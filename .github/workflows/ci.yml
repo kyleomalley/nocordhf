@@ -1,9 +1,6 @@
 name: ci
 
-# Cheap correctness floor: build + vet on every push and PR. No
-# tests in v1.0.0 (the regression corpus lives in the ft8m8
-# monorepo); add `go test ./...` here once the modem packages get
-# their own self-contained tests.
+# Cheap correctness floor: build + vet + tests on every push and PR.
 
 on:
   push:
@@ -24,3 +21,5 @@ jobs:
         run: go build ./...
       - name: Vet
         run: go vet ./...
+      - name: Test
+        run: go test -short ./...

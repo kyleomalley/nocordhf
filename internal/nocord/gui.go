@@ -233,7 +233,7 @@ type GUI struct {
 	// TQSL upload config + auto-upload toggle. When tqslAutoUpload is
 	// true, every QSO logged by the qsoTracker is followed by a tqsl
 	// invocation that signs the ADIF file and uploads to LoTW. Same
-	// pattern as legacy ft8m8: upload the running adif file on each
+	// pattern as the legacy GUI: upload the running adif file on each
 	// QSO close so partial logs go up promptly.
 	tqslCfg        *tqsl.Config
 	tqslAutoUpload bool
@@ -298,7 +298,7 @@ func (g *GUI) SetProfile(myCall, myGrid string) {
 // fyne.Preferences and applies them to the live decoder and map widget.
 // Called once from main.go after the GUI is built and before audio
 // starts so the operator's last preferences are honoured even before
-// they open the settings dialog. Defaults match the legacy ft8m8 GUI:
+// they open the settings dialog. Defaults match the legacy GUI:
 // worked-grid overlay ON, strict ITU filter ON.
 func (g *GUI) ApplySavedToggles() {
 	if g.app == nil {
@@ -376,7 +376,7 @@ func (g *GUI) refreshUserBar() {
 //   - Profile: operator callsign + grid (writes to fyne.Preferences;
 //     SetProfile applies live).
 //   - Map / Decoder: worked-grid overlay toggle, strict ITU filter on
-//     weak decodes (both legacy ft8m8 toggles).
+//     weak decodes (both legacy toggles).
 //   - LoTW: ARRL Logbook of the World credentials. On save we
 //     instantiate lotw.Client, kick off a background sync, and feed
 //     the results into the worked / confirmed grid map overlay.
@@ -463,7 +463,7 @@ func (g *GUI) showSettings() {
 	// ── TQSL (LoTW upload) tab ─────────────────────────────────────
 	// Wraps the ARRL TrustedQSL binary to sign + upload the running
 	// nocordhf.adif log on each completed QSO. The fields mirror the
-	// legacy ft8m8 GUI's TQSL panel: binary path, station location
+	// legacy GUI's TQSL panel: binary path, station location
 	// (a name configured inside TQSL itself), private-key password,
 	// and an auto-upload toggle.
 	tqslPathEntry := widget.NewEntry()

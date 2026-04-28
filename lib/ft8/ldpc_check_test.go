@@ -7,7 +7,9 @@ import (
 func TestLDPCAllZeros(t *testing.T) {
 	// All-zeros codeword: positive LLR should decode to all zeros
 	var llr [N]float64
-	for i := range llr { llr[i] = 5.0 }  // strong "bit=0" belief
+	for i := range llr {
+		llr[i] = 5.0
+	} // strong "bit=0" belief
 	bits, ok := DecodeLDPC(llr)
 	if !ok {
 		t.Error("all-zeros codeword should always pass parity")

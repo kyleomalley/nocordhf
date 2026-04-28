@@ -54,13 +54,13 @@ type Client struct {
 	lastRun time.Time
 }
 
-// New creates a Client caching under os.UserCacheDir()/ft8m8/lotw.
+// New creates a Client caching under os.UserCacheDir()/nocordhf/lotw.
 func New(username, password string) (*Client, error) {
 	base, err := os.UserCacheDir()
 	if err != nil {
 		return nil, fmt.Errorf("user cache dir: %w", err)
 	}
-	dir := filepath.Join(base, "ft8m8", "lotw")
+	dir := filepath.Join(base, "nocordhf", "lotw")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("mkdir cache: %w", err)
 	}
@@ -332,7 +332,7 @@ func (c *Client) fetchReport(ctx context.Context, since time.Time, qslsOnly bool
 	// Use a browser-like UA; the ARRL error page explicitly mentions
 	// browsers/cookies, and some Apache mod_security rules block the
 	// default Go UA.
-	req.Header.Set("User-Agent", "Mozilla/5.0 (ft8m8 LoTW client)")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (nocordhf LoTW client)")
 
 	resp, err := c.http.Do(req)
 	if err != nil {

@@ -26,7 +26,8 @@ func decimate4(samples []float32) []float32 {
 // With per-sample variance σ² at fs=12000, total noise power spreads uniformly
 // over 0..fs/2 = 6000 Hz. Power in a 2500 Hz window is σ² * 2500 / 6000.
 // Solving for σ² given Ps and target linear SNR:
-//   σ² = Ps * 6000 / (2500 * linearSNR) = Ps * 2.4 / linearSNR
+//
+//	σ² = Ps * 6000 / (2500 * linearSNR) = Ps * 2.4 / linearSNR
 func addAWGN(samples []float32, signalPower, snrDB float64, rng *rand.Rand) []float32 {
 	linearSNR := math.Pow(10, snrDB/10)
 	sigma := math.Sqrt(signalPower * 2.4 / linearSNR)

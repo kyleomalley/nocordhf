@@ -110,7 +110,7 @@ type Decoded struct {
 	// Agreement is the fraction of the 174 re-encoded codeword bits whose signs
 	// match the original LLRs. Real decodes at -20 dB match ~70–80%; random
 	// codewords match ~50%. Logged for post-hoc confidence analysis — lets us
-	// compare ft8m8 decodes the reference design missed (should be high agreement) against
+	// compare nocordhf decodes the reference design missed (should be high agreement) against
 	// possible phantoms that escape our filters (would be borderline).
 	Agreement float64
 	// tones is the 79-entry GFSK tone sequence reconstructed from the decoded
@@ -273,13 +273,13 @@ func Decode(samples []float32, slotStart time.Time, onDecode func(Decoded)) []De
 		const apRankLimit = 100
 
 		// Diagnostic: dump the full candidate list for post-hoc analysis of
-		// missed decodes. Opt-in via FT8M8_CANDIDATE_DUMP=1 because the line can
+		// missed decodes. Opt-in via NOCORDHF_CANDIDATE_DUMP=1 because the line can
 		// be ~10 KB on a busy slot. Compact "freq:score" pairs, sorted by score.
-		// When investigating a specific reference-design decode ft8m8 missed, grep the slot
+		// When investigating a specific reference-design decode nocordhf missed, grep the slot
 		// for the expected frequency; if it's absent, sync/minScore is the
 		// culprit; if present but no matching `decoded` or `rescue` line, BP and
 		// OSD both failed on that candidate.
-		if logging.L != nil && os.Getenv("FT8M8_CANDIDATE_DUMP") == "1" {
+		if logging.L != nil && os.Getenv("NOCORDHF_CANDIDATE_DUMP") == "1" {
 			buf := make([]string, 0, len(candidates))
 			for _, c := range candidates {
 				buf = append(buf, fmt.Sprintf("%.1f:%d", c.Freq, c.Score))
@@ -329,11 +329,11 @@ func Decode(samples []float32, slotStart time.Time, onDecode func(Decoded)) []De
 			// between-symbol interference smears energy that single-symbol LLRs
 			// can't resolve. Matches reference design ft8b.f90 passes 1–4.
 			//
-			// FT8M8_LEGACY_LLR=1 falls back to the old STFT-bin path (bmeta only).
+			// NOCORDHF_LEGACY_LLR=1 falls back to the old STFT-bin path (bmeta only).
 			var arr [N]float64
 			var llrs *coherentLLRs
 			var refinedXdt float64
-			if os.Getenv("FT8M8_LEGACY_LLR") == "1" {
+			if os.Getenv("NOCORDHF_LEGACY_LLR") == "1" {
 				legacy := extractLLR(wf, cand)
 				copy(arr[:], legacy)
 				refinedXdt = cand.TimeSecs
@@ -375,7 +375,7 @@ func Decode(samples []float32, slotStart time.Time, onDecode func(Decoded)) []De
 			// the bad slot recovered ~18 TPs without adding any phantoms
 			// (corpus F1 0.796 → 0.809). Cheap: only fires after the 4 coherent
 			// variants have all failed, and BP early-exits on stalled noise.
-			if !crcOK && os.Getenv("FT8M8_LEGACY_LLR") != "1" {
+			if !crcOK && os.Getenv("NOCORDHF_LEGACY_LLR") != "1" {
 				var legacyArr [N]float64
 				legacy := extractLLR(wf, cand)
 				copy(legacyArr[:], legacy)
@@ -869,7 +869,7 @@ func Decode(samples []float32, slotStart time.Time, onDecode func(Decoded)) []De
 	// pass 1 we'd push well past the slot boundary and starve next slot's
 	// audio capture.
 	deadlinePast := hasDeadline && time.Now().After(deadline)
-	if subtracted >= 3 && !deadlinePast && os.Getenv("FT8M8_NO_PASS2") != "1" {
+	if subtracted >= 3 && !deadlinePast && os.Getenv("NOCORDHF_NO_PASS2") != "1" {
 		pass2 := runPass(1, work)
 		// Merge: keep all pass-1 results; add pass-2 decodes that aren't a
 		// duplicate of a pass-1 decode's message text (same signal re-decoded
@@ -951,7 +951,7 @@ type ProbeMatch struct {
 // probeFreqHz. Use freqHalfWindowHz=0 to scan the entire candidate list.
 // Results are sorted by agreement descending.
 //
-// Purpose: brute-force diagnosis of "why did ft8m8 miss this decode?". If the
+// Purpose: brute-force diagnosis of "why did nocordhf miss this decode?". If the
 // top match has high agreement (≥ ~0.70) but BPDecoded is false, the signal is
 // present and correctly located — BP simply failed to converge and we have a
 // decoder bug / parameter issue. If all candidates' agreement is ≤ ~0.55, the

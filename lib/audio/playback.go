@@ -116,7 +116,7 @@ func (p *Player) Play(samples []float32, stopCh <-chan struct{}) error {
 		if peak >= 0.95 {
 			logging.L.Warnw("tx audio approaching digital clip — splatter likely",
 				"peak", fmt.Sprintf("%.3f", peak),
-				"hint", "lower the PWR slider in ft8m8; keep macOS output volume at 100% and adjust IC-7300 USB MOD LEVEL on the rig",
+				"hint", "lower the PWR slider in nocordhf; keep macOS output volume at 100% and adjust IC-7300 USB MOD LEVEL on the rig",
 			)
 		}
 	}()

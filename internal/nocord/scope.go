@@ -76,7 +76,7 @@ const (
 // scopePane holds the waterfall + map column. Built once per GUI; main feeds
 // the waterfall by calling SetWaterfallRow as the audio capturer produces
 // rows, and AddSpots as decoded stations land. Reuses ui.MapWidget — the
-// same map widget the legacy ft8m8 GUI uses, which gives us tile fetch,
+// same map widget the legacy nocordhf GUI uses, which gives us tile fetch,
 // drag/zoom, spot pins, hover-info, and worked-grid overlay for free.
 // slotBoundary records where a 15-second UTC slot start was painted in the
 // waterfall image, in image-row coordinates (0=top, wfHeight-1=bottom).
