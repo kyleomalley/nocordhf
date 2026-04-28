@@ -17,7 +17,7 @@ package nocord
 //     calls the configured writer + map-overlay refresh hook.
 //
 // The result is a working ADIF + worked-grid overlay that lights up
-// DXCC squares the same way the legacy ft8m8 GUI does, without
+// DXCC squares the same way the legacy nocordhf GUI does, without
 // inheriting that GUI's TX-state-machine complexity. Calls that
 // disappear before closing (other op walks away) age out after
 // qsoStaleAfter so the open-contact map stays bounded.

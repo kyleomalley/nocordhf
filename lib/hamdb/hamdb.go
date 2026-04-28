@@ -1,6 +1,6 @@
 // Package hamdb is a thin client for the free HamDB.org JSON API with an
 // on-disk cache. One cache file per callsign lives under the user cache dir
-// at ft8m8/hamdb/{CALL}.json. Positive results are served from cache for
+// at nocordhf/hamdb/{CALL}.json. Positive results are served from cache for
 // positiveTTL; negative results (callsign not found / transient errors) for
 // negativeTTL.
 package hamdb
@@ -23,7 +23,7 @@ import (
 
 const (
 	apiBase     = "https://api.hamdb.org"
-	agent       = "ft8m8"
+	agent       = "nocordhf"
 	positiveTTL = 30 * 24 * time.Hour
 	negativeTTL = 24 * time.Hour
 	httpTimeout = 8 * time.Second
@@ -85,13 +85,13 @@ type Client struct {
 	inflight   map[string]chan struct{}
 }
 
-// New creates a Client with its cache under os.UserCacheDir()/ft8m8/hamdb.
+// New creates a Client with its cache under os.UserCacheDir()/nocordhf/hamdb.
 func New() (*Client, error) {
 	base, err := os.UserCacheDir()
 	if err != nil {
 		return nil, fmt.Errorf("user cache dir: %w", err)
 	}
-	dir := filepath.Join(base, "ft8m8", "hamdb")
+	dir := filepath.Join(base, "nocordhf", "hamdb")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("mkdir cache: %w", err)
 	}

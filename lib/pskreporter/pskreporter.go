@@ -184,7 +184,7 @@ func (c *Client) fetchRange(ctx context.Context, lo, hi uint64) ([]uint64, []uin
 	if err != nil {
 		return nil, nil, err
 	}
-	req.Header.Set("User-Agent", "ft8m8")
+	req.Header.Set("User-Agent", "nocordhf")
 
 	resp, err := c.http.Do(req)
 	if err != nil {

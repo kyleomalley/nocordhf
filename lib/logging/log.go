@@ -1,5 +1,5 @@
 // Package logging configures a zap logger that writes syslog-style entries to
-// ./ft8m8.log and optionally to stderr (debug builds).
+// ./nocordhf.log and optionally to stderr (debug builds).
 package logging
 
 import (
@@ -10,11 +10,11 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
-const LogFile = "ft8m8.log" // legacy default — used by Init for backwards compatibility
+const LogFile = "nocordhf.log"
 
 var L *zap.SugaredLogger
 
-// Init opens (or creates) ./ft8m8.log and wires up zap. Equivalent to
+// Init opens (or creates) ./nocordhf.log and wires up zap. Equivalent to
 // InitFile(debug, buildID, LogFile); kept for callers that don't need a
 // custom log path.
 func Init(debug bool, buildID string) error {

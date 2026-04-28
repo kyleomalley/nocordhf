@@ -51,7 +51,7 @@ func writeField(b *strings.Builder, tag, value string) {
 	fmt.Fprintf(b, "<%s:%d>%s ", tag, len(value), value)
 }
 
-const header = "ADIF Export from ft8m8\n<EOH>\n"
+const header = "ADIF Export from nocordhf\n<EOH>\n"
 
 // Read parses an existing ADIF file and returns all valid QSO records.
 // Returns nil, nil if the file does not exist.
