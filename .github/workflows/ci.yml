@@ -1,0 +1,26 @@
+name: ci
+
+# Cheap correctness floor: build + vet on every push and PR. No
+# tests in v1.0.0 (the regression corpus lives in the ft8m8
+# monorepo); add `go test ./...` here once the modem packages get
+# their own self-contained tests.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          check-latest: true
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...

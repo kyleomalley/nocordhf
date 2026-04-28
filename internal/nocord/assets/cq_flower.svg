@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
+  <!--
+    CQ badge — a green pill with white "CQ" text. Shown next to a callsign
+    in the HEARD list when that station called CQ within the last two FT8
+    slots (30 s). Pure SVG so Fyne scales it cleanly to whatever pixel
+    height the row layout asks for.
+  -->
+  <rect x="1" y="6" width="30" height="20" rx="6" ry="6"
+        fill="#1bb24a" stroke="#0e6b2c" stroke-width="2"/>
+  <text x="16" y="21" text-anchor="middle"
+        font-family="Helvetica, Arial, sans-serif"
+        font-size="14" font-weight="bold" fill="#ffffff">CQ</text>
+</svg>

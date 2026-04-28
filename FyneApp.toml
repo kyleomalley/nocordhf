@@ -1,0 +1,24 @@
+# Fyne packaging metadata. Used by `fyne package` and goreleaser's
+# packaging step to build a proper macOS .app bundle. The
+# NSMicrophoneUsageDescription is the critical bit — without it
+# macOS Catalina+ will silently deny audio capture and FT8 RX
+# decodes nothing.
+
+[Details]
+  Icon = "docs/icon.png"
+  Name = "NocordHF"
+  ID = "com.nocordhf.app"
+  Version = "1.0.0"
+  Build = 1
+
+[Development]
+
+[Release]
+  CategoryType = "public.app-category.utilities"
+
+[Source]
+
+# macOS-specific Info.plist additions injected into the bundle.
+[macOS]
+  NSMicrophoneUsageDescription = "NocordHF captures audio from your radio's USB CODEC interface to decode FT8 transmissions."
+  LSMinimumSystemVersion = "11.0"

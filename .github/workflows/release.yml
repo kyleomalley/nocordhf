@@ -1,0 +1,73 @@
+name: release
+
+# Runs goreleaser on every pushed tag matching v*.*.*. Builds the
+# macOS universal binary, packs it as a .app bundle (with the
+# Info.plist additions from FyneApp.toml — including the microphone
+# usage description that Catalina+ requires for FT8 audio capture),
+# wraps that into a DMG, and uploads to a GitHub Release.
+#
+# To cut a release: tag the commit (e.g. `git tag v1.0.0 && git push
+# --tags`). The release is created in draft mode by default; review
+# the auto-generated changelog and click Publish in the GitHub UI.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  goreleaser:
+    runs-on: macos-14  # Apple Silicon runner; supports cross-build to amd64.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # goreleaser needs full history for changelog generation
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          check-latest: true
+
+      - name: Install fyne tooling
+        run: |
+          go install fyne.io/tools/cmd/fyne@latest
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: latest
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build .app bundle (Apple Silicon)
+        run: |
+          # GoReleaser produces a raw universal binary; wrap it in a
+          # proper .app bundle so users can drag it into Applications.
+          # fyne package reads FyneApp.toml for the Info.plist
+          # additions (including NSMicrophoneUsageDescription).
+          fyne package -os darwin -icon docs/icon.png \
+            -release \
+            -name NocordHF \
+            -app-id com.nocordhf.app \
+            -app-version 1.0.0
+          codesign --force --deep --sign - NocordHF.app
+          # Stamp the bundle into a DMG via hdiutil.
+          hdiutil create -volname NocordHF \
+            -srcfolder NocordHF.app \
+            -ov -format UDZO \
+            NocordHF-${GITHUB_REF_NAME}.dmg
+
+      - name: Upload .app DMG to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: NocordHF-*.dmg
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

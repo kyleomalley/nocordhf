@@ -1,0 +1,89 @@
+# GoReleaser config for NocordHF macOS releases.
+#
+# Builds amd64 + arm64 binaries on tag push, lipo's them into a
+# universal binary, wraps it as a .app bundle (with FyneApp.toml's
+# Info.plist additions including NSMicrophoneUsageDescription), packs
+# the bundle into a DMG, and uploads everything to a GitHub Release.
+#
+# Ad-hoc-signs the bundle with `codesign -s -` so Gatekeeper accepts
+# local execution; full Apple Developer ID signing + notarization
+# would replace the AdHoc step with `codesign -s "Developer ID..."`
+# plus a notarytool submit + staple step.
+
+version: 2
+
+project_name: nocordhf
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: nocordhf
+    main: ./cmd/nocordhf
+    binary: nocordhf
+    env:
+      - CGO_ENABLED=1
+    goos:
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.BuildID=v{{.Version}}
+
+universal_binaries:
+  - id: nocordhf-universal
+    ids:
+      - nocordhf
+    replace: true
+    name_template: nocordhf
+
+archives:
+  - id: nocordhf-archive
+    name_template: >-
+      nocordhf_v{{ .Version }}_macos_universal
+    formats:
+      - tar.gz
+    files:
+      - LICENSE
+      - README.md
+      - CHANGELOG.md
+      - docs/icon.png
+
+checksum:
+  name_template: checksums.txt
+
+release:
+  github:
+    owner: kyleomalley
+    name: nocordhf
+  draft: true
+  prerelease: auto
+  name_template: NocordHF v{{ .Version }}
+  header: |
+    ## NocordHF {{ .Tag }}
+
+    Discord-style FT8 client for amateur radio.
+
+    See [CHANGELOG.md](https://github.com/kyleomalley/nocordhf/blob/main/CHANGELOG.md) for full details.
+  footer: |
+    ---
+
+    A valid amateur radio license is required to transmit. NocordHF is
+    distributed under GPL-3.0; see [LICENSE](https://github.com/kyleomalley/nocordhf/blob/main/LICENSE).
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - Merge pull request
+      - Merge branch
