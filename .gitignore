@@ -1,8 +1,8 @@
 .DS_Store
 /build/
-nocordhf
-nocordhf.log
-nocordhf-stderr.log
-nocordhf.adif
+/nocordhf
+/nocordhf.log
+/nocordhf-stderr.log
+/nocordhf.adif
 recordings/
 *.prof

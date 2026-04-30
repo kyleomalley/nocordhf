@@ -638,6 +638,18 @@ func (m *MapWidget) ClearQSOPartner() {
 	}
 }
 
+// ClearSpots removes every station pin and any active QSO arc. Called
+// on band change so the map only shows current-band activity.
+func (m *MapWidget) ClearSpots() {
+	m.spotsMu.Lock()
+	m.spots = map[string]spotEntry{}
+	m.qsoCall = ""
+	m.qsoLat, m.qsoLon = 0, 0
+	m.hoverCall = ""
+	m.spotsMu.Unlock()
+	fyne.Do(func() { m.raster.Refresh() })
+}
+
 // AddSpots parses decoded FT8 messages and adds stations to the map.
 // When a message contains a grid square it is used for precise placement;
 // otherwise the callsign prefix is looked up in the entity table for a

@@ -111,6 +111,24 @@ func OpenIcom(portName string, baud int) (*IcomRadio, error) {
 	return r, nil
 }
 
+// VerifyResponse blocks up to `timeout` waiting for a CI-V frequency
+// reply. Used by AutoDetect to distinguish a real IC-7300 from a port
+// that just happened to open (e.g. an unrelated SiLabs CP210x device
+// that shares the SLAB_USBtoUART naming pattern). Returns nil if a
+// reply was observed, otherwise a timeout error.
+func (r *IcomRadio) VerifyResponse(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if r.Frequency() != 0 {
+			return nil
+		}
+		// Re-poke periodically in case the first query was lost.
+		_ = r.send(cmdReadFreq, nil)
+		time.Sleep(80 * time.Millisecond)
+	}
+	return fmt.Errorf("no CI-V response from %s within %s", r.portName, timeout)
+}
+
 // Close stops the listen loop and closes the serial port.
 // Signals stopCh and closes the port to interrupt any in-progress Read, then
 // waits up to 500ms for the goroutine to exit. If it doesn't exit in time

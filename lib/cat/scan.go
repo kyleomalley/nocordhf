@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"go.bug.st/serial"
 )
@@ -100,30 +101,90 @@ type AutoDetectResult struct {
 //   - tty.usbserial-* → FT-891 + DigiRig
 //
 // Returns an error if no radio is found on any port.
+//
+// Strategy:
+//  1. For each likely port, try the heuristic-preferred type first
+//     (e.g. SLAB_* → Icom, usbserial-* → Yaesu) with a long enough
+//     probe timeout to give cold-key-up rigs (notably the FT-891 via
+//     DigiRig) time to reply.
+//  2. If the preferred type doesn't reply, fall through and try the
+//     OTHER known types on the same port — heuristics get the easy
+//     cases right but mislabel adapters often enough that a fallback
+//     pass is worth the extra few seconds on first launch.
+//
+// The probe timeout is intentionally generous (2s) because the cost
+// of false-negative is the operator having to manually pick the
+// radio in Settings, while the cost of false-positive (declaring a
+// non-radio adapter as a radio) is way worse — sends bogus CAT
+// commands at the operator's actual radio if it shares a USB hub.
 func AutoDetect() (AutoDetectResult, error) {
+	const probeTimeout = 2 * time.Second
+	tryOpen := func(port string, kr KnownRadio) (Radio, error) {
+		switch kr.Type {
+		case "yaesu":
+			return OpenYaesu(port, kr.Baud)
+		default:
+			return OpenIcom(port, kr.Baud)
+		}
+	}
+	tryPort := func(port string, kr KnownRadio) (Radio, bool) {
+		r, err := tryOpen(port, kr)
+		if err != nil {
+			return nil, false
+		}
+		if probe, ok := r.(interface {
+			VerifyResponse(time.Duration) error
+		}); ok {
+			if perr := probe.VerifyResponse(probeTimeout); perr != nil {
+				_ = r.Close()
+				return nil, false
+			}
+		}
+		return r, true
+	}
+
 	ports := ScanPorts()
 	for _, port := range ports {
 		if !isLikelyRadio(port) {
 			continue
 		}
 		preferred := preferredType(port)
+		// Pass 1: heuristic-preferred type first.
 		for _, kr := range KnownRadios {
-			// If we have a heuristic match, skip non-matching types.
 			if preferred != "" && kr.Type != preferred {
 				continue
 			}
-			var r Radio
-			var err error
-			switch kr.Type {
-			case "yaesu":
-				r, err = OpenYaesu(port, kr.Baud)
-			default:
-				r, err = OpenIcom(port, kr.Baud)
+			if r, ok := tryPort(port, kr); ok {
+				return AutoDetectResult{Radio: r, Name: kr.Name, Port: port}, nil
 			}
-			if err == nil {
+		}
+		// Pass 2: fall back to every other type the heuristic didn't
+		// suggest. Catches the case where (for example) the DigiRig's
+		// FTDI adapter enumerates with an unexpected name and the
+		// preferredType heuristic guessed wrong.
+		for _, kr := range KnownRadios {
+			if preferred != "" && kr.Type == preferred {
+				continue // already tried in pass 1
+			}
+			if r, ok := tryPort(port, kr); ok {
 				return AutoDetectResult{Radio: r, Name: kr.Name, Port: port}, nil
 			}
 		}
 	}
 	return AutoDetectResult{}, fmt.Errorf("no radio detected — connect a radio and use the CAT button to configure")
+}
+
+// OpenByType opens a radio of the named type on the given port and baud.
+// Type strings match KnownRadio.Type ("icom", "yaesu"). Used by the saved-
+// profile path in main.go and the Radio settings tab so a known config can
+// be re-opened without rerunning AutoDetect.
+func OpenByType(t, port string, baud int) (Radio, error) {
+	switch strings.ToLower(strings.TrimSpace(t)) {
+	case "icom":
+		return OpenIcom(port, baud)
+	case "yaesu":
+		return OpenYaesu(port, baud)
+	default:
+		return nil, fmt.Errorf("unknown radio type %q", t)
+	}
 }

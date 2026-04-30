@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -31,6 +32,7 @@ import (
 
 	"github.com/kyleomalley/nocordhf/lib/adif"
 	"github.com/kyleomalley/nocordhf/lib/callsign"
+	"github.com/kyleomalley/nocordhf/lib/cat"
 	"github.com/kyleomalley/nocordhf/lib/ft8"
 	"github.com/kyleomalley/nocordhf/lib/lotw"
 	"github.com/kyleomalley/nocordhf/lib/ntpcheck"
@@ -62,10 +64,17 @@ var DefaultBands = []Band{
 
 // TxRequest mirrors ui.TxRequest's relevant subset. Built by the GUI when the
 // operator types a CQ or a directed call; consumed by the decoder loop in main.
+//
+// Tune=true selects a non-FT8 path: generate a pure-carrier tone for
+// ~3 s while keying PTT, suitable for adjusting an antenna tuner.
+// When Tune is set, Callsign / Grid / RemoteCall are ignored and the
+// 15-second slot countdown is skipped — tune transmissions don't have
+// to align to FT8 boundaries.
 type TxRequest struct {
 	Callsign   string // operator's own call (set in profile)
 	Grid       string // operator's grid
 	RemoteCall string // empty for CQ; set when replying to a heard station
+	Tune       bool   // pure-carrier tune transmission
 	StopCh     chan struct{}
 }
 
@@ -238,6 +247,12 @@ type GUI struct {
 	tqslCfg        *tqsl.Config
 	tqslAutoUpload bool
 
+	// radio is the live CAT handle owned by main.go. Held here so the
+	// Radio settings tab can hot-swap (Connect / Disconnect) the running
+	// rig without restarting the app. nil-safe: if main.go never calls
+	// SetRadio, the Radio tab degrades to read-only.
+	radio *cat.AtomicRadio
+
 	// ntpChecker measures clock drift against public NTP servers -the
 	// single most important non-obvious failure mode for FT8 is clock
 	// skew, so we surface it in the chat header. Lazy-started in Build()
@@ -343,6 +358,38 @@ func (g *GUI) LoadSavedProfile() (call, grid string) {
 	}
 	prefs := g.app.Preferences()
 	return prefs.String("myCall"), prefs.String("myGrid")
+}
+
+// SetRadio hands main.go's AtomicRadio to the GUI so the Radio settings
+// tab can swap it on Connect / Disconnect. Safe to call once at startup.
+func (g *GUI) SetRadio(r *cat.AtomicRadio) {
+	g.mu.Lock()
+	g.radio = r
+	g.mu.Unlock()
+}
+
+// LoadSavedRadio returns the persisted radio profile (type, port, baud)
+// and ok=true if the user has configured one via Settings → Radio. main.go
+// prefers this over auto-detect so an explicit choice survives reboots and
+// a missing rig at launch is a graceful "no radio" rather than a stall on
+// the auto-detect probe.
+func (g *GUI) LoadSavedRadio() (rType, port string, baud int, ok bool) {
+	if g.app == nil {
+		return "", "", 0, false
+	}
+	prefs := g.app.Preferences()
+	rType = prefs.String("radio_type")
+	port = prefs.String("radio_port")
+	baud = prefs.IntWithFallback("radio_baud", 0)
+	if rType == "" || port == "" {
+		return "", "", 0, false
+	}
+	if baud <= 0 {
+		if kr, found := cat.RadioByType(rType); found {
+			baud = kr.Baud
+		}
+	}
+	return rType, port, baud, true
 }
 
 // refreshUserBar updates the bottom-of-sidebar user panel (callsign + grid).
@@ -560,8 +607,139 @@ func (g *GUI) showSettings() {
 		widget.NewLabel("TQSL must already have your callsign certificate installed and at least one Station location configured. Auto-upload re-signs the running nocordhf.adif on every QSO completion."),
 	)
 
+	// ── Radio tab ──────────────────────────────────────────────────
+	// Persisted radio profile: type ("icom" / "yaesu" / "" = none),
+	// serial port path, and baud. On Save, the saved values are written
+	// to prefs and (if "Connect now" was used) the live AtomicRadio is
+	// swapped. Decouples startup from the radio: nocordhf launches even
+	// with no rig attached, and the operator picks a profile when ready.
+	const radioNone = "None (RX-only)"
+	radioTypeOpts := append([]string{radioNone}, cat.RadioTypeNames()...)
+	radioTypeSel := widget.NewSelect(radioTypeOpts, nil)
+	curRadioType := prefs.String("radio_type")
+	if kr, ok := cat.RadioByType(curRadioType); ok {
+		radioTypeSel.SetSelected(kr.Name)
+	} else {
+		radioTypeSel.SetSelected(radioNone)
+	}
+	availablePorts := cat.ScanPorts()
+	radioPortSel := widget.NewSelect(availablePorts, nil)
+	radioPortSel.PlaceHolder = "Select serial port"
+	if savedPort := prefs.String("radio_port"); savedPort != "" {
+		radioPortSel.SetSelected(savedPort)
+	}
+	radioBaudEntry := widget.NewEntry()
+	if b := prefs.IntWithFallback("radio_baud", 0); b > 0 {
+		radioBaudEntry.SetText(fmt.Sprintf("%d", b))
+	}
+	radioBaudEntry.SetPlaceHolder("default for the selected radio")
+	radioStatus := canvas.NewText("", color.RGBA{160, 165, 175, 255})
+	radioStatus.TextStyle = fyne.TextStyle{Monospace: true}
+	radioStatus.TextSize = 11
+	g.mu.Lock()
+	if g.radio != nil && g.radio.Inner() != nil {
+		radioStatus.Text = "Connected"
+	} else {
+		radioStatus.Text = "Disconnected"
+	}
+	g.mu.Unlock()
+	// Auto-fill baud when type changes if the user hasn't typed a custom value.
+	radioTypeSel.OnChanged = func(name string) {
+		if kr, ok := cat.RadioByName(name); ok {
+			if strings.TrimSpace(radioBaudEntry.Text) == "" {
+				radioBaudEntry.SetText(fmt.Sprintf("%d", kr.Baud))
+			}
+		}
+	}
+	radioRescanBtn := widget.NewButton("Rescan", func() {
+		ports := cat.ScanPorts()
+		radioPortSel.Options = ports
+		radioPortSel.Refresh()
+		if len(ports) == 0 {
+			radioStatus.Text = "No serial ports found"
+			radioStatus.Refresh()
+		}
+	})
+	radioConnectBtn := widget.NewButton("Connect now", func() {
+		g.mu.Lock()
+		ar := g.radio
+		g.mu.Unlock()
+		if ar == nil {
+			radioStatus.Text = "Radio control unavailable in this build"
+			radioStatus.Refresh()
+			return
+		}
+		name := radioTypeSel.Selected
+		if name == "" || name == radioNone {
+			ar.Swap(nil)
+			radioStatus.Text = "Disconnected"
+			radioStatus.Refresh()
+			return
+		}
+		kr, ok := cat.RadioByName(name)
+		if !ok {
+			radioStatus.Text = "Unknown radio type"
+			radioStatus.Refresh()
+			return
+		}
+		port := radioPortSel.Selected
+		if port == "" {
+			radioStatus.Text = "Pick a serial port first"
+			radioStatus.Refresh()
+			return
+		}
+		baud := kr.Baud
+		if s := strings.TrimSpace(radioBaudEntry.Text); s != "" {
+			if v, err := strconv.Atoi(s); err == nil && v > 0 {
+				baud = v
+			}
+		}
+		r, err := cat.OpenByType(kr.Type, port, baud)
+		if err != nil {
+			radioStatus.Text = "Connect failed: " + err.Error()
+			radioStatus.Refresh()
+			return
+		}
+		ar.Swap(r)
+		radioStatus.Text = fmt.Sprintf("Connected: %s on %s", kr.Name, port)
+		radioStatus.Refresh()
+		g.AppendSystem(fmt.Sprintf("ⓘ radio: %s on %s", kr.Name, port))
+	})
+	// TX audio level slider. On USB-CODEC rigs the rig's ALC follows
+	// the audio drive linearly, so this acts as a soft "TX power"
+	// control: 0.02 (≈ -34 dBFS) at the bottom for a faint signal,
+	// 0.5 (≈ -6 dBFS) at the top for full ALC drive. Default 0.18
+	// is the conservative ft8m8 setting that keeps ALC happy while
+	// still putting out useful power on most rigs.
+	curTxLevel := g.TxLevel()
+	txLevelLabel := canvas.NewText(fmt.Sprintf("%.2f (%.0f%%)", curTxLevel, curTxLevel*100/0.5), color.RGBA{200, 205, 215, 255})
+	txLevelLabel.TextStyle = fyne.TextStyle{Monospace: true}
+	txLevelLabel.TextSize = 11
+	txLevelSlider := widget.NewSlider(0.02, 0.5)
+	txLevelSlider.Step = 0.01
+	txLevelSlider.SetValue(curTxLevel)
+	txLevelSlider.OnChanged = func(v float64) {
+		g.SetTxLevel(v)
+		txLevelLabel.Text = fmt.Sprintf("%.2f (%.0f%%)", v, v*100/0.5)
+		txLevelLabel.Refresh()
+	}
+	txLevelRow := container.NewBorder(nil, nil, nil, txLevelLabel, txLevelSlider)
+
+	radioForm := widget.NewForm(
+		widget.NewFormItem("Radio", radioTypeSel),
+		widget.NewFormItem("Port", radioPortSel),
+		widget.NewFormItem("Baud", radioBaudEntry),
+		widget.NewFormItem("TX level", txLevelRow),
+	)
+	radioTab := container.NewVBox(
+		radioForm,
+		container.NewHBox(radioConnectBtn, radioRescanBtn, radioStatus),
+		widget.NewLabel("Pick \"None\" to run RX-only. Save persists the choice; \"Connect now\" applies it to the running session without closing the dialog. TX level controls the audio drive into the rig's USB CODEC — adjust until the rig's ALC just kisses full scale on transmit."),
+	)
+
 	tabs := container.NewAppTabs(
 		container.NewTabItem("Profile", profileForm),
+		container.NewTabItem("Radio", radioTab),
 		container.NewTabItem("Map / Decoder", mapForm),
 		container.NewTabItem("LoTW", lotwTab),
 		container.NewTabItem("TQSL Upload", tqslTab),
@@ -573,19 +751,40 @@ func (g *GUI) showSettings() {
 			if !ok {
 				return
 			}
-			newCall := strings.ToUpper(strings.TrimSpace(callEntry.Text))
-			newGrid := strings.ToUpper(strings.TrimSpace(gridEntry.Text))
-			if newCall != "" && !isPlausibleCallsign(newCall) {
-				dialog.ShowError(fmt.Errorf("%q does not look like a valid callsign", newCall), g.window)
-				return
-			}
-			g.SetProfile(newCall, newGrid)
+			// Persist all non-Profile tabs UNCONDITIONALLY. Earlier the
+			// callsign-validation early-return at the bottom would
+			// silently throw away the operator's Radio / Map / LoTW /
+			// TQSL changes if they happened to also have a malformed
+			// callsign in the Profile field. Now those tabs are
+			// saved first; only Profile changes get gated on
+			// validation.
+
+			// Map / Decoder.
 			prefs.SetBool("map_worked_overlay", overlayChk.Checked)
 			prefs.SetBool("itu_filter", ituChk.Checked)
 			ft8.SetITUFilterEnabled(ituChk.Checked)
 			if scope != nil && scope.mapWidget != nil {
 				scope.mapWidget.SetShowWorkedOverlay(overlayChk.Checked)
 			}
+
+			// Radio: type / port / baud. "None" clears the saved
+			// profile so the next launch falls back to auto-detect.
+			if rname := radioTypeSel.Selected; rname == "" || rname == radioNone {
+				prefs.SetString("radio_type", "")
+				prefs.SetString("radio_port", "")
+				prefs.SetInt("radio_baud", 0)
+			} else if kr, found := cat.RadioByName(rname); found {
+				prefs.SetString("radio_type", kr.Type)
+				prefs.SetString("radio_port", radioPortSel.Selected)
+				baud := kr.Baud
+				if s := strings.TrimSpace(radioBaudEntry.Text); s != "" {
+					if v, err := strconv.Atoi(s); err == nil && v > 0 {
+						baud = v
+					}
+				}
+				prefs.SetInt("radio_baud", baud)
+			}
+
 			// LoTW: persist creds, build client, kick off a sync if
 			// both fields were supplied. Empty fields clear the
 			// stored creds and disable the LoTW client.
@@ -606,8 +805,8 @@ func (g *GUI) showSettings() {
 					scope.mapWidget.Refresh()
 				}
 			}
-			// TQSL: persist binary path / station / cert password /
-			// auto-upload toggle and apply to the live config.
+
+			// TQSL: binary path / station / cert password / auto-upload.
 			tqslBinPath := strings.TrimSpace(tqslPathEntry.Text)
 			tqslStation := tqslStationSelect.Selected
 			tqslCertPw := tqslCertPwEntry.Text
@@ -624,6 +823,16 @@ func (g *GUI) showSettings() {
 			g.tqslCfg.CertPassword = tqslCertPw
 			g.tqslAutoUpload = tqslAutoChk.Checked
 			g.mu.Unlock()
+
+			// Profile: validated last so an invalid callsign doesn't
+			// throw away everything else above.
+			newCall := strings.ToUpper(strings.TrimSpace(callEntry.Text))
+			newGrid := strings.ToUpper(strings.TrimSpace(gridEntry.Text))
+			if newCall != "" && !isPlausibleCallsign(newCall) {
+				dialog.ShowError(fmt.Errorf("%q does not look like a valid callsign; other settings have been saved", newCall), g.window)
+				return
+			}
+			g.SetProfile(newCall, newGrid)
 			g.AppendSystem(fmt.Sprintf("profile updated: %s | %s | overlay=%v | itu=%v",
 				newCall, newGrid, overlayChk.Checked, ituChk.Checked))
 		},
@@ -1847,8 +2056,23 @@ func (g *GUI) buildLayout() fyne.CanvasObject {
 		if g.qso != nil {
 			g.qso.SetActiveBand(b.Name, b.Hz)
 		}
-		if g.scope != nil && g.scope.mapWidget != nil {
-			g.scope.mapWidget.Refresh()
+		// Wipe band-specific state so the new channel doesn't show
+		// stale waterfall pixels, decode boxes, or map pins from the
+		// band the operator just left.
+		if g.scope != nil {
+			g.scope.Reset()
+			if g.scope.mapWidget != nil {
+				g.scope.mapWidget.ClearSpots()
+			}
+		}
+		// Also clear the per-band HEARD list — the call set is band-
+		// specific and stale entries from the previous band confuse
+		// the operator scanning the sidebar.
+		g.mu.Lock()
+		g.heard = map[string]heardEntry{}
+		g.mu.Unlock()
+		if g.usersList != nil {
+			fyne.Do(func() { g.usersList.Refresh() })
 		}
 	}
 	chanHeader := canvas.NewText("BANDS", color.RGBA{140, 140, 145, 255})
@@ -2053,7 +2277,7 @@ func (g *GUI) buildLayout() fyne.CanvasObject {
 	}
 
 	g.input = widget.NewEntry()
-	g.input.SetPlaceHolder("Type CQ or a callsign, then Enter")
+	g.input.SetPlaceHolder("Type CQ, a callsign, or /tune; then Enter")
 	g.input.OnSubmitted = func(s string) {
 		g.handleSubmit(s)
 		g.input.SetText("")
@@ -2434,6 +2658,34 @@ func (g *GUI) TxFreq() float64 {
 	return g.scope.TxFreq()
 }
 
+// TxLevel returns the operator-selected TX audio amplitude in [0..1].
+// Drives the encoder's level argument; on USB-CODEC rigs this maps
+// roughly linearly to RF output via the rig's ALC, so the operator
+// can tune it as a soft "TX power" control. Persisted in prefs;
+// default 0.18 (≈ -15 dBFS, conservative to keep ALC happy).
+func (g *GUI) TxLevel() float64 {
+	if g.app == nil {
+		return 0.18
+	}
+	return g.app.Preferences().FloatWithFallback("tx_level", 0.18)
+}
+
+// SetTxLevel persists a new TX level. Clamped to a sane range so a
+// runaway slider can't blow the rig's ALC or drop transmissions to
+// inaudibility.
+func (g *GUI) SetTxLevel(v float64) {
+	if g.app == nil {
+		return
+	}
+	if v < 0.02 {
+		v = 0.02
+	}
+	if v > 0.5 {
+		v = 0.5
+	}
+	g.app.Preferences().SetFloat("tx_level", v)
+}
+
 // handleSubmit parses the input box and queues a TxRequest.
 //
 // Allowed inputs:
@@ -2447,6 +2699,19 @@ func (g *GUI) TxFreq() float64 {
 func (g *GUI) handleSubmit(raw string) {
 	s := strings.ToUpper(strings.TrimSpace(raw))
 	if s == "" {
+		return
+	}
+	// Slash-command path: /tune emits a pure-carrier tune
+	// transmission (no slot alignment, no FT8 modulation). Doesn't
+	// require a callsign / grid since nothing is encoded.
+	if s == "/TUNE" {
+		req := TxRequest{Tune: true, StopCh: make(chan struct{})}
+		select {
+		case g.txCh <- req:
+			g.AppendSystem("queued: tune (pure carrier)")
+		default:
+			g.AppendSystem("!TX queue full -try again")
+		}
 		return
 	}
 	g.mu.Lock()
@@ -2474,7 +2739,7 @@ func (g *GUI) handleSubmit(raw string) {
 			g.AppendSystem("!TX queue full -try again")
 		}
 	default:
-		g.AppendSystem(fmt.Sprintf("!%q is not \"CQ\" or a valid callsign -input rejected", raw))
+		g.AppendSystem(fmt.Sprintf("!%q is not \"CQ\", a valid callsign, or /tune -input rejected", raw))
 	}
 }
 

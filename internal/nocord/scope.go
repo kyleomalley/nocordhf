@@ -366,6 +366,47 @@ func (s *scopePane) SetMyGrid(grid string) {
 	s.mapWidget.UpdateMyGrid(grid)
 }
 
+// Reset clears all band-specific scope state — row history, decode
+// boxes, slot boundaries, and the rendered waterfall image — and re-
+// seeds synthetic boundaries from the current wall-clock so the slot
+// grid stays visible. Called when the operator switches channels so
+// the new band's display isn't contaminated with audio from the
+// previous one.
+func (s *scopePane) Reset() {
+	s.mu.Lock()
+	s.history = nil
+	s.boundaries = s.boundaries[:0]
+	s.decodes = s.decodes[:0]
+	s.pending = s.pending[:0]
+	s.lastSlotSec = -1
+	// Wipe the rendered image (alpha kept at 255 for the black bg).
+	if s.wfImg != nil {
+		for i := range s.wfImg.Pix {
+			if i%4 == 3 {
+				s.wfImg.Pix[i] = 255
+			} else {
+				s.wfImg.Pix[i] = 0
+			}
+		}
+	}
+	s.seedPastBoundariesLocked(time.Now().UTC())
+	canvasImg := s.wfCanvas
+	timeStrip := s.timeStrip
+	overlay := s.decodeOverlay
+	s.mu.Unlock()
+	if canvasImg != nil {
+		fyne.Do(func() {
+			canvasImg.Refresh()
+			if timeStrip != nil {
+				timeStrip.Refresh()
+			}
+			if overlay != nil {
+				overlay.Refresh()
+			}
+		})
+	}
+}
+
 // SetTxFreq updates the operator's intended TX frequency (Hz, audio centre)
 // and moves the on-waterfall TX-line marker. Click-on-waterfall handler
 // also calls this. Notifies main via the OnTxFreqChange callback so the
