@@ -69,7 +69,7 @@ release-mac:
 	lipo -create -output ./build/nocordhf ./build/nocordhf-amd64 ./build/nocordhf-arm64
 	rm ./build/nocordhf-amd64 ./build/nocordhf-arm64
 	@echo "==> packaging .app via fyne (uses FyneApp.toml for Info.plist)"
-	cd ./build && fyne package --target darwin --executable ./nocordhf --src ../cmd/nocordhf --icon $(CURDIR)/docs/icon.png --app-version $(NOCORDHF_VERSION) --release
+	cd ./build && fyne package --target darwin --executable ./nocordhf --src ../cmd/nocordhf --icon $(CURDIR)/docs/icon.png --app-id com.nocordhf.app --name NocordHF --app-version $(NOCORDHF_VERSION) --release
 	rm ./build/nocordhf
 	@echo "==> codesigning .app with hardened runtime"
 	codesign --force --deep --options runtime --timestamp \
