@@ -3,6 +3,22 @@
 All notable changes to NocordHF are tracked in this file. Version
 numbers follow [Semantic Versioning](https://semver.org/).
 
+## [1.0.1] - 2026-04-30
+
+### Added
+
+- Radio profile in Settings → Radio: persist type / port / baud, open
+  the saved configuration on startup, and hot-swap without a restart.
+- New macOS dock icon.
+
+### Fixed
+
+- Channel switch now wipes scope history and map pins so the new
+  band's display isn't contaminated by the previous one.
+- AutoDetect verifies CAT response, so a port that opened cleanly but
+  isn't actually talking to a radio is rejected instead of binding
+  silently.
+
 ## [1.0.0] - 2026-04-27
 
 First independent release. Extracted from the ft8m8 monorepo as a

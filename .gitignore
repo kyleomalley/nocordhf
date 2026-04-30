@@ -6,3 +6,5 @@
 /nocordhf.adif
 recordings/
 *.prof
+apple_developer.txt
+.claude/
