@@ -135,10 +135,26 @@ func (r *YaesuRadio) Close() error {
 }
 
 func (r *YaesuRadio) Frequency() uint64 { return r.lastHz.Load() }
-func (r *YaesuRadio) SMeter() uint32    { return r.lastSMeter.Load() }
-func (r *YaesuRadio) Power() uint32     { return r.lastPower.Load() }
-func (r *YaesuRadio) SWR() uint32       { return r.lastSWR.Load() }
-func (r *YaesuRadio) ALC() uint32       { return r.lastALC.Load() }
+
+// VerifyResponse blocks up to `timeout` waiting for a Yaesu CAT
+// frequency reply. AutoDetect calls this to distinguish a real radio
+// from an unrelated USB-serial adapter that opened cleanly but isn't
+// actually talking to a Yaesu rig.
+func (r *YaesuRadio) VerifyResponse(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if r.Frequency() != 0 {
+			return nil
+		}
+		r.pollFreq()
+		time.Sleep(80 * time.Millisecond)
+	}
+	return fmt.Errorf("no CAT response from %s within %s", r.portName, timeout)
+}
+func (r *YaesuRadio) SMeter() uint32 { return r.lastSMeter.Load() }
+func (r *YaesuRadio) Power() uint32  { return r.lastPower.Load() }
+func (r *YaesuRadio) SWR() uint32    { return r.lastSWR.Load() }
+func (r *YaesuRadio) ALC() uint32    { return r.lastALC.Load() }
 
 // ReadMeters sends NewCAT meter queries.
 func (r *YaesuRadio) ReadMeters() {
