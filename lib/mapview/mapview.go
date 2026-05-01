@@ -83,6 +83,12 @@ type MapWidget struct {
 	onSpotTap          func(call string)                       // called when the user taps a station dot
 	onSpotSecondaryTap func(call string, absPos fyne.Position) // called when the user right-clicks a station dot
 
+	// recentCQFn returns true when the GUI has heard the call transmit
+	// a CQ recently. Used to render a green "CQ" badge next to the
+	// callsign label on the map. nil-safe: when nil, no CQ markers
+	// are drawn.
+	recentCQFn func(call string) bool
+
 	// workedFn classifies a spot for coloring: 0 = unworked, 1 = worked in same
 	// grid square, 2 = worked this exact callsign. Set once at startup; read-only
 	// during rendering so no additional locking is needed.
@@ -248,6 +254,14 @@ func (m *MapWidget) SetOnSpotTap(fn func(call string)) {
 // for positioning a popup menu.
 func (m *MapWidget) SetOnSpotSecondaryTap(fn func(call string, absPos fyne.Position)) {
 	m.onSpotSecondaryTap = fn
+}
+
+// SetRecentCQFunc installs a callback the renderer uses to decide
+// whether to draw a green "CQ" badge next to a station label. The fn
+// is consulted on every redraw, so the GUI's notion of "recent" can
+// change without reseeding the map's spot list.
+func (m *MapWidget) SetRecentCQFunc(fn func(call string) bool) {
+	m.recentCQFn = fn
 }
 
 // SetWorkedFunc installs a function that classifies each spot for coloring.
@@ -1156,16 +1170,22 @@ func (m *MapWidget) draw(w, h int) image.Image {
 				labelCol = color.RGBA{255, 255, 80, 255}
 			}
 			mapDrawDot(img, x, y, dotR, dotC)
-			if s.otaType != "" {
-				// 2× scale so *OTA badges stay identifiable in dense clusters.
-				// cy shifted up to keep the icon above the station dot at the
-				// taller size (bitmap extents go to y=-5 × scale 2 = -10 px).
-				mapDrawOTAIcon(img, x, y-12, s.otaType, 2)
+			isRecentCQ := m.recentCQFn != nil && m.recentCQFn(s.call)
+			// At zoomed-out levels we render the pixel-art badge
+			// directly above the station dot (no room for the
+			// callsign-adjacent layout used at high zoom). Zoomed-in
+			// levels paint the same badge next to the callsign label
+			// — see the inner block below — so we skip this one when
+			// the side-of-callsign badge will appear.
+			if s.otaType != "" && ppd < 45 {
+				drawBadgeIcon(img, x, y-16, s.otaType, 24)
 			}
 			if ppd >= 45 {
 				// Zoomed in: scaled font to the right of the dot. At very
 				// high zoom we use a larger TrueType face so labels stay
-				// readable and clickable.
+				// readable and clickable. CQ + OTA badges sit
+				// immediately to the LEFT of the callsign label so the
+				// reader's eye picks up status before the call.
 				lblFace, adv, ascent := callsignFont(ppd)
 				labelW := len(s.call) * adv
 				gap := 6
@@ -1180,6 +1200,32 @@ func (m *MapWidget) draw(w, h int) image.Image {
 					lx = 2
 				}
 				ly := y + ascent/2
+
+				// Status badges sit in a fixed strip immediately to
+				// the left of the callsign label. Order from nearest
+				// the call to farthest: [CQ?] [OTA?] CALLSIGN.
+				// Both badges share the same vertical centre line,
+				// matched against the callsign's text baseline.
+				badgeGap := 2
+				iconSize := 24 // px diameter of each callsign-side badge
+				badgeY := ly - iconSize/2 - 4
+				cursor := lx - badgeGap
+				if isRecentCQ {
+					cursor -= iconSize
+					if drawBadgeIcon(img, cursor+iconSize/2, badgeY+iconSize/2, "CQ", iconSize) {
+						cursor -= badgeGap
+					} else {
+						cursor += iconSize
+					}
+				}
+				if s.otaType != "" {
+					cursor -= iconSize
+					if drawBadgeIcon(img, cursor+iconSize/2, badgeY+iconSize/2, s.otaType, iconSize) {
+						cursor -= badgeGap
+					} else {
+						cursor += iconSize
+					}
+				}
 				mapDrawTextOutlined(img, s.call, lx, ly, labelCol, lblFace)
 			} else {
 				// Zoomed out: tiny font centered above the dot.
@@ -1408,6 +1454,53 @@ func mapDrawDot(img *image.RGBA, cx, cy, r int, c color.RGBA) {
 			}
 		}
 	}
+}
+
+// otaBadgeStyle returns the short label + bg/fg colour pair for one
+// of the recognised *OTA programmes. Same palette as the HEARD
+// roster's per-program badge so the operator sees the same visual
+// identity in both views (green park / amber summit / teal flora /
+// etc). Returns ok=false for unrecognised types.
+func otaBadgeStyle(otaType string) (label string, bg, fg color.RGBA, ok bool) {
+	white := color.RGBA{255, 255, 255, 255}
+	switch otaType {
+	case "POTA":
+		return "P", color.RGBA{60, 180, 75, 255}, white, true
+	case "SOTA":
+		return "S", color.RGBA{220, 130, 30, 255}, white, true
+	case "WWFF":
+		return "WF", color.RGBA{50, 200, 170, 255}, white, true
+	case "IOTA":
+		return "I", color.RGBA{60, 130, 230, 255}, white, true
+	case "BOTA":
+		return "B", color.RGBA{90, 170, 240, 255}, white, true
+	case "LOTA":
+		return "L", color.RGBA{240, 200, 60, 255}, white, true
+	case "NOTA":
+		return "N", color.RGBA{180, 110, 200, 255}, white, true
+	case "PORTABLE":
+		return "/P", color.RGBA{160, 160, 160, 255}, white, true
+	}
+	return "", color.RGBA{}, color.RGBA{}, false
+}
+
+// mapDrawCircleBadgeLabel draws a filled circle with up to 3 chars of
+// tinyFont text centred inside. Used for the per-station status
+// badges (CQ / OTA) drawn just to the left of a callsign label on the
+// zoomed-in map view.
+func mapDrawCircleBadgeLabel(img *image.RGBA, cx, cy, r int, label string, bg, fg color.RGBA) {
+	mapDrawDot(img, cx, cy, r, bg)
+	// tinyFont chars are 4 wide × 5 tall (with 1-px advance gap → 5 px
+	// per char); pixelWidth excludes the trailing gap.
+	if label == "" {
+		return
+	}
+	const charW = 5
+	const charH = 5
+	w := len(label)*charW - 1
+	tx := cx - w/2
+	ty := cy - charH/2
+	mapDrawTinyTextOutlined(img, label, tx, ty, fg)
 }
 
 func mapDrawDiamond(img *image.RGBA, cx, cy, r int, c color.RGBA) {
@@ -1797,14 +1890,16 @@ func mapDrawQSOArc(img *image.RGBA, sx, sy, ex, ey int, txPhase bool) {
 }
 
 // mapDrawLegend draws the OTA icon legend in the bottom-left corner.
+// Compact layout: small (16 px) badge + label per row, tight rows.
 func mapDrawLegend(img *image.RGBA, w, h int) {
 	const (
-		rowH  = 18 // 7×13 font + comfortable leading
-		iconX = 12 // icon centre x relative to box left
-		textX = 24 // label starts here (leaves room for icon + gap)
-		padX  = 8
-		padY  = 8
-		boxW  = 162 // "WWFF Flora & Fauna" = 18 ch × 7 px = 126 + 24 offset + 12 right pad
+		badgeSize = 16
+		rowH      = badgeSize + 2
+		iconX     = badgeSize/2 + 6
+		textX     = badgeSize + 12
+		padX      = 8
+		padY      = 6
+		boxW      = 140
 	)
 	boxH := len(otaLegendEntries)*rowH + padY*2
 	bx := padX
@@ -1830,8 +1925,8 @@ func mapDrawLegend(img *image.RGBA, w, h int) {
 	labelCol := color.RGBA{200, 215, 240, 255}
 	for i, e := range otaLegendEntries {
 		iy := by + padY + i*rowH + rowH/2
-		mapDrawOTAIcon(img, bx+iconX, iy, e.key, 1) // scale 1 — legend layout uses the original icon size
-		mapDrawTextOutlined(img, e.key+" "+e.label, bx+textX, iy+5, labelCol, face)
+		drawBadgeIcon(img, bx+iconX, iy, e.key, badgeSize)
+		mapDrawTextOutlined(img, e.key+" "+e.label, bx+textX, iy+4, labelCol, face)
 	}
 }
 

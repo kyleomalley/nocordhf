@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <circle cx="24" cy="24" r="23" fill="#3CB44B"/>
+  <!-- Pine tree: three stacked triangles + trunk -->
+  <g fill="#FFFFFF" stroke="#FFFFFF" stroke-linejoin="round">
+    <polygon points="24,10 17,18 31,18" />
+    <polygon points="24,15 14,25 34,25" />
+    <polygon points="24,21 11,33 37,33" />
+    <rect x="22" y="33" width="4" height="6"/>
+  </g>
+</svg>

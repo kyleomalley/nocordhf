@@ -211,14 +211,17 @@ func isCallOrHashPosition(t string) bool {
 	return isValidCallsignToken(t)
 }
 
-// isCQModifier returns true for tokens valid as the optional zone/continent/
+// IsCQModifier returns true for tokens valid as the optional zone/continent/
 // activity modifier in "CQ MOD CALL GRID" messages. Covers:
 //   - continent/zone: DX, NA, EU, SA, AF, AS, OC, QRP
 //   - numeric zone: "CQ 3 UA9CC MO26", 1-3 digit zone numbers
 //   - activity: POTA, SOTA, WWFF, IOTA, TEST (reference design standard-message
 //     extension; "CQ POTA KE8WCR EN80" is a legitimate FT8 transmission
 //     encoded via the special n28 reservation for named activities).
-func isCQModifier(t string) bool {
+//
+// Exported so callers parsing decoded messages (e.g. the GUI's reply-target
+// extractor) don't have to maintain a parallel list and drift out of sync.
+func IsCQModifier(t string) bool {
 	switch t {
 	case "DX", "NA", "EU", "SA", "AF", "AS", "OC", "QRP",
 		"POTA", "SOTA", "WWFF", "IOTA", "TEST":
@@ -304,7 +307,7 @@ func isValidType1Message(text string) bool {
 			return false
 		}
 		callIdx := 1
-		if isCQModifier(tokens[1]) {
+		if IsCQModifier(tokens[1]) {
 			if len(tokens) < 3 {
 				return false
 			}

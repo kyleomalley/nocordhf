@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <circle cx="24" cy="24" r="23" fill="#32C8AA"/>
+  <!-- Daisy: 6 white petal circles around a yellow center, green stem -->
+  <g>
+    <!-- Stem -->
+    <line x1="24" y1="22" x2="24" y2="38" stroke="#FFFFFF" stroke-width="2.5" stroke-linecap="round"/>
+    <!-- Leaves -->
+    <ellipse cx="20" cy="32" rx="4" ry="2" fill="#FFFFFF" transform="rotate(-30 20 32)"/>
+    <ellipse cx="28" cy="32" rx="4" ry="2" fill="#FFFFFF" transform="rotate(30 28 32)"/>
+    <!-- Petals -->
+    <circle cx="24" cy="11" r="4" fill="#FFFFFF"/>
+    <circle cx="33" cy="14.5" r="4" fill="#FFFFFF"/>
+    <circle cx="36" cy="22" r="4" fill="#FFFFFF"/>
+    <circle cx="33" cy="29.5" r="4" fill="#FFFFFF"/>
+    <circle cx="15" cy="14.5" r="4" fill="#FFFFFF"/>
+    <circle cx="12" cy="22" r="4" fill="#FFFFFF"/>
+    <circle cx="15" cy="29.5" r="4" fill="#FFFFFF"/>
+    <!-- Center -->
+    <circle cx="24" cy="22" r="4" fill="#FFD43C"/>
+  </g>
+</svg>

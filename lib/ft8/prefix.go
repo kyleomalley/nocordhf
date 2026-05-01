@@ -84,7 +84,7 @@ func messageHasAllocatedCall(text string) bool {
 	var callIdx []int
 	if tokens[0] == "CQ" {
 		idx := 1
-		if len(tokens) >= 2 && isCQModifier(tokens[1]) {
+		if len(tokens) >= 2 && IsCQModifier(tokens[1]) {
 			idx = 2
 		}
 		if idx < len(tokens) {
