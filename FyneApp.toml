@@ -8,7 +8,7 @@
   Icon = "docs/icon.png"
   Name = "NocordHF"
   ID = "com.nocordhf.app"
-  Version = "1.0.1"
+  Version = "1.0.3"
   Build = 1
 
 [Development]

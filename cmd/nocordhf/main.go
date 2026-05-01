@@ -376,7 +376,14 @@ func runTX(
 		samples = generateTuneTone(txOffsetHz, txLevel, tuneSeconds)
 		displayMsg = fmt.Sprintf("TUNE %.0f Hz (%.0fs)", txOffsetHz, tuneSeconds)
 	case req.RemoteCall != "":
-		displayMsg = fmt.Sprintf("%s %s %s", req.RemoteCall, req.Callsign, req.Grid)
+		// Tail (when set) replaces the grid in the directed-call shape:
+		// "<them> <us> <Tail>" lets the auto-progress path send R-reports,
+		// RR73, 73, etc. with the same encoder used for first-call grids.
+		trailer := req.Grid
+		if req.Tail != "" {
+			trailer = req.Tail
+		}
+		displayMsg = fmt.Sprintf("%s %s %s", req.RemoteCall, req.Callsign, trailer)
 		samples, err = ft8.EncodeStandard(displayMsg, txLevel, txOffsetHz)
 	default:
 		displayMsg = fmt.Sprintf("CQ %s %s", req.Callsign, req.Grid)
@@ -396,25 +403,45 @@ func runTX(
 	// and the operator usually wants the carrier on the air NOW so
 	// they can finish tuning before missing another slot.
 	const lateTxMaxRem = 2
-	for !req.Tune {
+	if !req.Tune {
+		// Pick the actual TX slot up front — including any AvoidPeriod
+		// deferral — so the countdown reflects when we'll really key
+		// up, not just when the next 15-s boundary lands. The deferral
+		// notice fires immediately rather than after a misleading
+		// "TX in 5s" countdown to a slot we'd then skip.
 		now := time.Now().UTC()
 		rem := now.Unix() % 15
-		if rem <= lateTxMaxRem {
-			break
+		targetUnix := now.Unix() - rem
+		if rem > lateTxMaxRem {
+			targetUnix += 15 // missed this slot; aim for the next boundary
 		}
-		toNext := 15 - rem
-		// Only emit a countdown chat line every 5 seconds so the chat
-		// doesn't fill with "TX in 14s" "TX in 13s" "TX in 12s" rows.
-		if toNext%5 == 0 {
-			g.AppendSystem(fmt.Sprintf("TX in %ds: %s", toNext, displayMsg))
+		if req.AvoidPeriod >= 0 && int(targetUnix/15)&1 == req.AvoidPeriod {
+			g.AppendSystem(fmt.Sprintf(
+				"TX deferred: %s TXes in this period; waiting one slot",
+				req.RemoteCall))
+			targetUnix += 15
 		}
-		nextSec := now.Truncate(time.Second).Add(time.Second)
-		select {
-		case <-req.StopCh:
-			log.Infow("TX cancelled before keying")
-			g.AppendSystem("✕ TX cancelled")
-			return
-		case <-time.After(time.Until(nextSec)):
+		target := time.Unix(targetUnix, 0).UTC()
+
+		for {
+			now = time.Now().UTC()
+			if !now.Before(target) {
+				break
+			}
+			toNext := int(target.Sub(now).Round(time.Second).Seconds())
+			// Only emit a countdown chat line every 5 seconds so the
+			// chat doesn't fill with "TX in 14s" "TX in 13s" rows.
+			if toNext > 0 && toNext%5 == 0 {
+				g.AppendSystem(fmt.Sprintf("TX in %ds: %s", toNext, displayMsg))
+			}
+			sleepTo := now.Truncate(time.Second).Add(time.Second)
+			select {
+			case <-req.StopCh:
+				log.Infow("TX cancelled before keying")
+				g.AppendSystem("✕ TX cancelled")
+				return
+			case <-time.After(time.Until(sleepTo)):
+			}
 		}
 	}
 

@@ -77,8 +77,21 @@ type TxRequest struct {
 	Callsign   string // operator's own call (set in profile)
 	Grid       string // operator's grid
 	RemoteCall string // empty for CQ; set when replying to a heard station
-	Tune       bool   // pure-carrier tune transmission
-	StopCh     chan struct{}
+	// Tail, when non-empty alongside RemoteCall, replaces Grid in the
+	// outbound message ("RemoteCall Callsign Tail" instead of
+	// "RemoteCall Callsign Grid"). Used by the auto-progress path to
+	// send sig reports / R+report / RR73 / 73 in response to inbound
+	// directed messages without requiring a full QSO state machine.
+	Tail string
+	// AvoidPeriod, when set to 0 or 1, locks the TX out of that 15-s
+	// slot period — runTX will wait one extra slot if the next boundary
+	// would land in it. Use -1 for "no preference" (CQ, /tune, or
+	// targets we've never decoded). Prevents accidentally TXing in the
+	// same period as the station you're calling, where they'd be RXing
+	// nothing because they're TXing too.
+	AvoidPeriod int
+	Tune        bool // pure-carrier tune transmission
+	StopCh      chan struct{}
 }
 
 // heardSortMode picks how the HEARD sidebar orders its entries. Alpha is
@@ -161,6 +174,25 @@ type GUI struct {
 	currentSlotDecodes int
 	lastSlotDecodes    int
 	currentSlotSec     int64
+	// lastAutoReplyKey dedupes auto-progress replies within a single 15s
+	// slot. Multiple Costas hits / OSD passes can deliver the same
+	// decoded message more than once; without this guard we'd queue the
+	// same R-report or RR73 several times back-to-back. Keyed by
+	// "slotSec|RemoteCall|Tail"; cleared implicitly when the slot rolls.
+	lastAutoReplyKey string
+	// autoReply gates the AppendDecode → maybeAutoReply hook. When off,
+	// the operator drives every TX manually (right-click Reply or
+	// typing in the input). Persisted via the "auto_reply" preference
+	// so the toggle survives restarts.
+	autoReply bool
+	// peerPeriods records the most-recently-observed TX period (0 = first
+	// half of minute, 1 = second) for each station we've decoded. Used
+	// to pick the OPPOSITE period when transmitting to them, so we
+	// don't try to call them while they're talking. Updated on every
+	// AppendDecode whose sender we can identify; capped implicitly by
+	// chat history because callers never accumulate beyond what's been
+	// recently heard. Map size is naturally bounded by band activity.
+	peerPeriods map[string]int
 	// heard tracks RX-only senders for the IRC-style HEARD sidebar and
 	// input-box autocomplete. Keyed by callsign; value carries the latest
 	// SNR plus the timestamp we last saw the call so we can sort newest
@@ -318,11 +350,12 @@ const maxRows = 500
 // are caller-owned; the GUI sends to them but never closes them.
 func NewGUI(a fyne.App, buildID string, txCh chan TxRequest, tuneCh chan uint64) *GUI {
 	g := &GUI{
-		app:     a,
-		buildID: buildID,
-		txCh:    txCh,
-		tuneCh:  tuneCh,
-		current: DefaultBands[4], // 20m default
+		app:         a,
+		buildID:     buildID,
+		txCh:        txCh,
+		tuneCh:      tuneCh,
+		current:     DefaultBands[4], // 20m default
+		peerPeriods: make(map[string]int),
 	}
 	g.window = a.NewWindow("NocordHF [build=" + buildID + "]")
 	g.window.Resize(fyne.NewSize(1100, 720))
@@ -373,8 +406,10 @@ func (g *GUI) ApplySavedToggles() {
 	prefs := g.app.Preferences()
 	overlay := prefs.BoolWithFallback("map_worked_overlay", true)
 	itu := prefs.BoolWithFallback("itu_filter", true)
+	auto := prefs.BoolWithFallback("auto_reply", false)
 	ft8.SetITUFilterEnabled(itu)
 	g.mu.Lock()
+	g.autoReply = auto
 	scope := g.scope
 	g.mu.Unlock()
 	if scope != nil && scope.mapWidget != nil {
@@ -1010,6 +1045,15 @@ func (g *GUI) AppendDecode(d ft8.Decoded) {
 		isCQ := strings.HasPrefix(strings.ToUpper(strings.TrimSpace(d.Message.Text)), "CQ")
 		otaType := messageIndicatesOTA(d.Message.Text)
 		g.rememberHeard(sender, d.SNR, isCQ, otaType)
+		// Record their TX period so we can pick the opposite when
+		// calling them. Hashed senders ("<...>") are skipped — we'd
+		// just be poisoning the map with placeholder keys.
+		if !strings.HasPrefix(sender, "<") {
+			period := int((d.SlotStart.Unix()/15)%2) & 1
+			g.mu.Lock()
+			g.peerPeriods[strings.ToUpper(sender)] = period
+			g.mu.Unlock()
+		}
 	}
 	// Emit a thin slot-separator row the first time we hear a decode from
 	// a new 15-second slot, so RX cycles have visible breaks in the chat.
@@ -1037,6 +1081,162 @@ func (g *GUI) AppendDecode(d ft8.Decoded) {
 	if g.qso != nil {
 		g.qso.FireRX(d.Message.Text, int(d.SNR), d.SlotStart)
 	}
+	// Auto-progress: when an inbound message addresses us with a sig
+	// report / R-report / RR73 / grid, queue the right next-step reply
+	// so the operator doesn't have to manually craft each leg of the
+	// QSO. Stateless — purely a function of the message just heard —
+	// but deduped per-slot to absorb Costas-hit duplicates.
+	//
+	// Diagnostic Info-log on every addrUs decode so post-mortem analysis
+	// can tell whether the listener saw the message at all (BP decodes
+	// otherwise leave no trace in the rescue log) and which path
+	// followed: gated off, skipped (no recognized tail), deduped, or
+	// queued.
+	if row.addrUs {
+		g.mu.Lock()
+		auto := g.autoReply
+		g.mu.Unlock()
+		if logging.L != nil {
+			logging.L.Infow("addr_us decode",
+				"msg", d.Message.Text,
+				"snr", int(d.SNR),
+				"slot", d.SlotStart.Format("15:04:05"),
+				"auto", auto,
+				"my_call", myCall,
+			)
+		}
+		if g.txCh != nil && myCall != "" && auto {
+			g.maybeAutoReply(d, myCall, slotSec)
+		}
+	}
+}
+
+// maybeAutoReply builds and queues a reply TX for an inbound directed
+// message addressed at us, if autoReplyTail recognises the trailing
+// token. Caller has already established that d.Message.Text starts
+// with myCall.
+func (g *GUI) maybeAutoReply(d ft8.Decoded, myCall string, slotSec int64) {
+	// Use senderFromMessage (returns fields[1] for "X Y Z") not
+	// remoteCallFromMessage (returns fields[0] = the recipient = us, for
+	// any message addressed at us). The previous wiring extracted our
+	// own call as the "remote" and then bailed at the equality check
+	// below, so auto-reply never fired for anything addressed to us.
+	remote := senderFromMessage(d.Message.Text)
+	if remote == "" || strings.EqualFold(remote, myCall) {
+		if logging.L != nil {
+			logging.L.Infow("auto-reply skipped: no remote call",
+				"msg", d.Message.Text, "remote", remote)
+		}
+		return
+	}
+	tail := autoReplyTail(d.Message.Text, myCall, int(d.SNR))
+	if tail == "" {
+		if logging.L != nil {
+			logging.L.Infow("auto-reply skipped: no recognised tail",
+				"msg", d.Message.Text, "remote", remote)
+		}
+		return
+	}
+	key := fmt.Sprintf("%d|%s|%s", slotSec, strings.ToUpper(remote), tail)
+	g.mu.Lock()
+	if g.lastAutoReplyKey == key {
+		g.mu.Unlock()
+		if logging.L != nil {
+			logging.L.Infow("auto-reply skipped: duplicate this slot",
+				"key", key)
+		}
+		return
+	}
+	g.lastAutoReplyKey = key
+	myGrid := g.myGrid
+	g.mu.Unlock()
+
+	req := TxRequest{
+		Callsign:    myCall,
+		Grid:        myGrid,
+		RemoteCall:  remote,
+		Tail:        tail,
+		AvoidPeriod: g.peerPeriod(remote),
+		StopCh:      make(chan struct{}),
+	}
+	select {
+	case g.txCh <- req:
+		g.AppendSystem(fmt.Sprintf("auto-reply queued: %s %s %s", remote, myCall, tail))
+		if logging.L != nil {
+			logging.L.Infow("auto-reply queued",
+				"remote", remote, "tail", tail, "avoid_period", req.AvoidPeriod)
+		}
+	default:
+		// TX queue full (operator has manual TXs pending). Drop silently;
+		// they can manually click Reply if they want this one through.
+		if logging.L != nil {
+			logging.L.Warnw("auto-reply dropped: tx queue full",
+				"remote", remote, "tail", tail)
+		}
+	}
+}
+
+// peerPeriod returns the most-recently-observed TX period (0 or 1) for
+// `call`, or -1 if we've never decoded them. Callers feed the result
+// into TxRequest.AvoidPeriod so the slot countdown skips that period.
+func (g *GUI) peerPeriod(call string) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	p, ok := g.peerPeriods[strings.ToUpper(strings.TrimSpace(call))]
+	if !ok {
+		return -1
+	}
+	return p
+}
+
+// recentMsgFromCall walks chat history newest-to-oldest and returns the
+// most recent RX row whose sender matches `call` and which addresses us.
+// Used by the chat-side Reply affordances (right-click menu, profile
+// popup) so they can advance a QSO past the first calling-with-grid
+// stage without the click sites needing to thread message context.
+//
+// Returns ok=false when no such row exists in the visible history.
+func (g *GUI) recentMsgFromCall(call string) (msgText string, snr int, ok bool) {
+	upper := strings.ToUpper(strings.TrimSpace(call))
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for i := len(g.rows) - 1; i >= 0; i-- {
+		r := g.rows[i]
+		if r.system || r.tx || r.separator || !r.addrUs {
+			continue
+		}
+		sender := senderFromMessage(r.text)
+		if strings.EqualFold(sender, upper) {
+			return r.text, int(r.snrDB), true
+		}
+	}
+	return "", 0, false
+}
+
+// queueSmartReply is the chat-side analogue of maybeAutoReply: when the
+// operator clicks Reply on a station we've been working, look up the
+// last message they sent us and queue the right next-step trailer
+// (R-report → RR73 → 73). Falls back to the existing first-call-with-
+// grid behaviour (handleSubmit) when no advancing-step is implied.
+func (g *GUI) queueSmartReply(call string) {
+	g.mu.Lock()
+	myCall := g.myCall
+	g.mu.Unlock()
+	if myCall == "" {
+		g.handleSubmit(call) // hit the same "no profile" guard
+		return
+	}
+	if msg, snr, ok := g.recentMsgFromCall(call); ok {
+		if tail := autoReplyTail(msg, myCall, snr); tail != "" {
+			g.input.SetText(call + " " + tail)
+			g.handleSubmit(call + " " + tail)
+			g.input.SetText("")
+			return
+		}
+	}
+	g.input.SetText(call)
+	g.handleSubmit(call)
+	g.input.SetText("")
 }
 
 // AppendSystem renders a synthesised line ("waiting for slot…", "TX done").
@@ -1270,9 +1470,9 @@ func (g *GUI) showCallContextMenu(call string, isCQ bool, pos fyne.Position) {
 	items := []*fyne.MenuItem{
 		fyne.NewMenuItem("Profile", func() { g.showProfile(call, pos) }),
 		fyne.NewMenuItem(directedLabel, func() {
-			g.input.SetText(call)
-			g.handleSubmit(call)
-			g.input.SetText("")
+			// Routes through queueSmartReply so a Reply on a sig-report
+			// row sends R+report (etc.) instead of restarting the call.
+			g.queueSmartReply(call)
 		}),
 		fyne.NewMenuItem("Copy callsign", func() {
 			g.window.Clipboard().SetContent(call)
@@ -1764,9 +1964,7 @@ func (g *GUI) showProfile(call string, _ fyne.Position) {
 
 	// Actions.
 	replyBtn := widget.NewButton("Reply (call this station)", func() {
-		g.input.SetText(call)
-		g.handleSubmit(call)
-		g.input.SetText("")
+		g.queueSmartReply(call)
 	})
 	copyBtn := widget.NewButton("Copy callsign", func() {
 		g.window.Clipboard().SetContent(call)
@@ -2368,7 +2566,17 @@ func (g *GUI) buildLayout() fyne.CanvasObject {
 				msg.Color = color.RGBA{80, 200, 120, 255}
 				msg.TextStyle = fyne.TextStyle{Monospace: true, Bold: true}
 			case r.addrUs:
-				msg.Color = color.RGBA{255, 200, 80, 255}
+				// Bright cyan — distinct from the CQ amber sitting right
+				// next to it in busy bands so directed-at-us calls don't
+				// get visually lost.
+				msg.Color = color.RGBA{90, 220, 255, 255}
+				msg.TextStyle = fyne.TextStyle{Monospace: true, Bold: true}
+			case g.qso != nil && (g.qso.IsOpen(senderFromMessage(r.text)) ||
+				g.qso.IsOpen(remoteCallFromMessage(r.text))):
+				// One of our open-QSO targets is talking with (or being
+				// called by) someone else. Warm orange flag so we notice
+				// they're busy and may not respond to our pending TX.
+				msg.Color = color.RGBA{255, 150, 60, 255}
 				msg.TextStyle = fyne.TextStyle{Monospace: true, Bold: true}
 			case isCQ:
 				msg.Color = color.RGBA{255, 200, 50, 255}
@@ -2460,7 +2668,6 @@ func (g *GUI) buildLayout() fyne.CanvasObject {
 	}
 
 	g.input = widget.NewEntry()
-	g.input.SetPlaceHolder("Type CQ, a callsign, or /tune; then Enter")
 	g.input.OnSubmitted = func(s string) {
 		g.handleSubmit(s)
 		g.input.SetText("")
@@ -2486,7 +2693,29 @@ func (g *GUI) buildLayout() fyne.CanvasObject {
 		g.handleSubmit(g.input.Text)
 		g.input.SetText("")
 	})
-	inputRow := container.NewBorder(nil, nil, nil, g.sendBtn, g.input)
+	// Auto checkbox: when checked, an inbound message addressed to us
+	// triggers the next-step reply automatically (sig report → R+report
+	// → RR73 → 73). Read directly from prefs here (not g.autoReply)
+	// because buildLayout runs inside NewGUI, before main.go calls
+	// ApplySavedToggles — using g.autoReply would always render "off"
+	// on the first frame regardless of what was previously saved.
+	autoInitial := false
+	if g.app != nil {
+		autoInitial = g.app.Preferences().BoolWithFallback("auto_reply", false)
+	}
+	g.mu.Lock()
+	g.autoReply = autoInitial
+	g.mu.Unlock()
+	autoCheck := widget.NewCheck("Auto", func(on bool) {
+		g.mu.Lock()
+		g.autoReply = on
+		g.mu.Unlock()
+		if g.app != nil {
+			g.app.Preferences().SetBool("auto_reply", on)
+		}
+	})
+	autoCheck.SetChecked(autoInitial)
+	inputRow := container.NewBorder(nil, nil, autoCheck, g.sendBtn, g.input)
 	inputBg := canvas.NewRectangle(color.RGBA{64, 68, 75, 255})
 	inputStack := container.NewStack(inputBg, container.NewPadded(inputRow))
 
@@ -2942,9 +3171,13 @@ func (g *GUI) SetTxLevel(v float64) {
 //
 // Allowed inputs:
 //
-//	"CQ"               → send "CQ <mycall> <mygrid>"
-//	"<CALLSIGN>"       → start a directed call to <CALLSIGN>
-//	"" (empty)         → ignore
+//	"CQ"                  → send "CQ <mycall> <mygrid>"
+//	"<CALLSIGN>"          → start a directed call ("<them> <us> <grid>")
+//	"<CALLSIGN> <TAIL>"   → directed message with explicit trailer
+//	                        (TAIL ∈ ±NN | R±NN | RR73 | 73 | grid),
+//	                        e.g. "VP2MAA -10" → "VP2MAA KO6IEH -10"
+//	"/tune"               → pure-carrier tune transmission
+//	"" (empty)            → ignore
 //
 // Anything else is rejected with an inline system message -keeps the user
 // from accidentally transmitting free-form text on a digital QSO band.
@@ -2973,26 +3206,82 @@ func (g *GUI) handleSubmit(raw string) {
 		g.AppendSystem("!profile not set -set MyCall / MyGrid before transmitting")
 		return
 	}
+	tokens := strings.Fields(s)
 	switch {
 	case s == "CQ":
-		req := TxRequest{Callsign: myCall, Grid: myGrid, StopCh: make(chan struct{})}
+		req := TxRequest{
+			Callsign: myCall, Grid: myGrid,
+			AvoidPeriod: -1, // CQ broadcasts; no peer period to dodge
+			StopCh:      make(chan struct{}),
+		}
 		select {
 		case g.txCh <- req:
 			g.AppendSystem(fmt.Sprintf("queued: CQ %s %s", myCall, myGrid))
 		default:
 			g.AppendSystem("!TX queue full -try again")
 		}
-	case isPlausibleCallsign(s):
-		req := TxRequest{Callsign: myCall, Grid: myGrid, RemoteCall: s, StopCh: make(chan struct{})}
+	case len(tokens) == 1 && isPlausibleCallsign(tokens[0]):
+		req := TxRequest{
+			Callsign: myCall, Grid: myGrid,
+			RemoteCall:  tokens[0],
+			AvoidPeriod: g.peerPeriod(tokens[0]),
+			StopCh:      make(chan struct{}),
+		}
 		select {
 		case g.txCh <- req:
-			g.AppendSystem(fmt.Sprintf("queued: directed call to %s", s))
+			g.AppendSystem(fmt.Sprintf("queued: directed call to %s", tokens[0]))
+		default:
+			g.AppendSystem("!TX queue full -try again")
+		}
+	case len(tokens) == 2 && isPlausibleCallsign(tokens[0]) && isPlausibleTail(tokens[1]):
+		// Directed message with explicit trailer — operator typed
+		// "VP2MAA -10" or "VP2MAA RR73". Same encoder path as a first
+		// directed call; the Tail field replaces the grid.
+		req := TxRequest{
+			Callsign: myCall, Grid: myGrid,
+			RemoteCall: tokens[0], Tail: tokens[1],
+			AvoidPeriod: g.peerPeriod(tokens[0]),
+			StopCh:      make(chan struct{}),
+		}
+		select {
+		case g.txCh <- req:
+			g.AppendSystem(fmt.Sprintf("queued: %s %s %s", tokens[0], myCall, tokens[1]))
 		default:
 			g.AppendSystem("!TX queue full -try again")
 		}
 	default:
 		g.AppendSystem(fmt.Sprintf("!%q is not \"CQ\", a valid callsign, or /tune -input rejected", raw))
 	}
+}
+
+// isPlausibleTail reports whether tok is a valid trailing token for the
+// "<them> <us> <tail>" directed-message shape: a sig report (±NN), R+sig
+// (R±NN), the closing tokens RR73 / 73, or a Maidenhead grid. Used by
+// the chat input parser so operators can manually advance a QSO by
+// typing e.g. "VP2MAA -10" without reaching for buttons.
+func isPlausibleTail(tok string) bool {
+	tok = strings.ToUpper(tok)
+	switch {
+	case tok == "RR73", tok == "73":
+		return true
+	case len(tok) >= 3 && tok[0] == 'R' && (tok[1] == '+' || tok[1] == '-'):
+		for _, c := range tok[2:] {
+			if c < '0' || c > '9' {
+				return false
+			}
+		}
+		return true
+	case len(tok) >= 2 && (tok[0] == '+' || tok[0] == '-'):
+		for _, c := range tok[1:] {
+			if c < '0' || c > '9' {
+				return false
+			}
+		}
+		return true
+	case isGridLike(tok):
+		return true
+	}
+	return false
 }
 
 // Run shows the window and blocks the main goroutine until the user closes
