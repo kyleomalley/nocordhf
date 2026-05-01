@@ -1329,25 +1329,48 @@ func findCandidates(wf *waterfall) []Candidate {
 	for i := range buckets {
 		cands = append(cands, buckets[i].cands...)
 	}
-	// Sort candidates by sync score descending so workers decode strongest signals
-	// first. This maximizes recall: weak signals get processed if the wall-clock
-	// budget allows, but we never starve the audio capture goroutine because
-	// the budget-check in the worker loop enforces early exit.
-	//
-	// Historical note: nocordhf previously capped candidates at top 256–1500 to
-	// limit CPU cost, but this discarded weak Costas hits (score 5–8) that still
-	// decode via OSD. Corpus testing on real FT8 showed ~40% of decodable signals
-	// had Costas scores in this range. The wall-clock budget (13s for live decode)
-	// provides the enforcement mechanism instead of a count-based cap, matching
-	// jt9's approach: keep all candidates scoring ≥ minScore and let wall time
-	// decide how many decode.
+	// Sort candidates by sync score descending. Dedup walks neighbours so it
+	// needs sorted input; the same order is then used by the cap below to
+	// keep the highest-scoring survivors.
 	sort.SliceStable(cands, func(i, j int) bool {
 		return cands[i].Score > cands[j].Score
 	})
+	deduped := deduplicateCandidates(cands)
+	capped := capCandidates(deduped)
 	if logging.L != nil {
-		logging.L.Debugw("pre-dedup candidates", "count", len(cands))
+		logging.L.Debugw("candidates", "raw", len(cands), "deduped", len(deduped), "capped", len(capped))
 	}
-	return deduplicateCandidates(cands)
+	return capped
+}
+
+// candCapPercent / candCapFloor / candCapCeiling shape the per-slot
+// candidate budget that BP+OSD will actually process. Profile data shows
+// BP+OSD accounts for ~87% of decode CPU, so capping here is the highest-
+// leverage place to control wall time.
+//
+// Quiet slots (≤floor candidates) pass through untouched so weak-signal
+// recall is preserved. Busy slots are clamped to the ceiling so a noise-
+// flooded band can't blow the wall budget. Between those bounds we keep
+// the top X% by sync score, mirroring jt9 sync8's percentile-floor design.
+const (
+	candCapPercent = 60  // keep top N% by sync score
+	candCapFloor   = 200 // always process at least this many
+	candCapCeiling = 600 // never process more than this many
+)
+
+func capCandidates(cands []Candidate) []Candidate {
+	n := len(cands)
+	if n <= candCapFloor {
+		return cands
+	}
+	keep := n * candCapPercent / 100
+	if keep < candCapFloor {
+		keep = candCapFloor
+	}
+	if keep > candCapCeiling {
+		keep = candCapCeiling
+	}
+	return cands[:keep]
 }
 
 // extractLLR extracts 174 soft LLR values from the waterfall for a candidate,

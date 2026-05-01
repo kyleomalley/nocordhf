@@ -19,13 +19,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -69,6 +72,8 @@ func main() {
 	playbackDev := flag.String("audio-out", "USB Audio", "playback device name (TX audio to the rig)")
 	noCAT := flag.Bool("no-cat", false, "skip radio control — RX-only, no PTT/tune")
 	listAudio := flag.Bool("list-audio", false, "list audio capture devices and exit")
+	decode := flag.Bool("decode", false, "decode WAV files and output results (standalone mode, no GUI)")
+	corpusDir := flag.String("corpus-dir", "", "output directory for -decode (default: recordings/corpus/nocordhf/<git-sha>)")
 	debug := flag.Bool("debug", false, "verbose logging")
 	flag.Parse()
 
@@ -90,6 +95,11 @@ func main() {
 		if err := audio.ListDevices(); err != nil {
 			log.Fatalw("list devices failed", "err", err)
 		}
+		return
+	}
+
+	if *decode {
+		decodeWAVFiles(flag.Args(), *corpusDir)
 		return
 	}
 
@@ -523,6 +533,119 @@ func generateTuneTone(audioFreqHz, level, seconds float64) []float32 {
 		}
 	}
 	return out
+}
+
+// decodeWAVFiles batch-decodes WAV files into a versioned corpus directory.
+// Output: one .txt file per WAV, with header (BuildID, dirty status, run
+// timestamp) and sorted-unique `freq\tsnr\tmessage` lines. Designed for diffing
+// across nocordhf versions to track decode-quality regressions and
+// improvements over time.
+func decodeWAVFiles(wavPaths []string, corpusDir string) {
+	if len(wavPaths) == 0 {
+		fmt.Fprintf(os.Stderr, "usage: nocordhf -decode <wavfile> [<wavfile> ...]\n")
+		os.Exit(1)
+	}
+
+	// Default corpus directory: recordings/corpus/nocordhf/<git-sha>/
+	// Extract just the short git hash from BuildID (format: "sha-timestamp").
+	if corpusDir == "" {
+		sha := strings.SplitN(BuildID, "-", 2)[0]
+		corpusDir = filepath.Join("recordings", "corpus", "nocordhf", sha)
+	}
+	if err := os.MkdirAll(corpusDir, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "create corpus dir: %v\n", err)
+		os.Exit(1)
+	}
+
+	dirty := isGitDirty()
+	runTime := time.Now().UTC().Format(time.RFC3339)
+
+	ft8.SetDecodeBudget(30 * time.Second)
+
+	fmt.Printf("Corpus dir: %s (build=%s, dirty=%v)\n", corpusDir, BuildID, dirty)
+
+	for _, wavPath := range wavPaths {
+		samples, err := loadWAV(wavPath)
+		if err != nil {
+			fmt.Printf("  %s: %v\n", filepath.Base(wavPath), err)
+			continue
+		}
+		if len(samples) < 100000 {
+			fmt.Printf("  %s: insufficient samples (%d)\n", filepath.Base(wavPath), len(samples))
+			continue
+		}
+
+		base := strings.TrimSuffix(filepath.Base(wavPath), filepath.Ext(wavPath))
+		outPath := filepath.Join(corpusDir, base+".txt")
+
+		results := ft8.Decode(samples, time.Now().UTC(), nil)
+
+		// Dedupe by message text, keeping the highest-SNR observation.
+		// FT8 candidates can produce the same message at multiple sync
+		// scores; we want a stable representative per message for diffing.
+		bestByMsg := make(map[string]ft8.Decoded)
+		for _, r := range results {
+			if r.Message.Text == "" {
+				continue
+			}
+			if existing, ok := bestByMsg[r.Message.Text]; !ok || r.SNR > existing.SNR {
+				bestByMsg[r.Message.Text] = r
+			}
+		}
+		msgs := make([]string, 0, len(bestByMsg))
+		for m := range bestByMsg {
+			msgs = append(msgs, m)
+		}
+		sort.Strings(msgs)
+
+		f, err := os.Create(outPath)
+		if err != nil {
+			fmt.Printf("  %s: create failed: %v\n", base, err)
+			continue
+		}
+		fmt.Fprintf(f, "# nocordhf %s | run=%s | dirty=%v\n", BuildID, runTime, dirty)
+		fmt.Fprintf(f, "# freq\tsnr\tmessage\n")
+		for _, m := range msgs {
+			r := bestByMsg[m]
+			fmt.Fprintf(f, "%.1f\t%.0f\t%s\n", r.Freq, r.SNR, m)
+		}
+		f.Close()
+
+		fmt.Printf("  %s: %d messages\n", base, len(msgs))
+	}
+}
+
+// loadWAV reads a WAV file, skips the 44-byte RIFF header, and returns the
+// int16 PCM samples normalized to [-1, 1] as float32. Sufficient for the
+// 12 kHz mono recordings we capture.
+func loadWAV(path string) ([]float32, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) < 44 {
+		return nil, fmt.Errorf("file too small")
+	}
+	var samples []float32
+	reader := bytes.NewReader(data[44:])
+	for {
+		var v int16
+		if binary.Read(reader, binary.LittleEndian, &v) != nil {
+			break
+		}
+		samples = append(samples, float32(v)/32768.0)
+	}
+	return samples, nil
+}
+
+// isGitDirty reports whether the working tree has uncommitted changes,
+// so corpus output files can flag results from non-pristine builds.
+func isGitDirty() bool {
+	out, err := exec.Command("git", "status", "--porcelain").Output()
+	if err != nil {
+		return false
+	}
+	return len(strings.TrimSpace(string(out))) > 0
 }
 
 // redirectStderr points FD 2 (and the Go runtime's panic destination) at
