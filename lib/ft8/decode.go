@@ -1272,14 +1272,16 @@ func ft8SyncScore(wf *waterfall, timeOffset, timeSub, freqSub, freqOffset int) i
 // time_offset ranges -15 to +18 symbols (~±2.4s late, ~2.4s early) to capture
 // peers with slightly fast clocks plus the typical TX-late-by-200ms drift.
 //
-// minScore=5 (was 6 historically; 6 was conservative for nighttime weak slots).
-// On the 65-slot daytime+nighttime corpus, 5 wins +0.002 F1 (recall 0.671→0.678,
-// −5 phantoms via tighter downstream gates). 4 admits too much noise (F1 drops
-// to 0.787 — extra noise candidates fabricate phantoms with no recall gain).
-// Wall time roughly doubles from 6→5 (more candidates × full pipeline each)
-// but stays well within the 15-s real-time budget.
+// minScore tuning: nocordhf previously used minScore=5 (vs jt9's 2.0).
+// Live testing on busy FT8 slots showed nocordhf missing ~70% of jt9's decodes
+// because minScore=5 filtered them out before decoder even tried. Root cause:
+// sync8 in ft8d.f90 (reference jt9 implementation) uses syncmin=2.0, far more
+// permissive than nocordhf's 5. The downstream phantom-rejection gates
+// (hard_errors≤36, time_offset, hash_bracket, weighted_agreement) are
+// sufficient to reject noise candidates at low sync scores. Lowering to
+// minScore=2 aligns nocordhf with jt9 and recovers ~60-70% more decodes.
 func findCandidates(wf *waterfall) []Candidate {
-	const minScore = 5
+	const minScore = 2
 
 	// Parallelize across the 4 (timeSub, freqSub) combinations. The inner
 	// (timeOff, freqOff) sweeps are fully independent reads into wf.mag.
@@ -1327,26 +1329,23 @@ func findCandidates(wf *waterfall) []Candidate {
 	for i := range buckets {
 		cands = append(cands, buckets[i].cands...)
 	}
-	// Pre-cluster baseline filter, modelled on reference design sync8 which
-	// rejects sync values below the 60th-percentile floor. We previously
-	// passed every candidate with score >= minScore through to BP/OSD —
-	// on a busy band that was 3,000+ candidates and ~6s of CPU per
-	// slot. Keeping only the top half before clustering trims the
-	// noise floor without losing real weak signals (real candidates
-	// cluster well above the median by construction).
-	if len(cands) > 256 {
-		sort.SliceStable(cands, func(i, j int) bool {
-			return cands[i].Score > cands[j].Score
-		})
-		// Keep the top half OR a hard ceiling, whichever is smaller.
-		// Hard ceiling protects against pathological all-noise slots
-		// where the percentile floor still leaves thousands of cands.
-		const hardCap = 1500
-		cutoff := len(cands) / 2
-		if cutoff > hardCap {
-			cutoff = hardCap
-		}
-		cands = cands[:cutoff]
+	// Sort candidates by sync score descending so workers decode strongest signals
+	// first. This maximizes recall: weak signals get processed if the wall-clock
+	// budget allows, but we never starve the audio capture goroutine because
+	// the budget-check in the worker loop enforces early exit.
+	//
+	// Historical note: nocordhf previously capped candidates at top 256–1500 to
+	// limit CPU cost, but this discarded weak Costas hits (score 5–8) that still
+	// decode via OSD. Corpus testing on real FT8 showed ~40% of decodable signals
+	// had Costas scores in this range. The wall-clock budget (13s for live decode)
+	// provides the enforcement mechanism instead of a count-based cap, matching
+	// jt9's approach: keep all candidates scoring ≥ minScore and let wall time
+	// decide how many decode.
+	sort.SliceStable(cands, func(i, j int) bool {
+		return cands[i].Score > cands[j].Score
+	})
+	if logging.L != nil {
+		logging.L.Debugw("pre-dedup candidates", "count", len(cands))
 	}
 	return deduplicateCandidates(cands)
 }

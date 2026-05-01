@@ -58,8 +58,8 @@ func init() {
 }
 
 func main() {
-	myCall := flag.String("call", os.Getenv("FT8M8_CALL"), "operator callsign (default $FT8M8_CALL)")
-	myGrid := flag.String("grid", os.Getenv("FT8M8_GRID"), "operator grid square (default $FT8M8_GRID)")
+	myCall := flag.String("call", os.Getenv("NOCORDHF_CALL"), "operator callsign (default $NOCORDHF_CALL)")
+	myGrid := flag.String("grid", os.Getenv("NOCORDHF_GRID"), "operator grid square (default $NOCORDHF_GRID)")
 	// Default to a permissive "USB Audio" substring rather than the
 	// IC-7300-specific "USB Audio CODEC" — different macOS versions
 	// surface the same physical interface as either "USB Audio CODEC"
@@ -95,8 +95,8 @@ func main() {
 
 	log.Infow("nocordhf starting", "build", BuildID, "audio", *audioDev, "call", *myCall, "grid", *myGrid)
 
-	// Live decoder gets the same wall-clock budget as cmd/ft8m8 so the
-	// audio capture goroutine has CPU headroom during decode.
+	// Live decoder wall-clock budget; gives the audio capture goroutine
+	// CPU headroom during decode.
 	ft8.SetDecodeBudget(ft8.LiveDecodeWallBudget)
 
 	// Channels into the GUI. txCh delivers TX requests; tuneCh delivers
@@ -208,11 +208,10 @@ func main() {
 		}
 	}
 
-	// Audio capture: same path as ft8m8. Frames flow into a single goroutine
-	// that runs Decode() and pushes results into the chat. The capturer
-	// also fans samples out to the waterfall processor via SetSink — same
-	// pattern cmd/ft8m8 uses, decoupled from the slot-frame queue so the
-	// scope updates continuously rather than once per slot.
+	// Audio capture. Frames flow into a single goroutine that runs Decode()
+	// and pushes results into the chat. The capturer also fans samples out
+	// to the waterfall processor via SetSink, decoupled from the slot-frame
+	// queue so the scope updates continuously rather than once per slot.
 	capturer := audio.New(*audioDev)
 	wfProc := waterfall.New(128)
 	capturer.SetSink(func(samples []float32, now time.Time) {
@@ -238,9 +237,34 @@ func main() {
 		defer capturer.Stop()
 	}
 
+	// In -debug mode, persist every captured RX slot as a WAV so a missed
+	// decode can be replayed through WSJT-X (or jt9) for comparison.
+	var rxRecorder *audio.FrameRecorder
+	if audioOK && *debug {
+		freqFn := func() uint64 {
+			if r := radio.Inner(); r != nil {
+				return radio.Frequency()
+			}
+			return 0
+		}
+		if rec, err := audio.NewFrameRecorder("recordings", BuildID, freqFn); err != nil {
+			log.Warnw("rx recorder init failed", "err", err)
+		} else {
+			rxRecorder = rec
+			log.Infow("rx frame recording enabled", "dir", "recordings")
+		}
+	}
+
 	if audioOK {
 		go func() {
 			for frame := range capturer.Frames() {
+				if rxRecorder != nil {
+					if path, err := rxRecorder.Save(frame); err != nil {
+						log.Warnw("rx frame save failed", "err", err)
+					} else {
+						log.Debugw("rx frame saved", "path", path, "slot", frame.SlotStart.Format("15:04:05"))
+					}
+				}
 				if *myCall != "" {
 					ft8.SetAPContext(*myCall, "")
 				}
@@ -291,8 +315,7 @@ func main() {
 	}()
 
 	// TX loop: encode → wait for slot boundary → mute capturer → PTT on →
-	// settle → play samples → PTT off → unmute. Same shape as cmd/ft8m8 but
-	// without the QSO state-machine ceremony — Nocord is a chat client; we
+	// settle → play samples → PTT off → unmute. Nocord is a chat client; we
 	// either CQ or send a single directed call, no signal-report ladder.
 	player := audio.NewPlayer(*playbackDev)
 	go func() {
@@ -305,8 +328,7 @@ func main() {
 }
 
 // runTX executes one TX request to completion. Factored so the main
-// goroutine isn't a wall of nested select/defer blocks. Mirrors the TX
-// pipeline in cmd/ft8m8/main.go without the GUI/QSO callbacks.
+// goroutine isn't a wall of nested select/defer blocks.
 func runTX(
 	g *nocord.GUI,
 	log *zap.SugaredLogger,
@@ -435,8 +457,8 @@ func runTX(
 		pttOffWithRetry(radio, log)
 	}
 
-	// Peak readout — same diagnostic as cmd/ft8m8. Lets the operator
-	// dial in TxLevel + macOS output + USB MOD LEVEL.
+	// Peak readout — lets the operator dial in TxLevel + macOS output +
+	// USB MOD LEVEL.
 	peak := math.Float64frombits(player.LastPeak.Load())
 	peakDBFS := -120.0
 	if peak > 0 {

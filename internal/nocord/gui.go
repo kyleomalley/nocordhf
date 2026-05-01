@@ -760,7 +760,7 @@ func (g *GUI) showSettings() {
 	// the audio drive linearly, so this acts as a soft "TX power"
 	// control: 0.02 (≈ -34 dBFS) at the bottom for a faint signal,
 	// 0.5 (≈ -6 dBFS) at the top for full ALC drive. Default 0.18
-	// is the conservative ft8m8 setting that keeps ALC happy while
+	// is a conservative setting that keeps ALC happy while
 	// still putting out useful power on most rigs.
 	curTxLevel := g.TxLevel()
 	txLevelLabel := canvas.NewText(fmt.Sprintf("%.2f (%.0f%%)", curTxLevel, curTxLevel*100/0.5), color.RGBA{200, 205, 215, 255})
@@ -2752,16 +2752,8 @@ func (g *GUI) buildLayout() fyne.CanvasObject {
 		CertPassword:    prefs.String("tqsl_cert_password"),
 	}
 	g.tqslAutoUpload = prefs.BoolWithFallback("tqsl_auto_upload", false)
-	// Load both nocordhf.adif (our own future writes) and any pre-
-	// existing ft8m8.adif from the legacy GUI in the same working
-	// directory. Means the operator's full QSO history lights up the
-	// map overlay on first launch, instead of starting blank until
-	// they finish their first NocordHF contact. De-dup is unnecessary
-	// for overlay purposes (worked-grids is a set).
-	for _, path := range []string{"nocordhf.adif", "ft8m8.adif"} {
-		if recs, err := adif.Read(path); err == nil && len(recs) > 0 {
-			g.adifLog = append(g.adifLog, recs...)
-		}
+	if recs, err := adif.Read("nocordhf.adif"); err == nil && len(recs) > 0 {
+		g.adifLog = append(g.adifLog, recs...)
 	}
 	g.qso.SetOnLogged(func(rec adif.Record) {
 		// Persist + update in-memory log + refresh map overlay.
