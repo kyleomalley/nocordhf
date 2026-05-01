@@ -29,10 +29,10 @@ jobs:
     runs-on: macos-14  # Apple Silicon; native arm64 + cross-build to amd64.
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: "1.26"
           check-latest: true
@@ -101,7 +101,7 @@ jobs:
             "NocordHF-${{ steps.ver.outputs.version }}.app.zip"
 
       - name: Upload artefacts to draft GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           draft: true
           files: |
