@@ -3,6 +3,28 @@
 All notable changes to NocordHF are tracked in this file. Version
 numbers follow [Semantic Versioning](https://semver.org/).
 
+## [1.0.4] - 2026-05-01
+
+### Fixes
+
+- Bundle launches (Finder double-click on `NocordHF.app`) crashed
+  immediately because cwd was `/`, and `logging.InitFile` couldn't
+  create `nocordhf.log` there. The app now `chdir`s to
+  `~/Library/Application Support/NocordHF/` when launched as a
+  bundle so log + ADIF + recordings have a writable home. Terminal
+  launches keep the existing cwd.
+
+### Release tooling
+
+- `MAX_WAIT` in `scripts/notarize-wait.sh` raised from 30 min to
+  1 hr. v1.0.3's DMG submission was accepted at 28m20s — only
+  100 s clear of timing out.
+- New `make release-staple` target picks up after a
+  notarization-timeout failure: takes the existing submission ID,
+  polls Apple, staples the `.app`, then builds + signs + notarizes
+  + staples the DMG. Avoids a full rebuild + resubmit when Apple's
+  queue is just slow.
+
 ## [1.0.3] - 2026-05-01
 
 ### Decoder

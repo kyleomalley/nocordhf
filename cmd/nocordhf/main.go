@@ -61,6 +61,16 @@ func init() {
 }
 
 func main() {
+	// Bundle launches start with cwd=/, which isn't writable for a
+	// regular user — so logging.InitFile("nocordhf.log") below would
+	// fail and main() would exit 1 immediately, making the .app appear
+	// to "open and close instantly" in Finder. Move to a writable
+	// per-user data dir before any relative-path I/O. Terminal
+	// launches keep their original cwd (the binary path won't contain
+	// ".app/Contents/MacOS/") so the existing CLI workflow is
+	// unchanged.
+	chdirIfBundled()
+
 	myCall := flag.String("call", os.Getenv("NOCORDHF_CALL"), "operator callsign (default $NOCORDHF_CALL)")
 	myGrid := flag.String("grid", os.Getenv("NOCORDHF_GRID"), "operator grid square (default $NOCORDHF_GRID)")
 	// Default to a permissive "USB Audio" substring rather than the
@@ -673,6 +683,43 @@ func isGitDirty() bool {
 		return false
 	}
 	return len(strings.TrimSpace(string(out))) > 0
+}
+
+// chdirIfBundled detects when nocordhf was launched as a macOS .app
+// bundle (via Finder double-click or `open`) and moves cwd to a per-
+// user data directory so relative-path I/O — nocordhf.log,
+// nocordhf.adif, recordings/, *.prof — has somewhere writable to
+// land. Bundle launches start with cwd=/, where logging.InitFile
+// would fail and crash main() before the GUI even draws, making the
+// app appear to "open and close instantly" in Finder.
+//
+// Detection: the executable's path contains ".app/Contents/MacOS/".
+// Terminal launches (./build/nocordhf, /usr/local/bin/nocordhf, etc.)
+// won't match, so cwd is left alone and the existing CLI workflow is
+// untouched.
+//
+// Target: $XDG_CONFIG_HOME/NocordHF (Linux), ~/Library/Application
+// Support/NocordHF (macOS) — i.e. whatever os.UserConfigDir returns.
+// Best-effort: if either UserConfigDir or MkdirAll fails we fall back
+// to leaving cwd alone, and logging.InitFile will still surface the
+// underlying problem on stderr.
+func chdirIfBundled() {
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	if !strings.Contains(exe, ".app/Contents/MacOS/") {
+		return
+	}
+	cfg, err := os.UserConfigDir()
+	if err != nil {
+		return
+	}
+	dataDir := filepath.Join(cfg, "NocordHF")
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		return
+	}
+	_ = os.Chdir(dataDir)
 }
 
 // redirectStderr points FD 2 (and the Go runtime's panic destination) at

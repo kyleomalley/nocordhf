@@ -17,18 +17,28 @@ set -euo pipefail
 
 ARTEFACT="${1:?artefact path required}"
 PROFILE="${2:?keychain profile required}"
+# Optional 3rd arg: an existing submission ID to poll instead of
+# submitting fresh. Used by `make release-staple` to resume after
+# Apple's queue overran the CI runner's timeout — the artefact is
+# already in Apple's pipeline; we just need to wait for it.
+EXISTING_ID="${3:-}"
 
 # Tunables — generous defaults so a slow Apple queue doesn't trip
 # the timeout. Override via env if you ever need to.
 POLL_INTERVAL="${POLL_INTERVAL:-30}"      # seconds between polls
-MAX_WAIT="${MAX_WAIT:-1800}"              # 30 min hard cap
+MAX_WAIT="${MAX_WAIT:-3600}"              # 1 hr hard cap (v1.0.3's DMG submission landed at 28m20s — too tight)
 NETWORK_RETRIES="${NETWORK_RETRIES:-5}"   # consecutive poll failures before giving up
 
-echo "submitting: $ARTEFACT"
-SUBMIT_OUTPUT="$(xcrun notarytool submit "$ARTEFACT" --keychain-profile "$PROFILE" --output-format json)"
-echo "$SUBMIT_OUTPUT"
-SUBMISSION_ID="$(echo "$SUBMIT_OUTPUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")"
-echo "submission id: $SUBMISSION_ID"
+if [ -n "$EXISTING_ID" ]; then
+  echo "polling existing submission: $EXISTING_ID (artefact: $ARTEFACT)"
+  SUBMISSION_ID="$EXISTING_ID"
+else
+  echo "submitting: $ARTEFACT"
+  SUBMIT_OUTPUT="$(xcrun notarytool submit "$ARTEFACT" --keychain-profile "$PROFILE" --output-format json)"
+  echo "$SUBMIT_OUTPUT"
+  SUBMISSION_ID="$(echo "$SUBMIT_OUTPUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")"
+  echo "submission id: $SUBMISSION_ID"
+fi
 
 elapsed=0
 network_failures=0

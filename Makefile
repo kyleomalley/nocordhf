@@ -1,4 +1,4 @@
-.PHONY: build run clean release-snapshot release-mac icon precommit
+.PHONY: build run clean release-snapshot release-mac release-staple icon precommit
 
 # BuildID is stamped into the binary so a running NocordHF advertises
 # its origin in the title bar / log lines. Local builds use a
@@ -96,6 +96,57 @@ release-mac:
 	@echo "✓ release-mac done:"
 	@echo "    ./build/NocordHF.app"
 	@echo "    ./build/NocordHF-$(NOCORDHF_VERSION).dmg"
+
+# Resume a release that died because Apple's notary queue overran the
+# CI runner's timeout (notarize-wait.sh exits at MAX_WAIT, taking the
+# runner — and the in-flight submission's signed artefact — with it).
+#
+# Pre-requisites:
+#   - The signed (but unstapled) ./build/NocordHF.app from the failed
+#     run, OR a fresh local `make release-mac` re-run that got at
+#     least to the `notarytool submit` step. The .app must be the same
+#     bytes Apple has in their queue under APP_SUBMISSION_ID.
+#   - APP_SUBMISSION_ID grabbed from the failed CI job's log (the
+#     `submission id: <uuid>` line right before the timeout).
+#   - The same NOCORDHF_VERSION + MACOS_CERTIFICATE_NAME the original
+#     run used (otherwise the DMG won't match the .app's signature).
+#   - A keychain profile named $NOTARY_PROFILE (default
+#     `nocordhf-notary`) — use `xcrun notarytool store-credentials`
+#     to set one up if it isn't already.
+#
+# What it does:
+#   1. Polls Apple for APP_SUBMISSION_ID until Accepted (or fails out
+#      on Invalid/Rejected).
+#   2. Staples the existing .app.
+#   3. Builds, signs, notarizes, and staples the DMG fresh — this
+#      part submits a NEW submission ID for the DMG, then waits the
+#      same way `release-mac` does.
+#   4. Leaves both artefacts under ./build/ for manual upload to the
+#      GitHub Release.
+release-staple:
+	@if [ -z "$(NOCORDHF_VERSION)" ]; then echo "NOCORDHF_VERSION is required"; exit 1; fi
+	@if [ -z "$(MACOS_CERTIFICATE_NAME)" ]; then echo "MACOS_CERTIFICATE_NAME is required"; exit 1; fi
+	@if [ -z "$(APP_SUBMISSION_ID)" ]; then echo "APP_SUBMISSION_ID is required (from the failed CI job log)"; exit 1; fi
+	@if [ ! -d ./build/NocordHF.app ]; then echo "./build/NocordHF.app missing — re-run a local make release-mac up to the notarize step, or download the signed .app from the failed CI run"; exit 1; fi
+	@echo "==> polling notary for $(APP_SUBMISSION_ID)"
+	./scripts/notarize-wait.sh ./build/NocordHF.app $(NOTARY_PROFILE) $(APP_SUBMISSION_ID)
+	@echo "==> stapling .app"
+	xcrun stapler staple ./build/NocordHF.app
+	xcrun stapler validate ./build/NocordHF.app
+	@echo "==> building DMG"
+	rm -f ./build/NocordHF-$(NOCORDHF_VERSION).dmg
+	hdiutil create -volname "NocordHF" -srcfolder ./build/NocordHF.app \
+		-ov -format UDZO ./build/NocordHF-$(NOCORDHF_VERSION).dmg
+	codesign --force --sign "$(MACOS_CERTIFICATE_NAME)" --timestamp \
+		./build/NocordHF-$(NOCORDHF_VERSION).dmg
+	@echo "==> notarizing DMG (new submission)"
+	./scripts/notarize-wait.sh ./build/NocordHF-$(NOCORDHF_VERSION).dmg $(NOTARY_PROFILE)
+	xcrun stapler staple ./build/NocordHF-$(NOCORDHF_VERSION).dmg
+	@echo
+	@echo "✓ release-staple done. Upload manually to the draft Release:"
+	@echo "    gh release upload v$(NOCORDHF_VERSION) \\"
+	@echo "      ./build/NocordHF-$(NOCORDHF_VERSION).dmg \\"
+	@echo "      ./build/NocordHF.app  (zip first: ditto -c -k --keepParent ./build/NocordHF.app ./build/NocordHF-$(NOCORDHF_VERSION).app.zip)"
 
 clean:
 	rm -rf ./build ./dist
