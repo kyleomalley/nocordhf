@@ -68,11 +68,18 @@ release-mac:
 		-o ./build/nocordhf-arm64 ./cmd/nocordhf
 	lipo -create -output ./build/nocordhf ./build/nocordhf-amd64 ./build/nocordhf-arm64
 	rm ./build/nocordhf-amd64 ./build/nocordhf-arm64
-	@echo "==> packaging .app via fyne (uses FyneApp.toml for Info.plist)"
+	@echo "==> packaging .app via fyne"
 	cd ./build && fyne package --target darwin --executable ./nocordhf --src ../cmd/nocordhf --icon $(CURDIR)/docs/icon.png --app-id com.nocordhf.app --name NocordHF --app-version $(NOCORDHF_VERSION) --release
 	rm ./build/nocordhf
-	@echo "==> codesigning .app with hardened runtime"
+	@echo "==> patching Info.plist (NSMicrophoneUsageDescription, LSMinimumSystemVersion)"
+	# fyne package silently drops the FyneApp.toml [macOS] section, so
+	# without these keys the app gets a silent CoreAudio denial under
+	# the hardened runtime and FT8 RX decodes nothing.
+	plutil -insert NSMicrophoneUsageDescription -string "NocordHF captures audio from your radio's USB CODEC interface to decode FT8 transmissions." ./build/NocordHF.app/Contents/Info.plist
+	plutil -replace LSMinimumSystemVersion -string "11.0" ./build/NocordHF.app/Contents/Info.plist
+	@echo "==> codesigning .app with hardened runtime + audio-input entitlement"
 	codesign --force --deep --options runtime --timestamp \
+		--entitlements ./scripts/macos/entitlements.plist \
 		--sign "$(MACOS_CERTIFICATE_NAME)" \
 		./build/NocordHF.app
 	codesign --verify --deep --strict --verbose=2 ./build/NocordHF.app
