@@ -1,14 +1,20 @@
 name: release
 
-# Runs goreleaser on every pushed tag matching v*.*.*. Builds the
-# macOS universal binary, packs it as a .app bundle (with the
-# Info.plist additions from FyneApp.toml — including the microphone
-# usage description that Catalina+ requires for FT8 audio capture),
-# wraps that into a DMG, and uploads to a GitHub Release.
+# Builds, signs, and notarizes the macOS release on every pushed tag
+# matching v*.*.*. Produces a Developer-ID-signed + Apple-notarized +
+# stapled .app and .dmg, uploads both to a draft GitHub Release.
 #
-# To cut a release: tag the commit (e.g. `git tag v1.0.0 && git push
-# --tags`). The release is created in draft mode by default; review
-# the auto-generated changelog and click Publish in the GitHub UI.
+# To cut a release: tag the commit (e.g. `git tag v1.0.1 && git push
+# --tags`). Review the draft Release in the GitHub UI and click
+# Publish.
+#
+# Required repository secrets:
+#   MACOS_CERTIFICATE       base64-encoded Developer ID Application .p12
+#   MACOS_CERTIFICATE_PWD   export password for the .p12
+#   MACOS_CERTIFICATE_NAME  e.g. "Developer ID Application: Your Name (TEAMID)"
+#   MACOS_NOTARIZATION_APPLE_ID         Apple ID email for notarization
+#   MACOS_NOTARIZATION_TEAM_ID          10-char Apple developer team identifier
+#   MACOS_NOTARIZATION_PWD         app-specific password for the Apple ID
 
 on:
   push:
@@ -19,13 +25,11 @@ permissions:
   contents: write
 
 jobs:
-  goreleaser:
-    runs-on: macos-14  # Apple Silicon runner; supports cross-build to amd64.
+  release:
+    runs-on: macos-14  # Apple Silicon; native arm64 + cross-build to amd64.
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # goreleaser needs full history for changelog generation
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -33,44 +37,75 @@ jobs:
           go-version: "1.26"
           check-latest: true
 
-      - name: Install fyne tooling
-        run: |
-          go install fyne.io/tools/cmd/fyne@latest
-          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+      - name: Derive release version from tag
+        id: ver
+        # Strip the leading `v` so v1.0.1 → 1.0.1. Used as
+        # NOCORDHF_VERSION downstream and stamped into the .app/.dmg.
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
-      - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v6
-        with:
-          distribution: goreleaser
-          version: latest
-          args: release --clean
+      - name: Import Developer ID signing certificate
+        # Bootstraps a throwaway keychain for this run only, imports
+        # the Developer ID Application .p12 from secrets, and makes
+        # codesign able to find the identity. The keychain is
+        # discarded with the runner at job end.
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build .app bundle (Apple Silicon)
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
         run: |
-          # GoReleaser produces a raw universal binary; wrap it in a
-          # proper .app bundle so users can drag it into Applications.
-          # fyne package reads FyneApp.toml for the Info.plist
-          # additions (including NSMicrophoneUsageDescription).
-          pwd
-          ls -R docs/
-          fyne package -os darwin -icon "${GITHUB_WORKSPACE}/docs/icon.png" \
-            -src ./cmd/nocordhf \
-            -release \
-            -name NocordHF \
-            -app-id com.nocordhf.app \
-            -app-version "${GITHUB_REF_NAME#v}"
-          codesign --force --deep --sign - NocordHF.app
-          # Stamp the bundle into a DMG via hdiutil.
-          hdiutil create -volname NocordHF \
-            -srcfolder NocordHF.app \
-            -ov -format UDZO \
-            NocordHF-${GITHUB_REF_NAME}.dmg
+          set -euo pipefail
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          echo "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$RUNNER_TEMP/certificate.p12" \
+            -k "$KEYCHAIN_PATH" \
+            -P "$MACOS_CERTIFICATE_PWD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          # Prepend the throwaway keychain to the search list so
+          # codesign sees it without disturbing the runner's defaults.
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/certificate.p12"
+          security find-identity -p codesigning -v
 
-      - name: Upload .app DMG to release
+      - name: Store notarytool credentials
+        # `make release-mac` uses the keychain-profile form of
+        # notarytool; storing under the same profile name the Makefile
+        # references means no env-var plumbing into the target.
+        env:
+          MACOS_NOTARIZATION_APPLE_ID: ${{ secrets.MACOS_NOTARIZATION_APPLE_ID }}
+          MACOS_NOTARIZATION_TEAM_ID: ${{ secrets.MACOS_NOTARIZATION_TEAM_ID }}
+          MACOS_NOTARIZATION_PWD: ${{ secrets.MACOS_NOTARIZATION_PWD }}
+        run: |
+          xcrun notarytool store-credentials nocordhf-notary \
+            --apple-id "$MACOS_NOTARIZATION_APPLE_ID" \
+            --team-id "$MACOS_NOTARIZATION_TEAM_ID" \
+            --password "$MACOS_NOTARIZATION_PWD"
+
+      - name: Build, sign, notarize, and staple
+        env:
+          NOCORDHF_VERSION: ${{ steps.ver.outputs.version }}
+          MACOS_CERTIFICATE_NAME: ${{ secrets.MACOS_CERTIFICATE_NAME }}
+        run: make release-mac
+
+      - name: Zip the .app for release upload
+        # The .dmg is the canonical user-facing artefact; the zipped
+        # .app is included for users (and CI consumers) who prefer
+        # the bundle directly.
+        run: |
+          cd ./build
+          ditto -c -k --keepParent NocordHF.app \
+            "NocordHF-${{ steps.ver.outputs.version }}.app.zip"
+
+      - name: Upload artefacts to draft GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: NocordHF-*.dmg
+          draft: true
+          files: |
+            build/NocordHF-${{ steps.ver.outputs.version }}.dmg
+            build/NocordHF-${{ steps.ver.outputs.version }}.app.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
