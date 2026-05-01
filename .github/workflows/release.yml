@@ -12,15 +12,9 @@ name: release
 #   MACOS_CERTIFICATE       base64-encoded Developer ID Application .p12
 #   MACOS_CERTIFICATE_PWD   export password for the .p12
 #   MACOS_CERTIFICATE_NAME  e.g. "Developer ID Application: Your Name (TEAMID)"
-<<<<<<< HEAD
 #   MACOS_NOTARIZATION_APPLE_ID         Apple ID email for notarization
 #   MACOS_NOTARIZATION_TEAM_ID          10-char Apple developer team identifier
 #   MACOS_NOTARIZATION_PWD         app-specific password for the Apple ID
-=======
-#   NOTARY_APPLE_ID         Apple ID email for notarization
-#   NOTARY_TEAM_ID          10-char Apple developer team identifier
-#   NOTARY_PASSWORD         app-specific password for the Apple ID
->>>>>>> 702732f (update goreleaser)
 
 on:
   push:
@@ -82,7 +76,6 @@ jobs:
         # notarytool; storing under the same profile name the Makefile
         # references means no env-var plumbing into the target.
         env:
-<<<<<<< HEAD
           MACOS_NOTARIZATION_APPLE_ID: ${{ secrets.MACOS_NOTARIZATION_APPLE_ID }}
           MACOS_NOTARIZATION_TEAM_ID: ${{ secrets.MACOS_NOTARIZATION_TEAM_ID }}
           MACOS_NOTARIZATION_PWD: ${{ secrets.MACOS_NOTARIZATION_PWD }}
@@ -91,16 +84,6 @@ jobs:
             --apple-id "$MACOS_NOTARIZATION_APPLE_ID" \
             --team-id "$MACOS_NOTARIZATION_TEAM_ID" \
             --password "$MACOS_NOTARIZATION_PWD"
-=======
-          NOTARY_APPLE_ID: ${{ secrets.NOTARY_APPLE_ID }}
-          NOTARY_TEAM_ID: ${{ secrets.NOTARY_TEAM_ID }}
-          NOTARY_PASSWORD: ${{ secrets.NOTARY_PASSWORD }}
-        run: |
-          xcrun notarytool store-credentials nocordhf-notary \
-            --apple-id "$NOTARY_APPLE_ID" \
-            --team-id "$NOTARY_TEAM_ID" \
-            --password "$NOTARY_PASSWORD"
->>>>>>> 702732f (update goreleaser)
 
       - name: Build, sign, notarize, and staple
         env:
