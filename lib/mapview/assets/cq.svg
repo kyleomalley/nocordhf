@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <circle cx="24" cy="24" r="23" fill="#32AA5A"/>
+  <!-- "C" letterform: arc open on right -->
+  <path d="M 19 17
+           A 7 7 0 1 0 19 31"
+        stroke="#FFFFFF" stroke-width="3.5" fill="none" stroke-linecap="round"/>
+  <!-- "Q" letterform: full circle + diagonal tail -->
+  <circle cx="32" cy="24" r="6" stroke="#FFFFFF" stroke-width="3" fill="none"/>
+  <line x1="35" y1="28" x2="38" y2="32" stroke="#FFFFFF" stroke-width="3" stroke-linecap="round"/>
+</svg>

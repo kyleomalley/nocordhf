@@ -58,6 +58,11 @@ const (
 	// matching what they see for received signals.
 	scopeFT8BWHz = 50.0
 
+	// freqAxisHeight is the docked frequency-axis strip's vertical
+	// extent (replaces the old SCOPE header). Tall enough for one
+	// line of tick labels and a TX marker line below them.
+	freqAxisHeight = 28
+
 	// Time strip on the left of the waterfall: dedicated narrow column
 	// that holds crisp canvas.Text timestamps positioned by the layout to
 	// align with each slot boundary in the rasterised image.
@@ -156,11 +161,26 @@ type scopePane struct {
 
 	// Hooks fired by interactive decodeBox widgets. Set by the GUI so
 	// the scope package stays free of GUI-package types.
+	//
+	// onDecodeSelect fires on a single-click that landed on a decode
+	// box; arg is the call. The GUI uses it to show the magnification
+	// popup at the click position and to scroll/highlight the chat row.
+	//
+	// onDecodeDeselect fires on a single-click that landed on EMPTY
+	// waterfall. Used by the GUI to dismiss the magnification popup.
+	//
+	// onDecodeHover fires when the cursor moves onto a decode box
+	// (and again, with a different decode, when it moves to a
+	// different one). onDecodeHoverEnd fires when the cursor leaves
+	// all decode boxes. The GUI uses these for the live "preview"
+	// popup that follows the cursor when no popup is pinned; clicks
+	// pin a popup, after which hover events are ignored by the GUI.
 	onDecodeDoubleTap func(slotStart time.Time, call string)
-	onDecodeHover     func(call string, slotStart time.Time, freqHz float64, snr float64, screenPos fyne.Position) // pos = top-left of the box on screen
-	onDecodeHoverEnd  func()
 	onDecodeContext   func(call string, screenPos fyne.Position)
-	onDecodeSelect    func(call string) // single-click selection
+	onDecodeSelect    func(call string, slotStart time.Time, freqHz float64, screenPos fyne.Position)
+	onDecodeDeselect  func()
+	onDecodeHover     func(call string, slotStart time.Time, freqHz float64, screenPos fyne.Position)
+	onDecodeHoverEnd  func()
 
 	// highlightCall identifies a callsign whose decode boxes should
 	// render in a brighter highlight colour. Set when the operator
@@ -170,6 +190,23 @@ type scopePane struct {
 	// doesn't drop and re-add the highlight visibly.
 	highlightCall  string
 	highlightClear *time.Timer
+
+	// Hover state: the (call, slot, freq) tuple under the cursor right
+	// now, used to paint the hovered box in a soft highlight as visual
+	// feedback. Distinct from highlightCall (HEARD-row hover, applies
+	// to every box for that call) and from selectedCall (click-active,
+	// stronger highlight + fill).
+	hoverCall      string
+	hoverSlotStart time.Time
+	hoverFreqHz    float64
+
+	// Selection state (click-to-pick). One specific decode box is
+	// "active" at a time and renders in a brighter yellow with a
+	// saturated fill so the operator can see at a glance which decode
+	// the magnification popup is showing.
+	selectedCall      string
+	selectedSlotStart time.Time
+	selectedFreqHz    float64
 
 	// TX-bandwidth indicator: a translucent box matching FT8's 50 Hz
 	// occupied spectrum, centred on the operator's selected TX freq.
@@ -183,7 +220,14 @@ type scopePane struct {
 	txOverlay      *fyne.Container
 	wfWithOverlay  fyne.CanvasObject // the tappable+overlay stack added to VSplit
 	onTxFreqChange func(hz float64)  // callback for main.go to read latest TX freq
-	hdrText        *canvas.Text      // SCOPE header — shows live TX freq
+
+	// Frequency-axis strip docked under the waterfall. Replaces the
+	// old "SCOPE | TX 1234 Hz" header. Shows tick labels at 500-Hz
+	// intervals so the operator can read the X-axis like a graph,
+	// plus a triangle + label marking the live TX frequency.
+	freqAxis      *fyne.Container
+	freqAxisMark  *canvas.Text      // moves with txFreqHz, shows "1234 Hz"
+	freqAxisCaret *canvas.Rectangle // small caret beneath the marker
 }
 
 // newScopePane constructs the embedded scope column. The returned
@@ -260,9 +304,16 @@ func newScopePane(myGrid string) *scopePane {
 	//     can act on it (Profile / Reply / Copy / QRZ).
 	//   - Single click on empty waterfall → no-op.
 	//   - Double click anywhere → tune TX freq to that cursor x.
-	//   - Right click on a decode box → context menu only.
-	//   - Hover → magnification popup that follows the cursor (still
-	//     debounce-pinned to the first show position).
+	//   - Right click on a decode box → context menu.
+	//   - Hover → soft yellow highlight on the box under the cursor;
+	//     no popup, no GUI callback. Pure visual feedback so the
+	//     operator can see what their cursor is hitting before they
+	//     commit to a click.
+	//   - Single click on a decode box → selection (strong yellow +
+	//     fill) + GUI callback that opens the magnification popup at
+	//     the click position and scrolls/highlights the chat row.
+	//   - Single click on empty waterfall → clear selection + dismiss
+	//     the popup.
 	//
 	// Routing all pointer interactions through the stable waterfallTap
 	// (rather than per-decode widgets that move every audio row) keeps
@@ -272,18 +323,31 @@ func newScopePane(myGrid string) *scopePane {
 		size := tappable.Size()
 		d, ok := s.decodeAtPixel(local, size)
 		if !ok {
+			s.clearSelection()
+			if cb := s.getDecodeDeselectHook(); cb != nil {
+				cb()
+			}
 			return
 		}
-		// Single-click selects the decode in the chat + HEARD lists
-		// (scroll + blink-highlight + freeze chat auto-scroll). The
-		// magnification popup also re-pins on this hover/click.
+		s.setSelection(d)
 		if cb := s.getDecodeSelectHook(); cb != nil {
-			cb(d.call)
+			abs := fyne.CurrentApp().Driver().AbsolutePositionForObject(tappable)
+			screenPos := fyne.NewPos(abs.X+local.X+12, abs.Y+local.Y+12)
+			cb(d.call, d.slotStart, d.freqHz, screenPos)
 		}
 	}
 	tappable.onDouble = func(local fyne.Position) {
 		size := tappable.Size()
 		if size.Width <= 0 {
+			return
+		}
+		// Don't retune TX frequency when the double-click landed on
+		// a decode box. Operators were accidentally moving their TX
+		// freq while trying to interact with a station they'd
+		// selected — a fast double-click on the box looks identical
+		// to "double-click empty water to retune" without this
+		// check.
+		if _, ok := s.decodeAtPixel(local, size); ok {
 			return
 		}
 		xFrac := float64(local.X / size.Width)
@@ -307,41 +371,70 @@ func newScopePane(myGrid string) *scopePane {
 		size := tappable.Size()
 		d, ok := s.decodeAtPixel(local, size)
 		if !ok {
+			s.setHover(finalizedDecode{})
 			if cb := s.getDecodeHoverEndHook(); cb != nil {
 				cb()
 			}
 			return
 		}
+		// Box-highlight feedback (pure visual, scope-internal).
+		s.setHover(d)
+		// Live preview hook for the GUI: it positions the popup near
+		// the box and updates content as the cursor moves between
+		// boxes. The GUI ignores this when a popup is pinned.
 		if cb := s.getDecodeHoverHook(); cb != nil {
 			abs := fyne.CurrentApp().Driver().AbsolutePositionForObject(tappable)
-			cb(d.call, d.slotStart, d.freqHz, 0,
-				fyne.NewPos(abs.X+local.X+12, abs.Y+local.Y))
+			screenPos := fyne.NewPos(abs.X+local.X+12, abs.Y+local.Y+12)
+			cb(d.call, d.slotStart, d.freqHz, screenPos)
 		}
 	}
 	tappable.onHoverEnd = func() {
+		s.setHover(finalizedDecode{})
 		if cb := s.getDecodeHoverEndHook(); cb != nil {
 			cb()
 		}
 	}
 	s.wfWithOverlay = container.New(&waterfallSnapLayout{scope: s}, s.timeStrip, tappable)
 
-	// VSplit between waterfall and map; Offset is a 0..1 fraction so
-	// dragging it scales both proportionally — what the user asked for.
-	split := container.NewVSplit(s.wfWithOverlay, s.mapWidget)
+	// Frequency-axis strip docked under the waterfall. Replaces the
+	// old "SCOPE | TX 1234 Hz" header — same vertical real estate
+	// but now serves the X axis: tick labels at 500-Hz intervals
+	// across the visible range, plus a marker that follows the live
+	// TX freq. The strip's children are managed by freqAxisLayout
+	// which positions everything from the live container width.
+	axisBg := canvas.NewRectangle(color.RGBA{22, 24, 28, 255})
+	axisBg.SetMinSize(fyne.NewSize(0, freqAxisHeight))
+	tickLabels := []*canvas.Text{}
+	for hz := 500; hz <= int(scopeFreqMaxHz); hz += 500 {
+		t := canvas.NewText(fmt.Sprintf("%d", hz), color.RGBA{140, 145, 155, 255})
+		t.TextStyle = fyne.TextStyle{Monospace: true}
+		t.TextSize = 9
+		t.Alignment = fyne.TextAlignCenter
+		tickLabels = append(tickLabels, t)
+	}
+	mark := canvas.NewText(fmt.Sprintf("%.0f Hz", s.txFreqHz), color.RGBA{255, 200, 80, 255})
+	mark.TextStyle = fyne.TextStyle{Bold: true, Monospace: true}
+	mark.TextSize = 10
+	mark.Alignment = fyne.TextAlignCenter
+	s.freqAxisMark = mark
+	caret := canvas.NewRectangle(color.RGBA{255, 200, 80, 255})
+	s.freqAxisCaret = caret
+	axisChildren := []fyne.CanvasObject{axisBg}
+	for _, t := range tickLabels {
+		axisChildren = append(axisChildren, t)
+	}
+	axisChildren = append(axisChildren, caret, mark)
+	s.freqAxis = container.New(&freqAxisLayout{scope: s, ticks: tickLabels}, axisChildren...)
+
+	// Stack waterfall on top + axis strip on bottom, then VSplit
+	// between that pair and the map. The axis strip rides with the
+	// waterfall through the VSplit drag; the map gets the bottom.
+	wfWithAxis := container.NewBorder(nil, s.freqAxis, nil, nil, s.wfWithOverlay)
+	split := container.NewVSplit(wfWithAxis, s.mapWidget)
 	split.SetOffset(0.55) // slightly more waterfall by default
 
-	// Header strip identifies the column ("SCOPE") and shows the live TX
-	// frequency the operator has dialed in by clicking the waterfall.
-	// Updates whenever SetTxFreq fires; same dim grey as the chat header
-	// to keep the rhythm.
-	hdr := canvas.NewText(scopeHeaderText(s.txFreqHz), color.RGBA{170, 175, 185, 255})
-	hdr.TextSize = 9
-	hdr.TextStyle = fyne.TextStyle{Bold: true, Monospace: true}
-	s.hdrText = hdr
-	wrap := container.NewBorder(container.NewPadded(hdr), nil, nil, nil, split)
-
 	bg := canvas.NewRectangle(color.RGBA{30, 32, 38, 255})
-	s.container = container.NewStack(bg, wrap)
+	s.container = container.NewStack(bg, split)
 	return s
 }
 
@@ -422,17 +515,23 @@ func (s *scopePane) SetTxFreq(hz float64) {
 	s.txFreqHz = hz
 	cb := s.onTxFreqChange
 	overlay := s.txOverlay
-	hdr := s.hdrText
+	axis := s.freqAxis
+	mark := s.freqAxisMark
 	s.mu.Unlock()
-	if overlay != nil {
-		fyne.Do(func() {
+	fyne.Do(func() {
+		if overlay != nil {
 			overlay.Refresh()
-			if hdr != nil {
-				hdr.Text = scopeHeaderText(hz)
-				hdr.Refresh()
-			}
-		})
-	}
+		}
+		if mark != nil {
+			mark.Text = fmt.Sprintf("%.0f Hz", hz)
+			mark.Refresh()
+		}
+		// Layout depends on the new mark position; trigger a relayout
+		// so the marker + caret slide to the new X.
+		if axis != nil {
+			axis.Refresh()
+		}
+	})
 	if cb != nil {
 		cb(hz)
 	}
@@ -452,13 +551,6 @@ func (s *scopePane) SetOnTxFreqChange(fn func(hz float64)) {
 	s.mu.Lock()
 	s.onTxFreqChange = fn
 	s.mu.Unlock()
-}
-
-// scopeHeaderText formats the SCOPE column header to show the live TX
-// frequency in Hz (audio centre). Kept as a helper so SetTxFreq and
-// newScopePane stay in sync on the format string.
-func scopeHeaderText(hz float64) string {
-	return fmt.Sprintf("SCOPE  |  TX %4.0f Hz", hz)
 }
 
 // txOverlayLayout positions the TX-bandwidth box from the live overlay
@@ -489,6 +581,84 @@ func (l *txOverlayLayout) Layout(objs []fyne.CanvasObject, size fyne.Size) {
 
 func (l *txOverlayLayout) MinSize(_ []fyne.CanvasObject) fyne.Size {
 	return fyne.NewSize(0, 0) // overlay sizes itself to its parent stack
+}
+
+// freqAxisLayout positions the frequency-axis strip's children:
+//
+//	objs[0]      = background rectangle (covers the full strip)
+//	objs[1..N-3] = tick labels (one per 500-Hz tick), pre-ordered
+//	objs[N-2]    = TX caret rectangle
+//	objs[N-1]    = TX marker text
+//
+// Tick labels are clamped on the left/right edges so the leftmost and
+// rightmost don't get clipped against the strip border. The TX marker
+// + caret slide horizontally to track scope.txFreqHz.
+type freqAxisLayout struct {
+	scope *scopePane
+	ticks []*canvas.Text
+}
+
+func (l *freqAxisLayout) Layout(objs []fyne.CanvasObject, size fyne.Size) {
+	if len(objs) < 3 || size.Width <= 0 || size.Height <= 0 {
+		return
+	}
+	bg := objs[0]
+	bg.Move(fyne.NewPos(0, 0))
+	bg.Resize(size)
+
+	// Tick row sits on the top half, marker on the bottom half. Caret
+	// is a 1-px-wide vertical bar between the two so the operator's
+	// eye can trace marker → caret tip → waterfall column.
+	tickY := float32(0)
+	caretTopY := float32(11)
+	caretH := float32(5)
+	markerY := float32(15)
+	pxPerHz := size.Width / float32(scopeFreqMaxHz)
+
+	for i, t := range l.ticks {
+		// Tick label: centred at its frequency, clamped so the first
+		// and last don't fall off the edges.
+		hz := float32((i + 1) * 500) // l.ticks[0] = 500 Hz, etc.
+		cx := hz * pxPerHz
+		ts := t.MinSize()
+		x := cx - ts.Width/2
+		if x < 0 {
+			x = 0
+		}
+		if x+ts.Width > size.Width {
+			x = size.Width - ts.Width
+		}
+		t.Move(fyne.NewPos(x, tickY))
+		t.Resize(ts)
+	}
+
+	// TX marker + caret. Only valid if both the second-to-last and
+	// last objects are the caret + marker — guarded by the slice len
+	// check above.
+	caret := objs[len(objs)-2]
+	mark := objs[len(objs)-1]
+	l.scope.mu.Lock()
+	hz := l.scope.txFreqHz
+	l.scope.mu.Unlock()
+	cx := float32(hz/scopeFreqMaxHz) * size.Width
+	caret.Move(fyne.NewPos(cx, caretTopY))
+	caret.Resize(fyne.NewSize(2, caretH))
+	if mt, ok := mark.(*canvas.Text); ok {
+		ms := mt.MinSize()
+		x := cx - ms.Width/2
+		if x < 0 {
+			x = 0
+		}
+		if x+ms.Width > size.Width {
+			x = size.Width - ms.Width
+		}
+		mark.Move(fyne.NewPos(x, markerY))
+		mark.Resize(ms)
+	}
+}
+
+func (l *freqAxisLayout) MinSize(_ []fyne.CanvasObject) fyne.Size {
+	return fyne.NewSize(0, freqAxisHeight)
 }
 
 // SetWaterfallRow paints one waterfall row into the scope's RGBA image and
@@ -813,10 +983,18 @@ func (l *decodeOverlayLayout) Layout(_ []fyne.CanvasObject, size fyne.Size) {
 
 	type rect struct {
 		x, y, w, h float32
-		hot        bool // matches highlightCall — render in highlight colour
+		hot        bool // matches highlightCall — render in highlight colour (HEARD-row hover)
+		hovered    bool // cursor is currently over this box
+		selected   bool // click-active selection
 		d          finalizedDecode
 	}
 	hot := s.highlightCall
+	hovCall := s.hoverCall
+	hovSlot := s.hoverSlotStart
+	hovFreq := s.hoverFreqHz
+	selCall := s.selectedCall
+	selSlot := s.selectedSlotStart
+	selFreq := s.selectedFreqHz
 	// Cull decodes by absolute age rather than by what's currently in
 	// s.boundaries. The boundary list shrinks when the pane is small,
 	// so culling against it would discard decodes that the operator
@@ -871,10 +1049,15 @@ func (l *decodeOverlayLayout) Layout(_ []fyne.CanvasObject, size fyne.Size) {
 		if w < 4 {
 			w = 4
 		}
+		matchExact := func(c string, sl time.Time, f float64) bool {
+			return c != "" && d.call == c && d.slotStart.Equal(sl) && d.freqHz == f
+		}
 		rects = append(rects, rect{
 			x: x0, y: yTop, w: w, h: yBot - yTop,
-			hot: hot != "" && d.call == hot,
-			d:   d,
+			hot:      hot != "" && d.call == hot,
+			hovered:  matchExact(hovCall, hovSlot, hovFreq),
+			selected: matchExact(selCall, selSlot, selFreq),
+			d:        d,
 		})
 		if len(rects) >= len(s.decodeBoxPool) {
 			break // pool exhausted; remaining decodes silently drop this frame
@@ -890,17 +1073,35 @@ func (l *decodeOverlayLayout) Layout(_ []fyne.CanvasObject, size fyne.Size) {
 	defaultStroke := color.RGBA{255, 245, 120, 220}
 	hotStroke := color.RGBA{255, 235, 60, 255}
 	hotFill := color.RGBA{255, 235, 60, 70}
+	// Hover: visual feedback only, softer than selected. Lets the
+	// operator see what the cursor is over without committing.
+	hoverStroke := color.RGBA{255, 245, 120, 255}
+	hoverFill := color.RGBA{255, 235, 60, 40}
+	// Selected: deliberate click-active highlight, strongest of the
+	// three so the operator knows which decode the popup refers to.
+	// Wins over hovered + hot when overlapping.
+	selectedStroke := color.RGBA{255, 255, 80, 255}
+	selectedFill := color.RGBA{255, 235, 60, 130}
 	clearFill := color.RGBA{0, 0, 0, 0}
 	for i, rc := range rects {
 		b := pool[i]
 		b.Move(fyne.NewPos(rc.x, rc.y))
 		b.Resize(fyne.NewSize(rc.w, rc.h))
 		b.rect.Resize(fyne.NewSize(rc.w, rc.h))
-		if rc.hot {
+		switch {
+		case rc.selected:
+			b.rect.StrokeColor = selectedStroke
+			b.rect.StrokeWidth = 3
+			b.rect.FillColor = selectedFill
+		case rc.hovered:
+			b.rect.StrokeColor = hoverStroke
+			b.rect.StrokeWidth = 2
+			b.rect.FillColor = hoverFill
+		case rc.hot:
 			b.rect.StrokeColor = hotStroke
 			b.rect.StrokeWidth = 2
 			b.rect.FillColor = hotFill
-		} else {
+		default:
 			b.rect.StrokeColor = defaultStroke
 			b.rect.StrokeWidth = 1
 			b.rect.FillColor = clearFill
@@ -1051,19 +1252,27 @@ func (s *scopePane) MagnifiedSignalSlice(slotStart time.Time, freqHz float64, ou
 //     profile dialog for the call under the cursor.
 //
 // All handlers run on the Fyne main goroutine.
+//
+// Hover is intentionally NOT a hook: hover-only feedback (the box
+// highlight) is rendered internally by scope; the GUI only learns
+// about decode interactions via deliberate actions (double-click,
+// right-click, single-click on a box, or single-click on empty
+// waterfall = deselect).
 func (s *scopePane) SetDecodeHooks(
 	onDouble func(slotStart time.Time, call string),
-	onHover func(call string, slotStart time.Time, freqHz float64, snr float64, screenPos fyne.Position),
-	onHoverEnd func(),
 	onContext func(call string, screenPos fyne.Position),
-	onSelect func(call string),
+	onSelect func(call string, slotStart time.Time, freqHz float64, screenPos fyne.Position),
+	onDeselect func(),
+	onHover func(call string, slotStart time.Time, freqHz float64, screenPos fyne.Position),
+	onHoverEnd func(),
 ) {
 	s.mu.Lock()
 	s.onDecodeDoubleTap = onDouble
-	s.onDecodeHover = onHover
-	s.onDecodeHoverEnd = onHoverEnd
 	s.onDecodeContext = onContext
 	s.onDecodeSelect = onSelect
+	s.onDecodeDeselect = onDeselect
+	s.onDecodeHover = onHover
+	s.onDecodeHoverEnd = onHoverEnd
 	s.mu.Unlock()
 }
 
@@ -1075,7 +1284,22 @@ func (s *scopePane) getDecodeDoubleHook() func(time.Time, string) {
 	defer s.mu.Unlock()
 	return s.onDecodeDoubleTap
 }
-func (s *scopePane) getDecodeHoverHook() func(string, time.Time, float64, float64, fyne.Position) {
+func (s *scopePane) getDecodeContextHook() func(string, fyne.Position) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.onDecodeContext
+}
+func (s *scopePane) getDecodeSelectHook() func(string, time.Time, float64, fyne.Position) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.onDecodeSelect
+}
+func (s *scopePane) getDecodeDeselectHook() func() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.onDecodeDeselect
+}
+func (s *scopePane) getDecodeHoverHook() func(string, time.Time, float64, fyne.Position) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.onDecodeHover
@@ -1085,15 +1309,52 @@ func (s *scopePane) getDecodeHoverEndHook() func() {
 	defer s.mu.Unlock()
 	return s.onDecodeHoverEnd
 }
-func (s *scopePane) getDecodeContextHook() func(string, fyne.Position) {
+
+// setHover marks d as the hovered decode (or clears the hover state
+// if d.call is empty) and refreshes the overlay so the box paints
+// in its hover style. Called by the waterfallTap onHover handler.
+func (s *scopePane) setHover(d finalizedDecode) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.onDecodeContext
+	if s.hoverCall == d.call && s.hoverSlotStart.Equal(d.slotStart) && s.hoverFreqHz == d.freqHz {
+		s.mu.Unlock()
+		return
+	}
+	s.hoverCall = d.call
+	s.hoverSlotStart = d.slotStart
+	s.hoverFreqHz = d.freqHz
+	overlay := s.decodeOverlay
+	s.mu.Unlock()
+	if overlay != nil {
+		fyne.Do(func() { overlay.Refresh() })
+	}
 }
-func (s *scopePane) getDecodeSelectHook() func(string) {
+
+// setSelection marks d as the click-active decode and refreshes the
+// overlay so the box paints in its selected style.
+func (s *scopePane) setSelection(d finalizedDecode) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.onDecodeSelect
+	s.selectedCall = d.call
+	s.selectedSlotStart = d.slotStart
+	s.selectedFreqHz = d.freqHz
+	overlay := s.decodeOverlay
+	s.mu.Unlock()
+	if overlay != nil {
+		fyne.Do(func() { overlay.Refresh() })
+	}
+}
+
+// clearSelection drops the click-active decode (no box renders in the
+// selected style after this call).
+func (s *scopePane) clearSelection() {
+	s.mu.Lock()
+	s.selectedCall = ""
+	s.selectedSlotStart = time.Time{}
+	s.selectedFreqHz = 0
+	overlay := s.decodeOverlay
+	s.mu.Unlock()
+	if overlay != nil {
+		fyne.Do(func() { overlay.Refresh() })
+	}
 }
 
 // LatestDecodeFor returns the most recently finalised decode for the
