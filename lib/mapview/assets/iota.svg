@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <circle cx="24" cy="24" r="23" fill="#3C82E6"/>
+  <!-- Sandy island base -->
+  <ellipse cx="24" cy="38" rx="16" ry="4" fill="#EBD796"/>
+  <!-- Palm trunk (slight curve) -->
+  <path d="M 24 36 Q 23 25 25 14" stroke="#A06432" stroke-width="3" fill="none" stroke-linecap="round"/>
+  <!-- Palm fronds: 5 splayed leaves at the top -->
+  <g fill="#3CB44B" stroke="#3CB44B" stroke-linejoin="round" stroke-linecap="round" stroke-width="1.5">
+    <ellipse cx="14" cy="14" rx="6" ry="2.5" transform="rotate(-25 14 14)"/>
+    <ellipse cx="34" cy="14" rx="6" ry="2.5" transform="rotate(25 34 14)"/>
+    <ellipse cx="12" cy="20" rx="6" ry="2.5" transform="rotate(15 12 20)"/>
+    <ellipse cx="36" cy="20" rx="6" ry="2.5" transform="rotate(-15 36 20)"/>
+    <ellipse cx="24" cy="11" rx="3" ry="3"/>
+  </g>
+</svg>

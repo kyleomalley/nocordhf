@@ -12,6 +12,7 @@ package nocord
 import (
 	"context"
 	"fmt"
+	"image"
 	"image/color"
 	"math"
 	"os"
@@ -34,7 +35,9 @@ import (
 	"github.com/kyleomalley/nocordhf/lib/callsign"
 	"github.com/kyleomalley/nocordhf/lib/cat"
 	"github.com/kyleomalley/nocordhf/lib/ft8"
+	"github.com/kyleomalley/nocordhf/lib/logging"
 	"github.com/kyleomalley/nocordhf/lib/lotw"
+	mapview "github.com/kyleomalley/nocordhf/lib/mapview"
 	"github.com/kyleomalley/nocordhf/lib/ntpcheck"
 	"github.com/kyleomalley/nocordhf/lib/tqsl"
 	"github.com/kyleomalley/nocordhf/lib/waterfall"
@@ -98,6 +101,13 @@ type heardEntry struct {
 	snr      float64
 	lastSeen time.Time
 	lastCQ   time.Time // most recent slot we heard this op call CQ; zero if never
+	// lastOTA is the most recent slot we heard this op transmit from
+	// a portable / outdoor activity. lastOTAType is the *OTA program
+	// name (POTA/SOTA/IOTA/WWFF/BOTA/LOTA/NOTA), or "PORTABLE" for a
+	// /P /M /MM /AM suffix without an explicit programme. Empty when
+	// never.
+	lastOTA     time.Time
+	lastOTAType string
 }
 
 const maxHeard = 200
@@ -183,21 +193,36 @@ type GUI struct {
 	txActive     bool
 	activeStopCh chan struct{}
 
-	// decodePopup is the floating widget shown while the operator hovers
-	// a decode box on the waterfall. Held on the GUI so successive
-	// hovers replace the existing popup instead of stacking. A pending
-	// hide timer debounces MouseOut → MouseIn back-to-back events so
-	// the popup doesn't flash while crossing between adjacent boxes.
-	// decodePopup is the floating widget shown while hovering a decode
-	// box. Persistent: once shown, the popup stays at its initial
-	// position; subsequent hovers on different boxes refresh the
-	// magnified-image + text content in place rather than relocating
-	// the panel. The first hover after a hide picks the position
-	// relative to the box that was hovered.
+	// Magnification popup — two modes:
+	//   - Preview (decodePopupPinned == false): driven by hover.
+	//     Popup follows the cursor (positioned next to whichever
+	//     decode box is under it). Hides when the cursor leaves all
+	//     boxes. Lets the operator scan the band quickly.
+	//   - Pinned (decodePopupPinned == true): set by clicking a
+	//     decode box. Popup stays at the click position; hover
+	//     events are ignored. Operator can mouse over to the popup's
+	//     buttons without losing it. Click another box to re-pin to
+	//     that one; click empty waterfall or [✕] to unpin.
+	//
+	// decodePopupPinPos remembers the click position so we can
+	// re-show the popup at the same spot when a click on a different
+	// decode box dismisses it (Fyne's PopUp auto-hides on any click
+	// outside its own bounds).
 	decodePopup        *widget.PopUp
-	decodePopupContent *fyne.Container // VBox swapped in place on content updates
-	decodePopupHide    *time.Timer
+	decodePopupContent *fyne.Container // body swapped in place on content updates
 	decodePopupCall    string
+	decodePopupPinPos  fyne.Position
+	decodePopupPinned  bool
+
+	// Hover-preview debounce: cursor motion across decode boxes can
+	// fire many onHover events per second. Rebuilding + reshowing the
+	// PopUp on each one is expensive (thousands of redraws while the
+	// cursor sweeps). Instead, hover events stash the latest target
+	// in decodePreviewPending and arm a timer; when it fires we render
+	// the most recent target. Each new event resets the timer, so a
+	// cursor that's still moving never causes a render.
+	decodePreviewTimer   *time.Timer
+	decodePreviewPending decodePreviewTarget
 
 	// HEARD-row tooltip: small floating popup that shows the country
 	// name when the operator hovers a row. Same persistent / debounce
@@ -223,6 +248,22 @@ type GUI struct {
 	highlightedCall       string    // currently blink-highlighted call
 	highlightUntil        time.Time // wall-clock end of blink window
 	highlightTimer        *time.Timer
+
+	// suppressChatSelectInput is set while we programmatically call
+	// chatList.Select(idx) to scroll-to-row. Without it, the chatList
+	// OnSelected handler would treat the synthetic selection like a
+	// user click and overwrite the input box with the row's callsign.
+	// Flipped on by scrollChatTo* helpers; the OnSelected handler
+	// reads + clears it on entry.
+	suppressChatSelectInput bool
+
+	// suppressHeardSelectAction is the HEARD-list counterpart. The
+	// HEARD OnSelected handler shows the magnification popup and
+	// re-runs selectCall — both of which would recurse infinitely
+	// when the synthetic Select comes from selectCall's own
+	// scrollHeardToCall path. Set by scrollHeardToCall; OnSelected
+	// reads + clears it on entry.
+	suppressHeardSelectAction bool
 
 	// QSO logging. adifWriter persists each completed contact to
 	// nocordhf.adif; adifLog mirrors the on-disk file for in-memory
@@ -258,6 +299,16 @@ type GUI struct {
 	// skew, so we surface it in the chat header. Lazy-started in Build()
 	// so RX-only sessions still get the reading.
 	ntpChecker *ntpcheck.Checker
+}
+
+// decodePreviewTarget is the data needed to render one preview frame.
+// Stashed by the hover handler and consumed by the debounce timer.
+type decodePreviewTarget struct {
+	call      string
+	slotStart time.Time
+	freqHz    float64
+	pos       fyne.Position
+	end       bool // true → preview should hide instead of show
 }
 
 const maxRows = 500
@@ -957,7 +1008,8 @@ func (g *GUI) AppendDecode(d ft8.Decoded) {
 	// set -RX-only sessions still build the list.
 	if sender := senderFromMessage(d.Message.Text); sender != "" {
 		isCQ := strings.HasPrefix(strings.ToUpper(strings.TrimSpace(d.Message.Text)), "CQ")
-		g.rememberHeard(sender, d.SNR, isCQ)
+		otaType := messageIndicatesOTA(d.Message.Text)
+		g.rememberHeard(sender, d.SNR, isCQ, otaType)
 	}
 	// Emit a thin slot-separator row the first time we hear a decode from
 	// a new 15-second slot, so RX cycles have visible breaks in the chat.
@@ -1022,7 +1074,7 @@ func (g *GUI) appendRow(r chatRow) {
 	}
 }
 
-func (g *GUI) rememberHeard(call string, snr float64, isCQ bool) {
+func (g *GUI) rememberHeard(call string, snr float64, isCQ bool, otaType string) {
 	call = strings.ToUpper(strings.TrimSpace(call))
 	if call == "" || strings.HasPrefix(call, "<") {
 		return
@@ -1037,6 +1089,10 @@ func (g *GUI) rememberHeard(call string, snr float64, isCQ bool) {
 	entry.lastSeen = now
 	if isCQ {
 		entry.lastCQ = now
+	}
+	if otaType != "" {
+		entry.lastOTA = now
+		entry.lastOTAType = otaType
 	}
 	g.heard[call] = entry
 	// Cap memory: when the map gets too large, drop the oldest half.
@@ -1065,10 +1121,12 @@ func (g *GUI) rememberHeard(call string, snr float64, isCQ bool) {
 // (≤ maxHeard) keeps this trivially cheap. Decouples the list callbacks
 // from the live map so they don't need to hold g.mu while drawing.
 type heardRow struct {
-	call   string
-	snr    float64
-	when   time.Time
-	lastCQ time.Time
+	call        string
+	snr         float64
+	when        time.Time
+	lastCQ      time.Time
+	lastOTA     time.Time
+	lastOTAType string
 }
 
 func (g *GUI) heardSnapshot() []heardRow {
@@ -1076,7 +1134,10 @@ func (g *GUI) heardSnapshot() []heardRow {
 	mode := g.heardSort
 	out := make([]heardRow, 0, len(g.heard))
 	for c, e := range g.heard {
-		out = append(out, heardRow{call: c, snr: e.snr, when: e.lastSeen, lastCQ: e.lastCQ})
+		out = append(out, heardRow{
+			call: c, snr: e.snr, when: e.lastSeen,
+			lastCQ: e.lastCQ, lastOTA: e.lastOTA, lastOTAType: e.lastOTAType,
+		})
 	}
 	g.mu.Unlock()
 	switch mode {
@@ -1102,9 +1163,10 @@ func senderFromMessage(text string) string {
 	}
 	var sender string
 	if strings.EqualFold(fields[0], "CQ") {
-		// "CQ MOD X GRID" or "CQ X GRID"
+		// "CQ MOD X GRID" or "CQ X GRID" — modifier set lives in
+		// lib/ft8 so this stays aligned with the decoder.
 		switch {
-		case len(fields) >= 3 && (fields[1] == "DX" || fields[1] == "POTA" || fields[1] == "SOTA" || fields[1] == "TEST"):
+		case len(fields) >= 3 && ft8.IsCQModifier(fields[1]):
 			sender = fields[2]
 		case len(fields) >= 2:
 			sender = fields[1]
@@ -1236,152 +1298,244 @@ func (g *GUI) callIsCQ(call string) bool {
 	return !e.lastCQ.IsZero() && time.Since(e.lastCQ) <= 60*time.Second
 }
 
-// showDecodePopup renders / updates the floating panel that shows a
-// magnified slice of the waterfall around the hovered/selected decode
-// box plus the station's identity / SNR.
+// pinDecodePopup pins the magnification popup at screenPos for the
+// given decode. Called from a deliberate single-click on a decode box.
+// Replaces any existing preview popup. Subsequent calls (clicking a
+// different box) update the body in place at the new pin location.
 //
-// The panel is anchored to a FIXED position — the top-left corner of
-// the SCOPE pane — and only its contents change as the operator
-// hovers different boxes. Earlier versions tried to position the
-// popup next to whichever box was hovered, but fyne's coordinate
-// system across nested HSplit / VSplit / Border containers made the
-// reported "absolute" position unstable, so the popup would jump
-// around (and sometimes appear far outside the visible scope pane).
-// The fixed anchor avoids the coordinate-translation pitfalls
-// entirely; the popup is always in the same place.
+// The pinned popup ignores hover events until dismissed (empty-
+// waterfall click), so the operator can mouse over to the action
+// buttons without losing it.
+func (g *GUI) pinDecodePopup(call string, slotStart time.Time, freqHz float64, screenPos fyne.Position) {
+	logging.L.Debugw("pinDecodePopup", "call", call)
+	g.renderDecodePopup(call, slotStart, freqHz, screenPos, true /*pin*/)
+}
+
+// decodePreviewDebounce is how long hover events coalesce before
+// rendering. Cursor sweeps fire onHover many times per second; without
+// debounce we'd rebuild + reshow the popup on every pixel of motion.
+// 100 ms is short enough to feel responsive when the cursor settles
+// on a box, long enough to skip every intermediate target on a sweep.
+const decodePreviewDebounce = 100 * time.Millisecond
+
+// previewDecodePopup is called from hover events. It only stashes the
+// target and (re)arms the debounce timer; the actual popup render
+// happens in renderPendingPreview after the timer fires. Each event
+// resets the timer, so a moving cursor never causes a render.
 //
-// The screenPos argument is kept for API compatibility but only used
-// the very first time we have to ShowAtPosition (Fyne's PopUp won't
-// render until ShowAtPosition / Show is called once).
-func (g *GUI) showDecodePopup(call string, slotStart time.Time, freqHz float64, screenPos fyne.Position) {
+// No-op when a popup is currently pinned — the click commitment wins
+// over hover until the operator dismisses.
+func (g *GUI) previewDecodePopup(call string, slotStart time.Time, freqHz float64, screenPos fyne.Position) {
 	g.mu.Lock()
-	if g.decodePopupHide != nil {
-		g.decodePopupHide.Stop()
-		g.decodePopupHide = nil
-	}
-	sameCall := g.decodePopupCall == call && g.decodePopup != nil && g.decodePopup.Visible()
-	popupOpen := g.decodePopup != nil
-	g.mu.Unlock()
-	if sameCall {
+	logging.L.Debugw("previewDecodePopup",
+		"call", call, "pinned", g.decodePopupPinned, "popup_nil", g.decodePopup == nil)
+	if g.decodePopupPinned {
+		g.mu.Unlock()
 		return
 	}
+	// Same call as the currently-displayed preview? Skip — the
+	// cursor is jittering inside the same box, no need to redraw.
+	// We compare on call (rather than exact pixel position) because
+	// every pixel of cursor motion within a box re-fires onHover.
+	if g.decodePopup != nil && g.decodePopupCall == call && !g.decodePopupPinned {
+		g.mu.Unlock()
+		return
+	}
+	g.decodePreviewPending = decodePreviewTarget{
+		call: call, slotStart: slotStart, freqHz: freqHz, pos: screenPos,
+	}
+	g.armPreviewTimerLocked()
+	g.mu.Unlock()
+}
+
+// previewDecodePopupEnd is called when the cursor leaves all decode
+// boxes. Same debounce path as previewDecodePopup so a quick
+// out-then-back doesn't tear down + rebuild the popup.
+func (g *GUI) previewDecodePopupEnd() {
+	g.mu.Lock()
+	if g.decodePopupPinned {
+		g.mu.Unlock()
+		return
+	}
+	g.decodePreviewPending = decodePreviewTarget{end: true}
+	g.armPreviewTimerLocked()
+	g.mu.Unlock()
+}
+
+// armPreviewTimerLocked (re)starts the debounce timer. Must hold g.mu.
+func (g *GUI) armPreviewTimerLocked() {
+	if g.decodePreviewTimer != nil {
+		g.decodePreviewTimer.Stop()
+	}
+	g.decodePreviewTimer = time.AfterFunc(decodePreviewDebounce, g.renderPendingPreview)
+}
+
+// renderPendingPreview is the timer callback. Reads the latest pending
+// target and either renders the preview popup or hides it.
+func (g *GUI) renderPendingPreview() {
+	g.mu.Lock()
+	if g.decodePopupPinned {
+		g.mu.Unlock()
+		return
+	}
+	target := g.decodePreviewPending
+	pop := g.decodePopup
+	if target.end {
+		g.decodePopup = nil
+		g.decodePopupContent = nil
+		g.decodePopupCall = ""
+	}
+	g.mu.Unlock()
+
+	if target.end {
+		if pop != nil {
+			fyne.Do(func() { pop.Hide() })
+		}
+		return
+	}
+	g.renderDecodePopup(target.call, target.slotStart, target.freqHz, target.pos, false /*preview*/)
+}
+
+// renderDecodePopup is the shared show/update path. pin=true marks
+// the popup pinned (subsequent hover events bypass it); pin=false
+// keeps it in preview mode (next hover may move or hide it). The
+// popup is recreated on every render so its position can change for
+// preview mode; widget.NewPopUp's stale-content tracking is otherwise
+// fragile across hide-then-reshow cycles.
+func (g *GUI) renderDecodePopup(call string, slotStart time.Time, freqHz float64, screenPos fyne.Position, pin bool) {
 	if g.scope == nil || g.window == nil {
 		return
 	}
-	// Compute a fixed anchor: top-left of the scope container in
-	// canvas-absolute coordinates. Stable across the whole session;
-	// the only thing that moves it is window resize.
-	anchor := fyne.NewPos(0, 0)
-	if g.scope.container != nil {
-		anchor = fyne.CurrentApp().Driver().AbsolutePositionForObject(g.scope.container)
-		anchor = fyne.NewPos(anchor.X+8, anchor.Y+30)
-	}
-	// screenPos isn't trusted; replace with our fixed anchor. The
-	// parameter stays in the signature so existing callers (HEARD
-	// list click, scope hover hook) don't need to know about this.
-	_ = screenPos
-	screenPos = anchor
 
+	body := g.buildDecodePopupBody(call, slotStart, freqHz)
+	contentBox := container.NewStack(body)
+	bg := canvas.NewRectangle(color.RGBA{30, 32, 38, 245})
+	bg.StrokeColor = color.RGBA{90, 95, 105, 255}
+	bg.StrokeWidth = 1
+	wrapped := container.NewStack(bg, container.NewPadded(contentBox))
+	newPop := widget.NewPopUp(wrapped, g.window.Canvas())
+
+	g.mu.Lock()
+	oldPop := g.decodePopup
+	g.decodePopup = newPop
+	g.decodePopupContent = contentBox
+	g.decodePopupPinPos = screenPos
+	g.decodePopupPinned = pin
+	g.decodePopupCall = call
+	g.mu.Unlock()
+
+	fyne.Do(func() {
+		if oldPop != nil {
+			oldPop.Hide()
+		}
+		newPop.ShowAtPosition(screenPos)
+	})
+}
+
+// showDecodePopup keeps the old name as a thin wrapper for the HEARD-
+// list click path (the only remaining external caller); it pins
+// since that's a deliberate user action equivalent to a box click.
+func (g *GUI) showDecodePopup(call string, slotStart time.Time, freqHz float64, screenPos fyne.Position) {
+	g.pinDecodePopup(call, slotStart, freqHz, screenPos)
+}
+
+// buildDecodePopupBody constructs the inner widget tree for a given
+// (call, slot, freq). Reused on first show and every subsequent
+// in-place update.
+func (g *GUI) buildDecodePopupBody(call string, slotStart time.Time, freqHz float64) fyne.CanvasObject {
+	// Source slice request stays the same shape; the displayed
+	// canvas.Image is what actually grows. SetMinSize below pushes
+	// it to the popup's full available width with a generous height,
+	// so the magnified slice — the whole point of the popup — fills
+	// the panel instead of being squeezed beside the metadata.
 	img := g.scope.MagnifiedSignalSlice(slotStart, freqHz, 180, 90)
 	g.mu.Lock()
 	heard, hasHeard := g.heard[call]
 	g.mu.Unlock()
+
 	cc := "  "
 	if sc := callsign.ShortCode(call); len(sc) >= 2 {
 		cc = sc[len(sc)-2:]
 	}
-	identity := fmt.Sprintf("%s  %s", cc, call)
+	identText := canvas.NewText(fmt.Sprintf("%s  %s", cc, call), color.RGBA{220, 225, 235, 255})
+	identText.TextStyle = fyne.TextStyle{Bold: true, Monospace: true}
+	identText.TextSize = 13
+	freqText := canvas.NewText(fmt.Sprintf("%.0f Hz", freqHz), color.RGBA{170, 175, 185, 255})
+	freqText.TextStyle = fyne.TextStyle{Monospace: true}
+	freqText.TextSize = 10
 	snrLine := ""
 	if hasHeard {
 		snrLine = fmt.Sprintf("SNR %+0.0f dB | %s ago",
 			heard.snr, time.Since(heard.lastSeen).Round(time.Second))
 	}
-	freqLine := fmt.Sprintf("%.0f Hz", freqHz)
-
-	identText := canvas.NewText(identity, color.RGBA{220, 225, 235, 255})
-	identText.TextStyle = fyne.TextStyle{Bold: true, Monospace: true}
-	identText.TextSize = 12
-	freqText := canvas.NewText(freqLine, color.RGBA{170, 175, 185, 255})
-	freqText.TextStyle = fyne.TextStyle{Monospace: true}
-	freqText.TextSize = 10
 	snrText := canvas.NewText(snrLine, color.RGBA{170, 175, 185, 255})
 	snrText.TextStyle = fyne.TextStyle{Monospace: true}
 	snrText.TextSize = 10
 
-	var bodyChildren []fyne.CanvasObject
+	// Action buttons + metadata stack on the right; the magnified
+	// image takes the full left side. Layout split is enforced via
+	// HSplit so the operator gets a roughly 2/3 image, 1/3 chrome
+	// ratio regardless of how the popup wrapper sizes itself. Image
+	// dominates because the magnified slice is the whole point of
+	// the popup.
+	qrzBtn := widget.NewButton("QRZ", func() {
+		_ = openURL(fmt.Sprintf("https://www.qrz.com/db/%s", call))
+	})
+	profileBtn := widget.NewButton("Profile", func() {
+		g.showProfile(call, fyne.Position{})
+	})
+	callBtn := widget.NewButton("Call", func() {
+		g.input.SetText(call)
+		g.handleSubmit(call)
+		g.input.SetText("")
+		g.dismissDecodePopup()
+	})
+	// No explicit close button: hover-out hides the preview popup
+	// automatically, and clicking empty waterfall dismisses a pinned
+	// one. The `[✕]` was both redundant and a frequent target for
+	// the "popup wants to redraw" interaction loop.
+	rightCol := container.NewVBox(
+		identText,
+		freqText,
+		snrText,
+		qrzBtn,
+		profileBtn,
+		callBtn,
+	)
+
+	var imageWidget fyne.CanvasObject
 	if img != nil {
 		ci := canvas.NewImageFromImage(img)
 		ci.FillMode = canvas.ImageFillContain
-		ci.SetMinSize(fyne.NewSize(110, 220))
-		bodyChildren = []fyne.CanvasObject{ci, identText, freqText, snrText}
+		// Min size sets the popup's overall size — HSplit will scale
+		// children proportionally past this. ~260 wide on the left
+		// side at 2/3 ≈ 390 popup width with 130-ish on the right.
+		ci.SetMinSize(fyne.NewSize(260, 260))
+		imageWidget = ci
 	} else {
-		bodyChildren = []fyne.CanvasObject{identText, freqText, snrText}
+		imageWidget = canvas.NewRectangle(color.Transparent)
 	}
 
-	g.mu.Lock()
-	if popupOpen && g.decodePopupContent != nil {
-		// Update the existing panel in place. Replacing the VBox's
-		// children + refreshing leaves the popup parked at its
-		// current position — no bounce, no flicker. If the popup
-		// happens to be hidden (operator dismissed it some other
-		// way) re-show it at the supplied screenPos so subsequent
-		// hovers actually surface a visible popup.
-		g.decodePopupContent.Objects = bodyChildren
-		content := g.decodePopupContent
-		pop := g.decodePopup
-		g.decodePopupCall = call
-		g.mu.Unlock()
-		fyne.Do(func() {
-			content.Refresh()
-			if pop != nil && !pop.Visible() {
-				pop.ShowAtPosition(screenPos)
-			}
-		})
-		return
-	}
-	g.mu.Unlock()
-
-	body := container.NewVBox(bodyChildren...)
-	bg := canvas.NewRectangle(color.RGBA{30, 32, 38, 240})
-	bg.StrokeColor = color.RGBA{90, 95, 105, 255}
-	bg.StrokeWidth = 1
-	wrapped := container.NewStack(bg, container.NewPadded(body))
-
-	g.mu.Lock()
-	if g.decodePopup != nil {
-		g.decodePopup.Hide()
-	}
-	pop := widget.NewPopUp(wrapped, g.window.Canvas())
-	g.decodePopup = pop
-	g.decodePopupContent = body
-	g.decodePopupCall = call
-	g.mu.Unlock()
-	pop.ShowAtPosition(screenPos)
+	split := container.NewHSplit(imageWidget, rightCol)
+	split.SetOffset(0.66) // image gets ~2/3, chrome ~1/3
+	return split
 }
 
-// hideDecodePopup is a no-op. Earlier versions auto-dismissed the
-// magnification popup on hover-out, but the popup was never reliably
-// stable because Fyne's pointer-event dispatch races with the
-// per-row decodeBox repositioning. We now leave the popup visible
-// indefinitely once shown — its contents update in place when the
-// operator hovers a different decode box, and the popup is dismissed
-// only by clicking its inline Close button (added in showDecodePopup).
-func (g *GUI) hideDecodePopup() {
-	// Intentionally empty.
-}
+// hideDecodePopup is a no-op. Kept for callers that may still send a
+// hover-end signal. The popup is sticky and only dismisses on
+// explicit click (close button, or empty waterfall).
+func (g *GUI) hideDecodePopup() {}
 
-// dismissDecodePopup tears down the magnification popup. Called from
-// the popup's own Close button.
+// dismissDecodePopup tears down the magnification popup and clears
+// the pinned flag so the next hover-preview can take over.
 func (g *GUI) dismissDecodePopup() {
+	logging.L.Debugw("dismissDecodePopup called")
 	g.mu.Lock()
 	pop := g.decodePopup
 	g.decodePopup = nil
 	g.decodePopupContent = nil
 	g.decodePopupCall = ""
-	if g.decodePopupHide != nil {
-		g.decodePopupHide.Stop()
-		g.decodePopupHide = nil
-	}
+	g.decodePopupPinned = false
 	g.mu.Unlock()
 	if pop != nil {
 		fyne.Do(func() { pop.Hide() })
@@ -1901,6 +2055,9 @@ func (g *GUI) scrollChatToCall(call string) {
 		return
 	}
 	fyne.Do(func() {
+		g.mu.Lock()
+		g.suppressChatSelectInput = true
+		g.mu.Unlock()
 		g.chatList.ScrollTo(idx)
 		g.chatList.Select(idx)
 	})
@@ -1916,6 +2073,9 @@ func (g *GUI) scrollHeardToCall(call string) {
 	for i, e := range snap {
 		if strings.EqualFold(e.call, call) {
 			fyne.Do(func() {
+				g.mu.Lock()
+				g.suppressHeardSelectAction = true
+				g.mu.Unlock()
 				g.usersList.ScrollTo(i)
 				g.usersList.Select(i)
 			})
@@ -1971,6 +2131,9 @@ func (g *GUI) scrollChatToDecode(slotStart time.Time, call string) {
 		return
 	}
 	fyne.Do(func() {
+		g.mu.Lock()
+		g.suppressChatSelectInput = true
+		g.mu.Unlock()
 		g.chatList.ScrollTo(idx)
 		g.chatList.Select(idx)
 	})
@@ -1998,8 +2161,17 @@ func (g *GUI) buildLayout() fyne.CanvasObject {
 	// active mode ("FT8") and one greyed-out future mode ("FT4"); chips
 	// rather than icons keep the layout cheap and obvious.
 	ft8Chip := chip("FT8", color.RGBA{88, 101, 242, 255}) // Discord blurple
-	ft4Chip := chip("FT4", color.RGBA{60, 60, 60, 255})   // disabled grey
-	modeRail := container.NewVBox(ft8Chip, ft4Chip)
+	// FT4 isn't implemented yet but we keep the chip in place so the
+	// rail looks complete; tapping it shows a "coming soon" notice
+	// instead of leaving the operator wondering whether they
+	// mis-clicked or the app is stuck.
+	ft4Chip := chip("FT4", color.RGBA{60, 60, 60, 255})
+	ft4Tap := newTappableContainer(ft4Chip, func() {
+		dialog.ShowInformation("FT4",
+			"Coming soon — NocordHF currently transmits and decodes FT8 only.",
+			g.window)
+	})
+	modeRail := container.NewVBox(ft8Chip, ft4Tap)
 	modeBg := canvas.NewRectangle(color.RGBA{32, 34, 37, 255})
 	modeCol := container.NewStack(modeBg, container.NewPadded(modeRail))
 
@@ -2263,8 +2435,19 @@ func (g *GUI) buildLayout() fyne.CanvasObject {
 			return
 		}
 		r := g.rows[id]
+		// Suppress the input-population side-effect when the
+		// selection was synthesised by scrollChatTo* (just to scroll
+		// to the row). Without this, clicking a decode box on the
+		// waterfall would write that call into the input box every
+		// time, since selectCall scrolls the chat to the matching
+		// row via Select(idx).
+		suppress := g.suppressChatSelectInput
+		g.suppressChatSelectInput = false
 		g.mu.Unlock()
 		g.chatList.UnselectAll()
+		if suppress {
+			return
+		}
 		if r.system || r.tx || r.separator {
 			return
 		}
@@ -2342,38 +2525,66 @@ func (g *GUI) buildLayout() fyne.CanvasObject {
 			return len(g.heard)
 		},
 		func() fyne.CanvasObject {
-			// Three-segment row: tiny green "CQ" tag, country flag, and
-			// "CALL SNR" text. The whole row is wrapped in a hoverRow
-			// (highlights the matching map pin / waterfall box on
-			// hover, opens the context menu on right-click). The
-			// flag-only slot is wrapped in its OWN hoverRow so the
-			// country tooltip ONLY appears when the cursor is actually
-			// over the flag — keeps the tooltip from popping for
-			// every cursor move across the row text.
-			cq := canvas.NewText("CQ", color.RGBA{80, 200, 120, 255})
-			cq.TextStyle = fyne.TextStyle{Bold: true, Monospace: true}
-			cq.TextSize = 10
-			cq.Hide()
-			cqSlot := container.New(&fixedWidthLayout{width: 22}, cq)
+			// Four-segment row: [CQ slot] [OTA slot] [country slot]
+			// CALL SNR. The CQ and OTA badges are wrapped in fixed-
+			// width slots so toggling their visibility doesn't shift
+			// the country circle, callsign, and SNR — those columns
+			// stay at a fixed X regardless of which status badges are
+			// present.
+			//
+			// The whole row is wrapped in a hoverRow (highlights the
+			// matching map pin / waterfall box on hover, opens the
+			// context menu on right-click). The flag-circle is in
+			// its own hoverRow so the country tooltip ONLY appears
+			// when the cursor is actually over the country circle.
+			// CQ slot: pixel-art icon from the same badge catalog as
+			// the OTA programmes, so map and roster show identical
+			// CQ artwork. canvas.Image with nearest-neighbour scale
+			// for sharp edges at the 18px slot size.
+			cqImg := canvas.NewImageFromImage(mapview.BadgeImage("CQ"))
+			cqImg.FillMode = canvas.ImageFillContain
+			cqImg.ScaleMode = canvas.ImageScalePixels
+			cqImg.SetMinSize(fyne.NewSize(18, 18))
+			cqImg.Hide()
+			cqSlot := container.New(&fixedWidthLayout{width: 22}, cqImg)
+			// OTA slot: a canvas.Image that gets its source swapped
+			// per row via mapview.BadgeImage(otaType). Image is
+			// downscaled to ~18 px with nearest-neighbor for crisp
+			// pixel-art rendering at small sizes.
+			otaImg := canvas.NewImageFromImage(blankBadgeImage())
+			otaImg.FillMode = canvas.ImageFillContain
+			otaImg.ScaleMode = canvas.ImageScalePixels
+			otaImg.SetMinSize(fyne.NewSize(18, 18))
+			otaImg.Hide()
+			otaSlot := container.New(&fixedWidthLayout{width: 22}, otaImg)
+			// Country slot: native unicode flag emoji centred in a
+			// fixed-width slot. Reverted from a colored-disc-with-
+			// letters because the operating system already renders
+			// flag emoji at the right size, and the actual flag is
+			// what the user wants to see (the disc was reading as a
+			// generic blob with text).
 			flagText := canvas.NewText("", color.RGBA{220, 225, 235, 255})
 			flagText.TextSize = 14
 			flagText.Alignment = fyne.TextAlignCenter
-			flagInner := container.New(&fixedWidthLayout{width: 24}, container.NewCenter(flagText))
+			flagInner := container.New(&fixedWidthLayout{width: 22}, container.NewCenter(flagText))
 			flagSlot := newHoverRow(flagInner)
 			t := canvas.NewText("", color.RGBA{210, 215, 225, 255})
 			t.TextStyle = fyne.TextStyle{Monospace: true}
 			t.TextSize = 10
-			return newHoverRow(container.NewHBox(cqSlot, flagSlot, t))
+			return newHoverRow(container.NewHBox(cqSlot, otaSlot, flagSlot, t))
 		},
 		func(id widget.ListItemID, obj fyne.CanvasObject) {
 			h := obj.(*hoverRow)
 			row := h.inner.(*fyne.Container)
 			cqSlot := row.Objects[0].(*fyne.Container)
-			cq := cqSlot.Objects[0].(*canvas.Text)
-			flagSlot := row.Objects[1].(*hoverRow)
+			cqImg := cqSlot.Objects[0].(*canvas.Image)
+			otaSlot := row.Objects[1].(*fyne.Container)
+			otaImg := otaSlot.Objects[0].(*canvas.Image)
+			flagSlot := row.Objects[2].(*hoverRow)
 			flagInner := flagSlot.inner.(*fyne.Container)
-			flagText := flagInner.Objects[0].(*fyne.Container).Objects[0].(*canvas.Text)
-			t := row.Objects[2].(*canvas.Text)
+			flagCenter := flagInner.Objects[0].(*fyne.Container)
+			flagText := flagCenter.Objects[0].(*canvas.Text)
+			t := row.Objects[3].(*canvas.Text)
 			snap := g.heardSnapshot()
 			if id >= len(snap) {
 				h.onHoverIn = nil
@@ -2386,10 +2597,13 @@ func (g *GUI) buildLayout() fyne.CanvasObject {
 				return
 			}
 			e := snap[id]
+
+			// Country slot: native unicode flag emoji for the call's
+			// home entity. Falls back to the 2-letter ISO code for
+			// entities without a real flag (Hawaii, Alaska, etc.)
+			// or to two spaces when the code can't be inferred.
 			flag := callsign.Flag(e.call)
 			if flag == "" {
-				// Fall back to country code for entities without a
-				// real ISO-3166 trailer (Hawaii, Alaska, etc.).
 				if sc := callsign.ShortCode(e.call); len(sc) >= 2 {
 					flag = sc[len(sc)-2:]
 				} else {
@@ -2398,10 +2612,27 @@ func (g *GUI) buildLayout() fyne.CanvasObject {
 			}
 			flagText.Text = flag
 			flagText.Refresh()
+
+			// CQ badge: visible while the CQ window is fresh.
 			if !e.lastCQ.IsZero() && time.Since(e.lastCQ) <= 30*time.Second {
-				cq.Show()
+				cqImg.Show()
 			} else {
-				cq.Hide()
+				cqImg.Hide()
+			}
+			// OTA badge: pixel-art icon for the active program, drawn
+			// from lib/mapview's BadgeImage so the same artwork
+			// appears on the map. Hidden when no recent OTA has
+			// been heard (or the program is unknown).
+			if !e.lastOTA.IsZero() && time.Since(e.lastOTA) <= 5*time.Minute {
+				if im := mapview.BadgeImage(e.lastOTAType); im != nil {
+					otaImg.Image = im
+					otaImg.Refresh()
+					otaImg.Show()
+				} else {
+					otaImg.Hide()
+				}
+			} else {
+				otaImg.Hide()
 			}
 			t.Text = fmt.Sprintf("%-7s %+3.0f", e.call, e.snr)
 			if g.shouldBlinkCall(e.call) {
@@ -2446,12 +2677,24 @@ func (g *GUI) buildLayout() fyne.CanvasObject {
 		},
 	)
 	g.usersList.OnSelected = func(id widget.ListItemID) {
+		// Suppress the side-effect (popup + selectCall) when the
+		// selection was synthesised by scrollHeardToCall. Without
+		// this, the recursive selectCall → scrollHeardToCall → Select
+		// → OnSelected → selectCall loop fires showDecodePopup
+		// hundreds of times per second.
+		g.mu.Lock()
+		suppress := g.suppressHeardSelectAction
+		g.suppressHeardSelectAction = false
+		g.mu.Unlock()
 		snap := g.heardSnapshot()
 		if id >= len(snap) {
 			return
 		}
 		call := snap[id].call
 		g.usersList.UnselectAll()
+		if suppress {
+			return
+		}
 		// Single-click in the HEARD list mirrors single-click on a
 		// waterfall decode box: show the magnification popup, scroll
 		// + blink the matching chat row, freeze chat auto-scroll.
@@ -2558,26 +2801,41 @@ func (g *GUI) buildLayout() fyne.CanvasObject {
 	g.scope.mapWidget.SetWorkedGridsFunc(g.lotwWorkedGridsOnActiveBand)
 	g.scope.mapWidget.SetConfirmedGridsFunc(g.lotwConfirmedGridsOnActiveBand)
 	g.scope.mapWidget.SetWorkedFunc(g.workedStatusForCall)
+	g.scope.mapWidget.SetRecentCQFunc(g.callIsCQ)
 	// Right-click a station dot on the map → same context menu as
 	// the chat / HEARD / waterfall surfaces.
 	g.scope.mapWidget.SetOnSpotSecondaryTap(func(call string, absPos fyne.Position) {
 		g.showCallContextMenu(call, g.callIsCQ(call), absPos)
 	})
 
-	// Wire decode-box interactions: double-click → scroll chat;
-	// hover → magnified signal popup; right-click → operator profile.
-	// Hover handlers stay nil for now until the popup widget below is
-	// constructed; double-click + context are safe to wire up front.
+	// Wire decode-box interactions:
+	//   - double-click → scroll chat to the matching call;
+	//   - right-click → operator context menu;
+	//   - single-click on a box → pin the magnification popup at the
+	//     click position and scroll/highlight the chat row;
+	//   - single-click on empty waterfall → unpin + hide the popup;
+	//   - hover over a box (when no popup is pinned) → show a live
+	//     preview popup adjacent to the box; updates as the cursor
+	//     moves between boxes; hides on hover-leave-all.
 	g.scope.SetDecodeHooks(
 		g.scrollChatToDecode,
-		func(call string, slotStart time.Time, freqHz float64, _ float64, pos fyne.Position) {
-			g.showDecodePopup(call, slotStart, freqHz, pos)
-		},
-		func() { g.hideDecodePopup() },
 		func(call string, pos fyne.Position) {
 			g.showCallContextMenu(call, g.callIsCQ(call), pos)
 		},
-		g.selectCall,
+		func(call string, slotStart time.Time, freqHz float64, pos fyne.Position) {
+			// Click → pin. Selection highlight is already set by
+			// scope's onSelect before this callback fires; here we
+			// pin the popup, scroll + blink-highlight the matching
+			// chat row.
+			g.pinDecodePopup(call, slotStart, freqHz, pos)
+			g.selectCall(call)
+		},
+		g.dismissDecodePopup,
+		func(call string, slotStart time.Time, freqHz float64, pos fyne.Position) {
+			// Hover preview — only when nothing is currently pinned.
+			g.previewDecodePopup(call, slotStart, freqHz, pos)
+		},
+		g.previewDecodePopupEnd,
 	)
 
 	// ── Compose four columns horizontally ──────────────────────────────
@@ -2591,11 +2849,13 @@ func (g *GUI) buildLayout() fyne.CanvasObject {
 	root := container.NewBorder(nil, nil, leftPair, nil, chatScope)
 
 	// Force the column widths to feel like Discord (mode rail thin,
-	// channel column moderate, chat takes the rest).
+	// band column tight — band labels are short ("20m", "40m" plus
+	// the parenthesised activity count), no need for 180px of
+	// chrome). Chat takes the rest.
 	modeCol.Resize(fyne.NewSize(56, 720))
 	modeBg.SetMinSize(fyne.NewSize(56, 0))
-	chanCol.Resize(fyne.NewSize(180, 720))
-	chanBg.SetMinSize(fyne.NewSize(180, 0))
+	chanCol.Resize(fyne.NewSize(110, 720))
+	chanBg.SetMinSize(fyne.NewSize(110, 0))
 
 	return root
 }
@@ -2805,6 +3065,120 @@ func formatRowSegments(r chatRow) (ts, meta, msg string) {
 }
 
 // chip renders a small filled rectangle with a label -used for the mode rail.
+// tappableContainer wraps any CanvasObject so a tap fires onTap.
+// Used for chip / icon visuals that aren't natively interactive.
+// Implements fyne.Tappable on a BaseWidget so Fyne's pointer-event
+// dispatch finds it and routes single-clicks here.
+type tappableContainer struct {
+	widget.BaseWidget
+	content fyne.CanvasObject
+	onTap   func()
+}
+
+func newTappableContainer(content fyne.CanvasObject, onTap func()) *tappableContainer {
+	t := &tappableContainer{content: content, onTap: onTap}
+	t.ExtendBaseWidget(t)
+	return t
+}
+
+func (t *tappableContainer) CreateRenderer() fyne.WidgetRenderer {
+	return widget.NewSimpleRenderer(t.content)
+}
+
+func (t *tappableContainer) Tapped(_ *fyne.PointEvent) {
+	if t.onTap != nil {
+		t.onTap()
+	}
+}
+
+// circleBadge renders a colored circle with up to a few characters of
+// text inside it — used as a visual marker in the HEARD roster + on
+// the map. Shape is enforced via canvas.Circle (Fyne primitive that
+// renders a perfect filled disk regardless of pixel density). The
+// label is centred and clipped to the badge's diameter via a Stack.
+//
+// size = the circle's diameter in DIPs.
+// blankBadgeImage returns a small fully-transparent RGBA used as the
+// initial source for an HEARD-list OTA slot's canvas.Image. The
+// binder swaps in the real BadgeImage when a row activates an OTA
+// programme; this placeholder keeps the slot a valid image until then
+// (canvas.NewImageFromImage requires a non-nil source).
+func blankBadgeImage() *image.RGBA {
+	return image.NewRGBA(image.Rect(0, 0, 1, 1))
+}
+
+func circleBadge(label string, bg color.Color, fg color.Color, size float32) *fyne.Container {
+	// Transparent sizer rect enforces the diameter — canvas.Circle
+	// itself has no SetMinSize, but a Stack adopts the largest
+	// MinSize among its children.
+	sizer := canvas.NewRectangle(color.Transparent)
+	sizer.SetMinSize(fyne.NewSize(size, size))
+	c := canvas.NewCircle(bg)
+	c.StrokeWidth = 0
+	t := canvas.NewText(label, fg)
+	t.TextStyle = fyne.TextStyle{Bold: true, Monospace: true}
+	// Font size that fits 2 chars comfortably inside the diameter
+	// without crowding. 0.55× the diameter is a good empirical fit
+	// for the gomonobold rendering Fyne uses by default.
+	t.TextSize = size * 0.55
+	t.Alignment = fyne.TextAlignCenter
+	return container.NewStack(sizer, c, container.NewCenter(t))
+}
+
+// otaBadgeStyle returns the label + colour pair for an OTA program.
+// Same palette is used in the HEARD roster (circleBadge slot) and on
+// the map (mapDrawCircleBadgeLabel), so the visual identity of each
+// programme is consistent across both surfaces. Cartoony bright fills
+// with white text — readable at the small badge sizes both views use.
+//
+// Returns ok=false for unknown types so the caller can hide the slot.
+func otaBadgeStyle(otaType string) (label string, bg, fg color.RGBA, ok bool) {
+	white := color.RGBA{255, 255, 255, 255}
+	switch otaType {
+	case "POTA":
+		return "P", color.RGBA{60, 180, 75, 255}, white, true // park green
+	case "SOTA":
+		return "S", color.RGBA{220, 130, 30, 255}, white, true // summit amber
+	case "WWFF":
+		return "WF", color.RGBA{50, 200, 170, 255}, white, true // flora teal
+	case "IOTA":
+		return "I", color.RGBA{60, 130, 230, 255}, white, true // island blue
+	case "BOTA":
+		return "B", color.RGBA{90, 170, 240, 255}, white, true // beach sky
+	case "LOTA":
+		return "L", color.RGBA{240, 200, 60, 255}, white, true // lighthouse yellow
+	case "NOTA":
+		return "N", color.RGBA{180, 110, 200, 255}, white, true // nuns purple
+	case "PORTABLE":
+		return "/P", color.RGBA{160, 160, 160, 255}, white, true // generic grey
+	}
+	return "", color.RGBA{}, color.RGBA{}, false
+}
+
+// updateCircleBadge mutates a circleBadge in place — used by list
+// row binders that need to re-colour / re-label the same persistent
+// widget on every refresh, rather than rebuilding the whole row.
+//
+// Mirrors circleBadge's child layout: Stack of [sizer, circle,
+// Center(text)]. Defensive on the type assertions so a future change
+// to circleBadge fails loudly rather than silently no-op'ing.
+func updateCircleBadge(badge *fyne.Container, label string, bg, fg color.Color) {
+	if badge == nil || len(badge.Objects) < 3 {
+		return
+	}
+	if c, ok := badge.Objects[1].(*canvas.Circle); ok {
+		c.FillColor = bg
+		c.Refresh()
+	}
+	if center, ok := badge.Objects[2].(*fyne.Container); ok && len(center.Objects) > 0 {
+		if t, ok := center.Objects[0].(*canvas.Text); ok {
+			t.Text = label
+			t.Color = fg
+			t.Refresh()
+		}
+	}
+}
+
 func chip(label string, fill color.Color) *fyne.Container {
 	bg := canvas.NewRectangle(fill)
 	bg.CornerRadius = 8
@@ -2828,9 +3202,11 @@ func remoteCallFromMessage(text string) string {
 		return ""
 	}
 	if strings.EqualFold(fields[0], "CQ") {
-		// "CQ MOD X GRID" or "CQ X GRID"
-		if len(fields) >= 3 && (fields[1] == "DX" || fields[1] == "POTA" || fields[1] == "SOTA" || fields[1] == "TEST") {
-			return fields[1+1]
+		// "CQ MOD X GRID" or "CQ X GRID". The modifier set (DX, NA,
+		// EU, …, POTA, SOTA, numeric zones, …) is owned by lib/ft8 so
+		// the decoder and this reply-target parser stay in sync.
+		if len(fields) >= 3 && ft8.IsCQModifier(fields[1]) {
+			return fields[2]
 		}
 		if len(fields) >= 2 {
 			return fields[1]
@@ -2847,6 +3223,51 @@ func remoteCallFromMessage(text string) string {
 // callsign: at least one letter and at least one digit, length 3–10, only
 // uppercase letters / digits / "/". Defensive -keeps obvious typos out
 // of the TX queue without an exhaustive ITU-prefix check.
+// messageIndicatesOTA classifies a decoded FT8 message for portable /
+// outdoor activity. Returns the program name when one is recognised:
+//
+//   - POTA / SOTA / IOTA / WWFF / BOTA / LOTA / NOTA — explicit FT8
+//     "CQ <PROG> CALL GRID" form (n28 reservation for named
+//     activities). The program name comes through verbatim.
+//   - PORTABLE — a /P /M /MM /AM suffix on a callsign-shaped token,
+//     no explicit program. Conventional ham shorthand for
+//     portable/mobile/maritime mobile/aeronautical mobile.
+//
+// Returns "" for system messages or anything that doesn't fit.
+func messageIndicatesOTA(text string) string {
+	fields := strings.Fields(strings.ToUpper(text))
+	if len(fields) >= 2 && fields[0] == "CQ" {
+		switch fields[1] {
+		case "POTA", "SOTA", "IOTA", "WWFF", "BOTA", "LOTA", "NOTA":
+			return fields[1]
+		}
+	}
+	for _, f := range fields {
+		i := strings.Index(f, "/")
+		if i <= 0 || i == len(f)-1 {
+			continue
+		}
+		suffix := f[i+1:]
+		switch suffix {
+		case "P", "M", "MM", "AM":
+			pre := f[:i]
+			hasL, hasD := false, false
+			for _, r := range pre {
+				if r >= 'A' && r <= 'Z' {
+					hasL = true
+				}
+				if r >= '0' && r <= '9' {
+					hasD = true
+				}
+			}
+			if hasL && hasD {
+				return "PORTABLE"
+			}
+		}
+	}
+	return ""
+}
+
 func isPlausibleCallsign(s string) bool {
 	if len(s) < 3 || len(s) > 10 {
 		return false
