@@ -54,10 +54,11 @@ jobs:
           # fyne package reads FyneApp.toml for the Info.plist
           # additions (including NSMicrophoneUsageDescription).
           fyne package -os darwin -icon docs/icon.png \
+            -src ./cmd/nocordhf \
             -release \
             -name NocordHF \
             -app-id com.nocordhf.app \
-            -app-version 1.0.0
+            -app-version "${GITHUB_REF_NAME#v}"
           codesign --force --deep --sign - NocordHF.app
           # Stamp the bundle into a DMG via hdiutil.
           hdiutil create -volname NocordHF \
