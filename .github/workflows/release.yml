@@ -53,6 +53,8 @@ jobs:
           # proper .app bundle so users can drag it into Applications.
           # fyne package reads FyneApp.toml for the Info.plist
           # additions (including NSMicrophoneUsageDescription).
+          pwd
+          ls -R docs/
           fyne package -os darwin -icon "${GITHUB_WORKSPACE}/docs/icon.png" \
             -src ./cmd/nocordhf \
             -release \
