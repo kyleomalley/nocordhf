@@ -3,6 +3,30 @@
 All notable changes to NocordHF are tracked in this file. Version
 numbers follow [Semantic Versioning](https://semver.org/).
 
+## [1.0.5] - 2026-05-01
+
+### Fixes
+
+- Bundled `.app` had no audio access. `fyne package` silently
+  drops the `[macOS]` section in `FyneApp.toml`, so
+  `NSMicrophoneUsageDescription` never reached `Info.plist` and
+  CoreAudio refused mic capture under the hardened runtime. We now
+  patch the key in via `plutil` after packaging and codesign with
+  a `com.apple.security.device.audio-input` entitlement
+  (`scripts/macos/entitlements.plist`). Affects FT8 RX from the
+  rig's USB CODEC interface — without these the receive pipeline
+  decoded nothing from a Finder-launched `.app`.
+- TQSL upload exited 10 with a usage dump on every QSO. v1.0.3
+  added `-y` and `-n` flags assuming TQSL 2.5/2.6 semantics; in
+  TQSL 2.7+ `-y` doesn't exist and `-n` means `--updates`
+  (triggers an update check). Reverted to the original
+  `-x -u -d -a compliant` flag set.
+- QSO closure double-uploaded to LoTW. The QSO tracker re-created
+  an `openContact` when one was missing then immediately finalized
+  it on `73`/`RR73`, so a repeat-decode of the closing message — or
+  a manual TX of `73` after the auto-reply already sent one — fired
+  `onLogged` twice. Now bails when the contact wasn't already open.
+
 ## [1.0.4] - 2026-05-01
 
 ### Fixes

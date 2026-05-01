@@ -169,7 +169,7 @@ func (t *qsoTracker) ObserveRX(msg string, theirSNR int, decodedAt time.Time) (a
 		return adif.Record{}, false
 	}
 
-	c := t.open[their]
+	c, wasOpen := t.open[their], t.open[their] != nil
 	if c == nil {
 		c = &openContact{
 			theirCall: their,
@@ -190,6 +190,14 @@ func (t *qsoTracker) ObserveRX(msg string, theirSNR int, decodedAt time.Time) (a
 		tok := fields[i]
 		switch {
 		case tok == "RR73" || tok == "73":
+			// Don't re-fire onLogged on a repeat 73/RR73 from them:
+			// the QSO was already finalised on the first one and
+			// removed from t.open. Without this, multiple Costas hits
+			// of the same closing message produce duplicate uploads.
+			if !wasOpen {
+				delete(t.open, their)
+				return adif.Record{}, false
+			}
 			rec := t.finaliseLocked(c, decodedAt)
 			delete(t.open, their)
 			return rec, true
@@ -232,7 +240,7 @@ func (t *qsoTracker) ObserveTX(msg string, txAt time.Time) (adif.Record, bool) {
 	if !looksLikeCallsignFast(their) {
 		return adif.Record{}, false
 	}
-	c := t.open[their]
+	c, wasOpen := t.open[their], t.open[their] != nil
 	if c == nil {
 		c = &openContact{
 			theirCall: their,
@@ -248,6 +256,15 @@ func (t *qsoTracker) ObserveTX(msg string, txAt time.Time) (adif.Record, bool) {
 	for i := 2; i < len(fields); i++ {
 		tok := fields[i]
 		if tok == "73" || tok == "RR73" {
+			// Don't double-fire onLogged when we re-send 73/RR73
+			// (manually after auto-reply, or auto-reply re-firing on
+			// repeated decodes): the QSO was already finalised on the
+			// first one and removed from t.open. If it isn't there
+			// now, there's nothing meaningful to log — skip.
+			if !wasOpen {
+				delete(t.open, their)
+				return adif.Record{}, false
+			}
 			rec := t.finaliseLocked(c, txAt)
 			delete(t.open, their)
 			return rec, true
