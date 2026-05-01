@@ -606,6 +606,19 @@ func (l *freqAxisLayout) Layout(objs []fyne.CanvasObject, size fyne.Size) {
 	bg.Move(fyne.NewPos(0, 0))
 	bg.Resize(size)
 
+	// The waterfall above us reserves scopeTimeStripWidth pixels on the
+	// left for the slot-time strip; the actual 0..scopeFreqMaxHz axis
+	// spans only the area to the RIGHT of that strip. Mirror the same
+	// offset here so tick labels and the TX caret line up with the
+	// frequency column they refer to. Without this, the axis maps
+	// 0..3600 Hz across the full parent width and everything sits ~64
+	// px too far left.
+	stripW := float32(scopeTimeStripWidth)
+	if stripW > size.Width {
+		stripW = size.Width
+	}
+	axisW := size.Width - stripW
+
 	// Tick row sits on the top half, marker on the bottom half. Caret
 	// is a 1-px-wide vertical bar between the two so the operator's
 	// eye can trace marker → caret tip → waterfall column.
@@ -613,17 +626,17 @@ func (l *freqAxisLayout) Layout(objs []fyne.CanvasObject, size fyne.Size) {
 	caretTopY := float32(11)
 	caretH := float32(5)
 	markerY := float32(15)
-	pxPerHz := size.Width / float32(scopeFreqMaxHz)
+	pxPerHz := axisW / float32(scopeFreqMaxHz)
 
 	for i, t := range l.ticks {
 		// Tick label: centred at its frequency, clamped so the first
 		// and last don't fall off the edges.
 		hz := float32((i + 1) * 500) // l.ticks[0] = 500 Hz, etc.
-		cx := hz * pxPerHz
+		cx := stripW + hz*pxPerHz
 		ts := t.MinSize()
 		x := cx - ts.Width/2
-		if x < 0 {
-			x = 0
+		if x < stripW {
+			x = stripW
 		}
 		if x+ts.Width > size.Width {
 			x = size.Width - ts.Width
@@ -640,14 +653,14 @@ func (l *freqAxisLayout) Layout(objs []fyne.CanvasObject, size fyne.Size) {
 	l.scope.mu.Lock()
 	hz := l.scope.txFreqHz
 	l.scope.mu.Unlock()
-	cx := float32(hz/scopeFreqMaxHz) * size.Width
+	cx := stripW + float32(hz/scopeFreqMaxHz)*axisW
 	caret.Move(fyne.NewPos(cx, caretTopY))
 	caret.Resize(fyne.NewSize(2, caretH))
 	if mt, ok := mark.(*canvas.Text); ok {
 		ms := mt.MinSize()
 		x := cx - ms.Width/2
-		if x < 0 {
-			x = 0
+		if x < stripW {
+			x = stripW
 		}
 		if x+ms.Width > size.Width {
 			x = size.Width - ms.Width

@@ -113,7 +113,15 @@ func (c *Config) Upload(adifPath string) error {
 		return fmt.Errorf("tqsl binary not found at %s", c.BinaryPath)
 	}
 
-	args := []string{"-x", "-u", "-d", "-a", "compliant"}
+	// -q quiet: suppress GUI dialogs (incl. the "confirm grid square"
+	//    popup that fires every upload otherwise — primary fix for the
+	//    "tqsl keeps asking for grid" complaint).
+	// -y suppress yes/no prompts (assume yes) — batch upload shouldn't
+	//    block on confirmation dialogs.
+	// -n no beep on completion.
+	// -x quit when done, -u upload only, -d errors to stderr (no
+	//    dialog), -a compliant duplicate handling.
+	args := []string{"-x", "-u", "-d", "-q", "-y", "-n", "-a", "compliant"}
 	if c.StationLocation != "" {
 		args = append(args, "-l", c.StationLocation)
 	}

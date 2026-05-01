@@ -1899,8 +1899,19 @@ func mapDrawLegend(img *image.RGBA, w, h int) {
 		textX     = badgeSize + 12
 		padX      = 8
 		padY      = 6
-		boxW      = 140
+		// basicfont.Face7x13 advances 7 px per glyph; right-edge gutter
+		// keeps the longest label off the border.
+		glyphW      = 7
+		rightGutter = 8
 	)
+	maxLabelChars := 0
+	for _, e := range otaLegendEntries {
+		n := len(e.key) + 1 + len(e.label) // "POTA Parks"
+		if n > maxLabelChars {
+			maxLabelChars = n
+		}
+	}
+	boxW := textX + maxLabelChars*glyphW + rightGutter
 	boxH := len(otaLegendEntries)*rowH + padY*2
 	bx := padX
 	by := h - boxH - padX

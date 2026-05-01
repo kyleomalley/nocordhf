@@ -98,6 +98,22 @@ func (t *qsoTracker) SetOnLogged(fn func(adif.Record)) {
 	t.mu.Unlock()
 }
 
+// IsOpen reports whether a contact with `call` is currently in progress
+// (we sent it a directed call but haven't logged the QSO yet, so it's
+// still in t.open). Used by the chat renderer to flag rows where one
+// of our open targets is now talking with someone else — a "they're
+// busy" cue so the operator notices the target may not respond to us.
+func (t *qsoTracker) IsOpen(call string) bool {
+	call = strings.ToUpper(strings.TrimSpace(call))
+	if call == "" {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	_, ok := t.open[call]
+	return ok
+}
+
 // FireRX is the convenience wrapper used by GUI.AppendDecode: feeds
 // the tracker and, if the message closed a QSO, fires onLogged
 // synchronously. Returns true if a record was produced.
