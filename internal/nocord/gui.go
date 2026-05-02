@@ -138,6 +138,21 @@ type chatRow struct {
 	region    string // e.g. "NA-US", "EU-DE"
 	text      string
 	method    string // "" / "osd" / "a1" / etc.
+	// confirmStatus flags whether the row's sender has a prior contact
+	// with us on the current band (computed at AppendDecode time):
+	//   0 = none, 1 = ADIF-logged, 2 = LoTW-confirmed
+	confirmStatus int
+	// txInProgress + txProgress drive the live "characters going green
+	// while transmitting" effect on TX rows. While true, the row's
+	// message is split: the first txProgress runes render green
+	// (already on-air) and the remainder render grey (still pending).
+	// Set to false once playback completes — row then renders fully
+	// green like a normal finished-TX echo. Only meaningful on tx rows.
+	txInProgress bool
+	txProgress   int
+	// txStart is the wall clock the audio began playing — used by the
+	// 1 Hz status ticker to advance txProgress proportionally.
+	txStart time.Time
 }
 
 // GUI is the NocordHF top-level window state. Everything the main loop needs
@@ -185,6 +200,19 @@ type GUI struct {
 	// typing in the input). Persisted via the "auto_reply" preference
 	// so the toggle survives restarts.
 	autoReply bool
+	// rosterStaleMinutes is how long a HEARD-list entry / map spot can
+	// go without a fresh decode before sweepStaleRoster purges it.
+	// 0 disables purging (entries live forever, like before this
+	// setting existed). Persisted as the "roster_stale_minutes" pref;
+	// editable in Settings → Profile.
+	rosterStaleMinutes int
+	// pendingRetries tracks auto-reply TXs we sent but haven't yet seen
+	// a response to. Each entry's tail is re-queued every ~30 s (one
+	// of their slots + one of ours) up to retryMaxAttempts; cleared the
+	// moment we decode any inbound message addressed at us from that
+	// call. Lets the auto-reply chain survive a missed RX without
+	// requiring the user to manually re-click. Keyed by uppercase call.
+	pendingRetries map[string]*pendingRetry
 	// peerPeriods records the most-recently-observed TX period (0 = first
 	// half of minute, 1 = second) for each station we've decoded. Used
 	// to pick the OPPOSITE period when transmitting to them, so we
@@ -350,12 +378,13 @@ const maxRows = 500
 // are caller-owned; the GUI sends to them but never closes them.
 func NewGUI(a fyne.App, buildID string, txCh chan TxRequest, tuneCh chan uint64) *GUI {
 	g := &GUI{
-		app:         a,
-		buildID:     buildID,
-		txCh:        txCh,
-		tuneCh:      tuneCh,
-		current:     DefaultBands[4], // 20m default
-		peerPeriods: make(map[string]int),
+		app:            a,
+		buildID:        buildID,
+		txCh:           txCh,
+		tuneCh:         tuneCh,
+		current:        DefaultBands[4], // 20m default
+		peerPeriods:    make(map[string]int),
+		pendingRetries: make(map[string]*pendingRetry),
 	}
 	g.window = a.NewWindow("NocordHF [build=" + buildID + "]")
 	g.window.Resize(fyne.NewSize(1100, 720))
@@ -532,9 +561,13 @@ func (g *GUI) showSettings() {
 	gridEntry := widget.NewEntry()
 	gridEntry.SetText(curGrid)
 	gridEntry.SetPlaceHolder("Your 4- or 6-char Maidenhead grid")
+	rosterStaleEntry := widget.NewEntry()
+	rosterStaleEntry.SetText(strconv.Itoa(prefs.IntWithFallback("roster_stale_minutes", 30)))
+	rosterStaleEntry.SetPlaceHolder("30 (0 disables)")
 	profileForm := widget.NewForm(
 		widget.NewFormItem("Callsign", callEntry),
 		widget.NewFormItem("Grid", gridEntry),
+		widget.NewFormItem("Roster stale (min)", rosterStaleEntry),
 	)
 
 	// ── Map / Decoder tab ──────────────────────────────────────────
@@ -914,6 +947,15 @@ func (g *GUI) showSettings() {
 			// throw away everything else above.
 			newCall := strings.ToUpper(strings.TrimSpace(callEntry.Text))
 			newGrid := strings.ToUpper(strings.TrimSpace(gridEntry.Text))
+			// Roster stale-after threshold (minutes). Bad input falls
+			// back to the previous value rather than rejecting the
+			// whole save.
+			if mins, err := strconv.Atoi(strings.TrimSpace(rosterStaleEntry.Text)); err == nil && mins >= 0 {
+				prefs.SetInt("roster_stale_minutes", mins)
+				g.mu.Lock()
+				g.rosterStaleMinutes = mins
+				g.mu.Unlock()
+			}
 			if newCall != "" && !isPlausibleCallsign(newCall) {
 				dialog.ShowError(fmt.Errorf("%q does not look like a valid callsign; other settings have been saved", newCall), g.window)
 				return
@@ -1026,6 +1068,12 @@ func (g *GUI) AppendDecode(d ft8.Decoded) {
 	if remote := remoteCallFromMessage(d.Message.Text); remote != "" {
 		row.region = callsign.ShortCode(remote)
 	}
+	// Mark rows whose SENDER is already in the log on the current
+	// band so the operator can spot known calls / fresh DX at a
+	// glance without scrolling through ADIF or the map.
+	if sender := senderFromMessage(d.Message.Text); sender != "" {
+		row.confirmStatus = g.confirmStatusForCall(sender)
+	}
 	// Mark messages addressed to us (first token == myCall) for highlighting.
 	g.mu.Lock()
 	myCall := g.myCall
@@ -1093,9 +1141,24 @@ func (g *GUI) AppendDecode(d ft8.Decoded) {
 	// followed: gated off, skipped (no recognized tail), deduped, or
 	// queued.
 	if row.addrUs {
+		// Flip the map's QSO arc to point back at the caller.
+		// SetQSOPartner with (0,0) lat/lon falls back to the spot DB
+		// at draw time, so anyone we've previously decoded will have
+		// a known position. The most recent of TX-echo / addr-us
+		// decode wins — matches the "last call only" UX.
+		sender := senderFromMessage(d.Message.Text)
 		g.mu.Lock()
+		scope := g.scope
 		auto := g.autoReply
 		g.mu.Unlock()
+		if scope != nil && scope.mapWidget != nil && sender != "" {
+			scope.mapWidget.SetQSOPartner(sender, 0, 0, false)
+		}
+		// They responded — drop any in-flight retry for this call so
+		// sweepPendingRetries doesn't keep re-TXing the previous leg.
+		// maybeAutoReply below will register a fresh entry for the
+		// next QSO step if one applies.
+		g.clearPendingRetry(sender)
 		if logging.L != nil {
 			logging.L.Infow("addr_us decode",
 				"msg", d.Message.Text,
@@ -1166,6 +1229,33 @@ func (g *GUI) maybeAutoReply(d ft8.Decoded, myCall string, slotSec int64) {
 			logging.L.Infow("auto-reply queued",
 				"remote", remote, "tail", tail, "avoid_period", req.AvoidPeriod)
 		}
+		// Register / refresh the retry entry so the 1 Hz sweep
+		// (sweepPendingRetries) re-queues this same TX up to
+		// retryMaxAttempts times if the remote doesn't respond. Reset
+		// counter when the tail changes (we've moved to the next QSO
+		// step; the operator effectively ack'd the previous one).
+		//
+		// Skip "73" — that's the terminal courtesy reply after the
+		// remote sent us RR73, so they've already closed; resending
+		// 73 serves no protocol purpose and wastes a slot. (RR73 is
+		// still retried: if they didn't hear it they need our ack to
+		// finish their side of the QSO.)
+		if tail != "73" {
+			g.mu.Lock()
+			ru := strings.ToUpper(remote)
+			prev, ok := g.pendingRetries[ru]
+			if ok && prev.tail == tail {
+				prev.attempts++
+				prev.lastSent = time.Now()
+			} else {
+				g.pendingRetries[ru] = &pendingRetry{
+					tail:     tail,
+					attempts: 1,
+					lastSent: time.Now(),
+				}
+			}
+			g.mu.Unlock()
+		}
 	default:
 		// TX queue full (operator has manual TXs pending). Drop silently;
 		// they can manually click Reply if they want this one through.
@@ -1174,6 +1264,170 @@ func (g *GUI) maybeAutoReply(d ft8.Decoded, myCall string, slotSec int64) {
 				"remote", remote, "tail", tail)
 		}
 	}
+}
+
+// sweepPendingRetries walks the pendingRetries map and re-queues any
+// auto-reply whose remote hasn't responded within retryWait, up to
+// retryMaxAttempts. Called once a second by the status ticker.
+//
+// "Responded" is detected at AppendDecode time (see clearPendingRetry):
+// any inbound from the entry's call addressed at us deletes the entry,
+// so the sweep below only sees calls we're still waiting on.
+func (g *GUI) sweepPendingRetries() {
+	g.mu.Lock()
+	myCall, myGrid := g.myCall, g.myGrid
+	auto := g.autoReply
+	if !auto || myCall == "" || g.txCh == nil {
+		g.mu.Unlock()
+		return
+	}
+	now := time.Now()
+	type todo struct {
+		remote, tail string
+		avoid        int
+	}
+	var requeue []todo
+	for call, p := range g.pendingRetries {
+		if now.Sub(p.lastSent) < retryWait {
+			continue
+		}
+		if p.attempts >= retryMaxAttempts {
+			delete(g.pendingRetries, call)
+			if logging.L != nil {
+				logging.L.Infow("auto-reply gave up",
+					"remote", call, "tail", p.tail, "attempts", p.attempts)
+			}
+			continue
+		}
+		requeue = append(requeue, todo{call, p.tail, g.peerPeriods[call]})
+		p.attempts++
+		p.lastSent = now
+	}
+	g.mu.Unlock()
+	// Queue outside the lock — txCh send + AppendSystem can both block
+	// briefly and we don't want to hold g.mu for them.
+	for _, t := range requeue {
+		avoid := t.avoid
+		if _, ok := g.peerPeriods[t.remote]; !ok {
+			avoid = -1
+		}
+		req := TxRequest{
+			Callsign: myCall, Grid: myGrid,
+			RemoteCall: t.remote, Tail: t.tail,
+			AvoidPeriod: avoid,
+			StopCh:      make(chan struct{}),
+		}
+		select {
+		case g.txCh <- req:
+			g.AppendSystem(fmt.Sprintf("retry: %s %s %s", t.remote, myCall, t.tail))
+		default:
+			// Queue full — leave the entry in pendingRetries for next sweep.
+		}
+	}
+}
+
+// advanceTxRows nudges the txProgress on every in-progress TX row by
+// the proportion of the FT8 audio duration that's elapsed since the
+// row was created. Called once a second by the status ticker; cheap
+// (walks chat history, only mutates rows currently animating).
+//
+// When elapsed >= txAudioDuration the row is marked complete
+// (txInProgress=false), at which point the renderer treats it as a
+// normal finished-TX echo (full text rendered green).
+func (g *GUI) advanceTxRows() {
+	g.mu.Lock()
+	now := time.Now()
+	dirty := false
+	for i := range g.rows {
+		r := &g.rows[i]
+		if !r.tx || !r.txInProgress {
+			continue
+		}
+		runeLen := len([]rune(r.text))
+		elapsed := now.Sub(r.txStart)
+		if elapsed >= txAudioDuration {
+			if r.txProgress != runeLen || r.txInProgress {
+				r.txProgress = runeLen
+				r.txInProgress = false
+				dirty = true
+			}
+			continue
+		}
+		want := int(float64(runeLen) * elapsed.Seconds() / txAudioDuration.Seconds())
+		if want > runeLen {
+			want = runeLen
+		}
+		if want != r.txProgress {
+			r.txProgress = want
+			dirty = true
+		}
+	}
+	chatList := g.chatList
+	g.mu.Unlock()
+	if dirty && chatList != nil {
+		fyne.Do(func() { chatList.Refresh() })
+	}
+}
+
+// sweepStaleRoster purges HEARD-list entries and map spots that haven't
+// been refreshed within rosterStaleMinutes. Called once a second by the
+// status ticker; cheap when the threshold isn't crossed (just walks the
+// maps comparing timestamps). A 0-minute threshold disables the sweep
+// so the operator can opt out via the Settings pref.
+func (g *GUI) sweepStaleRoster() {
+	g.mu.Lock()
+	mins := g.rosterStaleMinutes
+	g.mu.Unlock()
+	if mins <= 0 {
+		return
+	}
+	maxAge := time.Duration(mins) * time.Minute
+	cutoff := time.Now().Add(-maxAge)
+
+	g.mu.Lock()
+	heardRemoved := 0
+	for k, e := range g.heard {
+		if !e.lastSeen.After(cutoff) {
+			delete(g.heard, k)
+			heardRemoved++
+		}
+	}
+	scope := g.scope
+	usersList := g.usersList
+	g.mu.Unlock()
+
+	spotsRemoved := 0
+	if scope != nil && scope.mapWidget != nil {
+		spotsRemoved = scope.mapWidget.RemoveStaleSpots(maxAge)
+	}
+	if heardRemoved > 0 || spotsRemoved > 0 {
+		if logging.L != nil {
+			logging.L.Infow("roster sweep",
+				"heard_removed", heardRemoved,
+				"spots_removed", spotsRemoved,
+				"max_age_min", mins,
+			)
+		}
+		if usersList != nil {
+			fyne.Do(func() { usersList.Refresh() })
+		}
+		if scope != nil && scope.mapWidget != nil && spotsRemoved > 0 {
+			fyne.Do(func() { scope.mapWidget.Refresh() })
+		}
+	}
+}
+
+// clearPendingRetry drops any in-flight retry for `call`. Called from
+// AppendDecode when an inbound from `call` addressed at us arrives:
+// they responded, so the previous TX leg succeeded and the next leg
+// (if any) will register a fresh entry via maybeAutoReply.
+func (g *GUI) clearPendingRetry(call string) {
+	if call == "" {
+		return
+	}
+	g.mu.Lock()
+	delete(g.pendingRetries, strings.ToUpper(call))
+	g.mu.Unlock()
 }
 
 // peerPeriod returns the most-recently-observed TX period (0 or 1) for
@@ -1247,17 +1501,64 @@ func (g *GUI) AppendSystem(text string) {
 // AppendTxEcho records that we just transmitted; shows up in the chat with
 // a TX-distinct style. Also feeds the QSO tracker so a directed call we
 // initiated opens a contact and a closing 73 we send finalises one.
+// txAudioDuration is the on-air length of one FT8 transmission
+// (79 GFSK symbols × 160 ms). Used by the chat to interpolate the
+// "characters going green while TXing" animation.
+const txAudioDuration = 12640 * time.Millisecond
+
 func (g *GUI) AppendTxEcho(msg string) {
 	now := time.Now()
-	g.appendRow(chatRow{when: now, tx: true, text: msg})
+	// Created in-progress: the status ticker (advanceTxRows) walks
+	// time.Since(txStart) and fills txProgress; the row renders the
+	// transmitted prefix green and the pending suffix grey, then
+	// flips fully green once the audio is done.
+	g.appendRow(chatRow{
+		when:         now,
+		tx:           true,
+		text:         msg,
+		txInProgress: true,
+		txStart:      now,
+	})
 	if g.qso != nil {
 		g.qso.FireTX(msg, now)
+	}
+	// Update the map's QSO arc to point at whoever we just called.
+	// CQ is broadcast — no specific destination — so skip those.
+	// Coordinates default to (0,0): mapview falls back to the spot
+	// database at draw time, so anyone we've previously decoded gets
+	// an arc; cold calls to never-decoded stations silently get none.
+	g.mu.Lock()
+	scope := g.scope
+	myCall := g.myCall
+	g.mu.Unlock()
+	if scope != nil && scope.mapWidget != nil {
+		fields := strings.Fields(strings.ToUpper(strings.TrimSpace(msg)))
+		if len(fields) >= 2 && fields[0] != "CQ" && !strings.EqualFold(fields[0], myCall) {
+			scope.mapWidget.SetQSOPartner(fields[0], 0, 0, true)
+		}
 	}
 }
 
 func (g *GUI) appendRow(r chatRow) {
 	g.mu.Lock()
-	g.rows = append(g.rows, r)
+	// Insert in chronological-by-`when` order, not raw insertion order.
+	// FT8 decodes arrive ~2 s after their slot ends — so an in-progress
+	// TX row added at TX-start (when=now, e.g. 02:18:00) would normally
+	// appear ABOVE the prior slot's decodes (when=02:17:45) that get
+	// appended later. Walking back to the first row with `when` <= r.when
+	// keeps the visible order correct: TX stays at the bottom and
+	// late-arriving decodes slot into their proper slot above it.
+	insertAt := len(g.rows)
+	for insertAt > 0 && g.rows[insertAt-1].when.After(r.when) {
+		insertAt--
+	}
+	if insertAt == len(g.rows) {
+		g.rows = append(g.rows, r)
+	} else {
+		g.rows = append(g.rows, chatRow{})
+		copy(g.rows[insertAt+1:], g.rows[insertAt:])
+		g.rows[insertAt] = r
+	}
 	if len(g.rows) > maxRows {
 		g.rows = g.rows[len(g.rows)-maxRows:]
 	}
@@ -1405,15 +1706,18 @@ func (g *GUI) refreshStatus() {
 		fmt.Sprintf("UTC %s", now.Format("15:04:05")),
 		fmt.Sprintf("slot +%ds", slotPhase),
 	}
-	// "decodes" cell: live count for the current slot if any decodes
-	// have landed, otherwise the previous slot's final count so the
-	// header is informative during the silent gap.
+	// "decodes" cell: live count for the current slot, plus the
+	// previous slot's final count so both are visible at a glance.
+	// During the silent gap before the first decode of a new slot,
+	// curCount is 0 — show "rx 0/N" rather than dropping the cell so
+	// the header doesn't shrink and reflow other parts.
 	nowSlot := now.Unix() - now.Unix()%15
-	switch {
-	case curCount > 0 && curSlot == nowSlot:
-		parts = append(parts, fmt.Sprintf("rx %d", curCount))
-	case prevCount > 0:
-		parts = append(parts, fmt.Sprintf("rx %d (prev)", prevCount))
+	cur := curCount
+	if curSlot != nowSlot {
+		cur = 0 // we've rolled into a new slot; current is fresh
+	}
+	if cur > 0 || prevCount > 0 {
+		parts = append(parts, fmt.Sprintf("rx %d/%d", cur, prevCount))
 	}
 
 	statusColor := color.RGBA{170, 175, 185, 255}
@@ -2135,6 +2439,37 @@ func (g *GUI) localWorkedGridsOnActiveBand() map[string]bool {
 	return out
 }
 
+// confirmStatusForCall returns the strongest prior-contact level we
+// have with `call` on the current band:
+//
+//	0 = never worked on this band
+//	1 = QSO logged in our ADIF (but not yet LoTW-confirmed)
+//	2 = LoTW QSL received (confirmed)
+//
+// Used by formatRowSegments to flag chat rows with a marker so the
+// operator can see at-a-glance which calls are already in the log.
+// Per-band so a worked-on-20m flag doesn't show up while we're on 40m.
+func (g *GUI) confirmStatusForCall(call string) int {
+	call = strings.ToUpper(strings.TrimSpace(call))
+	if call == "" {
+		return 0
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	band := g.current.Name
+	for _, q := range g.lotwQSLs {
+		if q.Confirmed && strings.EqualFold(q.Band, band) && strings.EqualFold(q.Call, call) {
+			return 2
+		}
+	}
+	for _, r := range g.adifLog {
+		if strings.EqualFold(r.Band, band) && strings.EqualFold(r.TheirCall, call) {
+			return 1
+		}
+	}
+	return 0
+}
+
 // workedStatusForCall classifies a callsign for map-pin colouring:
 //
 //	0 = not worked on this band  (default green)
@@ -2347,6 +2682,9 @@ func (g *GUI) startStatusTicker() {
 		defer t.Stop()
 		for range t.C {
 			g.refreshStatus()
+			g.sweepPendingRetries()
+			g.sweepStaleRoster()
+			g.advanceTxRows()
 		}
 	}()
 }
@@ -2479,8 +2817,12 @@ func (g *GUI) buildLayout() fyne.CanvasObject {
 
 	// ── Chat pane: header + scrollable history + input ─────────────────
 	g.statusText = canvas.NewText("UTC --:--:--", color.RGBA{170, 175, 185, 255})
-	g.statusText.TextStyle = fyne.TextStyle{Bold: true, Monospace: true}
-	g.statusText.TextSize = 9
+	// Bold-only (no Monospace): Fyne's mono font lacks a true bold
+	// variant on macOS so the topic bar rendered visually identical
+	// to regular weight. The header isn't tabular so the proportional
+	// face is fine here.
+	g.statusText.TextStyle = fyne.TextStyle{Bold: true}
+	g.statusText.TextSize = 11
 	header := container.NewPadded(g.statusText)
 	// Spin up the NTP checker + 1 Hz status ticker. The checker runs its
 	// own goroutine internally; startStatusTicker drives refreshStatus so
@@ -2514,18 +2856,35 @@ func (g *GUI) buildLayout() fyne.CanvasObject {
 			meta := canvas.NewText("", color.RGBA{130, 135, 145, 255})
 			meta.TextStyle = fyne.TextStyle{Monospace: true}
 			meta.TextSize = 8
+			// Message column = two canvas.Text widgets in an inner HBox.
+			// Normal rows use only the first; in-progress TX rows split
+			// the message between them — `msg` carries the already-
+			// transmitted prefix (rendered green like a finished TX
+			// echo) and `msgPending` carries the not-yet-transmitted
+			// suffix in grey. Same monospace face + size so adjacent
+			// characters line up pixel-for-pixel.
 			msg := canvas.NewText("", color.RGBA{220, 220, 222, 255})
 			msg.TextStyle = fyne.TextStyle{Monospace: true}
 			msg.TextSize = 10
-			textRow := container.NewHBox(ts, meta, msg)
+			msgPending := canvas.NewText("", color.RGBA{120, 124, 132, 255})
+			msgPending.TextStyle = fyne.TextStyle{Monospace: true}
+			msgPending.TextSize = 10
+			textRow := container.NewHBox(ts, meta, msg, msgPending)
 			replyBtn := widget.NewButtonWithIcon("", theme.MailReplyIcon(), nil)
 			replyBtn.Importance = widget.LowImportance
 			replyBtn.Hide()
-			// Action area: a fixed-width strip on the right side of the
-			// row. Each potential button has a reserved slot so adding a
-			// second action later (e.g. "log QSO", "ignore") doesn't
-			// shift the reply button around. Slot 0 = rightmost.
-			actions := container.New(&chatActionsLayout{slotWidth: 28, slots: 1}, replyBtn)
+			// Prior-contact badge: single-letter "L" (LoTW QSL on this
+			// band) or "O" (ADIF QSO logged but not confirmed). Lives
+			// in slot 1 of the actions area, immediately left of the
+			// reply button. Single character keeps every chat row left-
+			// aligned at the same x-offset (no shift between marked
+			// and unmarked rows).
+			qsoBadge := canvas.NewText("", color.RGBA{200, 205, 215, 255})
+			qsoBadge.TextStyle = fyne.TextStyle{Bold: true, Monospace: true}
+			qsoBadge.TextSize = 10
+			qsoBadge.Alignment = fyne.TextAlignCenter
+			actions := container.New(&chatActionsLayout{slotWidth: 28, slots: 2},
+				replyBtn, container.NewCenter(qsoBadge))
 			padded := container.NewPadded(container.NewBorder(nil, nil, nil, actions, textRow))
 			return newHoverRow(padded)
 		},
@@ -2536,9 +2895,11 @@ func (g *GUI) buildLayout() fyne.CanvasObject {
 			textRow := border.Objects[0].(*fyne.Container)
 			actions := border.Objects[1].(*fyne.Container)
 			replyBtn := actions.Objects[0].(*widget.Button)
+			qsoBadge := actions.Objects[1].(*fyne.Container).Objects[0].(*canvas.Text)
 			ts := textRow.Objects[0].(*canvas.Text)
 			meta := textRow.Objects[1].(*canvas.Text)
 			msg := textRow.Objects[2].(*canvas.Text)
+			msgPending := textRow.Objects[3].(*canvas.Text)
 			g.mu.Lock()
 			if id >= len(g.rows) {
 				g.mu.Unlock()
@@ -2549,7 +2910,25 @@ func (g *GUI) buildLayout() fyne.CanvasObject {
 			tsText, metaText, msgText := formatRowSegments(r)
 			ts.Text = tsText
 			meta.Text = metaText
+			// In-progress TX: split the message at the rune boundary
+			// matching txProgress. msgPending picks up the rest in
+			// grey so the operator can watch the line go green
+			// character-by-character. Default for every other row:
+			// full text in `msg`, msgPending empty.
 			msg.Text = msgText
+			msgPending.Text = ""
+			if r.tx && r.txInProgress {
+				runes := []rune(msgText)
+				p := r.txProgress
+				if p < 0 {
+					p = 0
+				}
+				if p > len(runes) {
+					p = len(runes)
+				}
+				msg.Text = string(runes[:p])
+				msgPending.Text = string(runes[p:])
+			}
 			isCQ := strings.HasPrefix(r.text, "CQ")
 			switch {
 			case r.separator:
@@ -2592,6 +2971,25 @@ func (g *GUI) buildLayout() fyne.CanvasObject {
 					msg.TextStyle = fyne.TextStyle{Monospace: true, Bold: true}
 				}
 			}
+			// Prior-contact: "L" badge (LoTW QSL on this band) puts the
+			// message in italics; "O" badge (ADIF-only QSO) leaves the
+			// font upright. Skip on system / tx / separator rows where
+			// the row's text isn't a station message.
+			qsoBadge.Text = ""
+			if !r.system && !r.tx && !r.separator {
+				switch r.confirmStatus {
+				case 2: // LoTW QSL
+					qsoBadge.Text = "L"
+					qsoBadge.Color = color.RGBA{120, 200, 120, 255}
+					ts := msg.TextStyle
+					ts.Italic = true
+					msg.TextStyle = ts
+				case 1: // ADIF QSO
+					qsoBadge.Text = "O"
+					qsoBadge.Color = color.RGBA{180, 180, 195, 255}
+				}
+			}
+			qsoBadge.Refresh()
 			// Reply button: visible only for CQ rows from a real (non-
 			// hashed) callsign. Tapping it queues a directed call to
 			// that station -equivalent to typing their call in the
@@ -2797,10 +3195,18 @@ func (g *GUI) buildLayout() fyne.CanvasObject {
 			flagText.Alignment = fyne.TextAlignCenter
 			flagInner := container.New(&fixedWidthLayout{width: 22}, container.NewCenter(flagText))
 			flagSlot := newHoverRow(flagInner)
+			// Prior-contact slot: single-letter "L" / "O" badge that
+			// mirrors the chat-row indicator. Same width as the other
+			// status slots so the call column stays at a fixed x.
+			qsoText := canvas.NewText("", color.RGBA{180, 180, 195, 255})
+			qsoText.TextStyle = fyne.TextStyle{Bold: true, Monospace: true}
+			qsoText.TextSize = 10
+			qsoText.Alignment = fyne.TextAlignCenter
+			qsoSlot := container.New(&fixedWidthLayout{width: 18}, container.NewCenter(qsoText))
 			t := canvas.NewText("", color.RGBA{210, 215, 225, 255})
 			t.TextStyle = fyne.TextStyle{Monospace: true}
 			t.TextSize = 10
-			return newHoverRow(container.NewHBox(cqSlot, otaSlot, flagSlot, t))
+			return newHoverRow(container.NewHBox(cqSlot, otaSlot, qsoSlot, flagSlot, t))
 		},
 		func(id widget.ListItemID, obj fyne.CanvasObject) {
 			h := obj.(*hoverRow)
@@ -2809,11 +3215,13 @@ func (g *GUI) buildLayout() fyne.CanvasObject {
 			cqImg := cqSlot.Objects[0].(*canvas.Image)
 			otaSlot := row.Objects[1].(*fyne.Container)
 			otaImg := otaSlot.Objects[0].(*canvas.Image)
-			flagSlot := row.Objects[2].(*hoverRow)
+			qsoSlot := row.Objects[2].(*fyne.Container)
+			qsoText := qsoSlot.Objects[0].(*fyne.Container).Objects[0].(*canvas.Text)
+			flagSlot := row.Objects[3].(*hoverRow)
 			flagInner := flagSlot.inner.(*fyne.Container)
 			flagCenter := flagInner.Objects[0].(*fyne.Container)
 			flagText := flagCenter.Objects[0].(*canvas.Text)
-			t := row.Objects[3].(*canvas.Text)
+			t := row.Objects[4].(*canvas.Text)
 			snap := g.heardSnapshot()
 			if id >= len(snap) {
 				h.onHoverIn = nil
@@ -2863,6 +3271,22 @@ func (g *GUI) buildLayout() fyne.CanvasObject {
 			} else {
 				otaImg.Hide()
 			}
+			// Prior-contact badge: same letters as the chat row.
+			// "L" for an LoTW QSL on the active band, "O" for an
+			// ADIF-only QSO. Roster keeps the regular weight (no
+			// italics) — the IRC-style monospace nick list reads
+			// better when only the letter changes per row.
+			switch g.confirmStatusForCall(e.call) {
+			case 2:
+				qsoText.Text = "L"
+				qsoText.Color = color.RGBA{120, 200, 120, 255}
+			case 1:
+				qsoText.Text = "O"
+				qsoText.Color = color.RGBA{180, 180, 195, 255}
+			default:
+				qsoText.Text = ""
+			}
+			qsoText.Refresh()
 			t.Text = fmt.Sprintf("%-7s %+3.0f", e.call, e.snr)
 			if g.shouldBlinkCall(e.call) {
 				t.Color = color.RGBA{255, 240, 80, 255}
@@ -2981,11 +3405,22 @@ func (g *GUI) buildLayout() fyne.CanvasObject {
 		CertPassword:    prefs.String("tqsl_cert_password"),
 	}
 	g.tqslAutoUpload = prefs.BoolWithFallback("tqsl_auto_upload", false)
+	g.rosterStaleMinutes = prefs.IntWithFallback("roster_stale_minutes", 30)
 	if recs, err := adif.Read("nocordhf.adif"); err == nil && len(recs) > 0 {
 		g.adifLog = append(g.adifLog, recs...)
 	}
 	g.qso.SetOnLogged(func(rec adif.Record) {
 		// Persist + update in-memory log + refresh map overlay.
+		// Backfill TheirGrid from the spot DB if the QSO didn't carry
+		// one through the exchange — common when the contact opens on
+		// a sig report rather than a CQ-with-grid. Without this the
+		// map overlay can't tint the grid square blue because
+		// localWorkedGridsOnActiveBand keys off rec.TheirGrid.
+		if rec.TheirGrid == "" && g.scope != nil && g.scope.mapWidget != nil {
+			if grid := g.scope.mapWidget.GetSpotGrid(rec.TheirCall); grid != "" {
+				rec.TheirGrid = grid
+			}
+		}
 		if err := g.adifWriter.Append(rec); err == nil {
 			g.mu.Lock()
 			g.adifLog = append(g.adifLog, rec)

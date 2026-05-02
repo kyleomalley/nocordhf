@@ -3,6 +3,76 @@
 All notable changes to NocordHF are tracked in this file. Version
 numbers follow [Semantic Versioning](https://semver.org/).
 
+## [1.0.6] - 2026-05-01
+
+### Map
+
+- QSO propagation arc now drawn for the most recent inbound /
+  outbound directed call. Cyan upward-bowing curve with arrowhead
+  at the partner when we TX, amber downward-bowing curve with
+  arrowhead back at us when they call. Latest event wins.
+- "Roster stale (min)" pref in Settings → Profile (default 30,
+  0 disables) — purges HEARD entries and map spots that haven't
+  been refreshed in that window.
+- Frequency-axis caret aligned to the actual waterfall column
+  (was offset by ~64 px because the time-strip width wasn't
+  subtracted from the axis range).
+
+### Chat
+
+- Live TX progress: the TX row appears the moment audio starts
+  with the message split between green (already on-air) and grey
+  (still pending). Lets the operator see what's transmitting in
+  real time and stop early if needed.
+- Drag the TX cursor across the waterfall to retune live (in
+  addition to the existing double-click-to-snap).
+- Prior-contact marker on every chat row: ★ for an LoTW QSL on
+  the active band, ○ for an ADIF-only QSO. Skips when never
+  worked.
+- Topic bar shows current and previous slot decode counts
+  ("rx 5/12") in bold, proportional font.
+- Bright cyan for messages addressed to us; warm orange for rows
+  where one of our open-QSO targets is talking with someone else.
+
+### QSO automation
+
+- Auto-reply retries up to 4 times (30 s apart) when the remote
+  doesn't respond, then gives up. Skipped for terminal `73`
+  (they've already closed; resending serves no purpose).
+- Right-click Reply / profile-popup Reply use recent inbound
+  context to pick the right next-step trailer instead of always
+  re-sending the calling-with-grid form.
+- TX period lock: directed TXs defer one slot if the next
+  boundary would land in the target's TX period.
+
+### Release tooling
+
+- CI binary's `BuildID` now correctly reflects the release tag
+  (was showing `nongit-…` because `fyne package` silently rebuilt
+  the universal binary without our `-ldflags`). Stash the
+  universal binary, restore it into the .app after fyne runs;
+  also export `GOFLAGS` so any rebuild keeps the BuildID.
+- `notarize-wait.sh` `MAX_WAIT` 30 min → 1 hr (v1.0.3's DMG
+  finished at 28m20s — too tight).
+- New `make release-staple` target: resume after a notary timeout
+  by polling an existing submission ID instead of full rebuild.
+
+### Decoder
+
+- Diagnostic Info-level logs: `addr_us decode` whenever an
+  inbound message addresses us (with auto-reply gate state +
+  myCall), `qso-arc` on every map arc state change.
+
+### Fixes
+
+- Auto-reply previously never fired for any directed-at-us
+  message because `remoteCallFromMessage` returns the recipient
+  (us, for an addressed-at-us row) and the equality guard
+  immediately bailed. Now uses `senderFromMessage`.
+- Auto checkbox state survives restarts (was hydrated after the
+  checkbox UI was built, so the visual rendered off and was out
+  of sync with the gated state).
+
 ## [1.0.5] - 2026-05-01
 
 ### Fixes

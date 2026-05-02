@@ -336,17 +336,21 @@ func newScopePane(myGrid string) *scopePane {
 			cb(d.call, d.slotStart, d.freqHz, screenPos)
 		}
 	}
-	tappable.onDouble = func(local fyne.Position) {
+	// Shared "x → TX freq" handler used by both double-click (snap-
+	// once) and drag (continuous sweep). Centralised so the two
+	// gestures stay in lockstep on bounds + decode-box guard.
+	setTxFromX := func(local fyne.Position) {
 		size := tappable.Size()
 		if size.Width <= 0 {
 			return
 		}
-		// Don't retune TX frequency when the double-click landed on
-		// a decode box. Operators were accidentally moving their TX
+		// Don't retune TX frequency when the gesture landed on a
+		// decode box. Operators were accidentally moving their TX
 		// freq while trying to interact with a station they'd
 		// selected — a fast double-click on the box looks identical
 		// to "double-click empty water to retune" without this
-		// check.
+		// check, and the same applies to drag-starts that originate
+		// inside a box.
 		if _, ok := s.decodeAtPixel(local, size); ok {
 			return
 		}
@@ -359,6 +363,8 @@ func newScopePane(myGrid string) *scopePane {
 		}
 		s.SetTxFreq(xFrac * scopeFreqMaxHz)
 	}
+	tappable.onDouble = setTxFromX
+	tappable.onDrag = setTxFromX
 	tappable.onSecondary = func(local fyne.Position, abs fyne.Position) {
 		size := tappable.Size()
 		if d, ok := s.decodeAtPixel(local, size); ok {
@@ -1657,6 +1663,7 @@ type waterfallTap struct {
 	onSelect    func(localPos fyne.Position) // single-tap → select decode under cursor
 	onSecondary func(localPos fyne.Position, abs fyne.Position)
 	onDouble    func(localPos fyne.Position)
+	onDrag      func(localPos fyne.Position) // drag → live TX-frequency drag
 	onHover     func(localPos fyne.Position) // mouse-in or mouse-move
 	onHoverEnd  func()
 }
@@ -1664,6 +1671,7 @@ type waterfallTap struct {
 var _ fyne.Tappable = (*waterfallTap)(nil)
 var _ fyne.SecondaryTappable = (*waterfallTap)(nil)
 var _ fyne.DoubleTappable = (*waterfallTap)(nil)
+var _ fyne.Draggable = (*waterfallTap)(nil)
 var _ desktop.Hoverable = (*waterfallTap)(nil)
 
 func newWaterfallTap(inner fyne.CanvasObject, onTap func(xFrac float64)) *waterfallTap {
@@ -1721,6 +1729,23 @@ func (w *waterfallTap) MouseMoved(ev *desktop.MouseEvent) {
 		w.onHover(ev.Position)
 	}
 }
+
+// Dragged fires on every pointer-move while a button is held. We use it
+// for live TX-frequency tuning so the operator can sweep across the
+// waterfall and watch the caret follow the cursor without releasing
+// (the existing double-tap path is still there for "snap once").
+//
+// DragEvent.Position is in widget-local coordinates, same as Tapped /
+// DoubleTapped — onDrag re-uses the freq math from onDouble.
+func (w *waterfallTap) Dragged(ev *fyne.DragEvent) {
+	if w.onDrag != nil {
+		w.onDrag(ev.Position)
+	}
+}
+
+// DragEnd is required by fyne.Draggable but we have no per-gesture
+// state to release: each Dragged call already updated the live TX freq.
+func (w *waterfallTap) DragEnd() {}
 
 func (w *waterfallTap) MouseOut() {
 	if w.onHoverEnd != nil {

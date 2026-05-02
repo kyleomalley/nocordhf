@@ -77,6 +77,10 @@ type MapWidget struct {
 	qsoLat     float64
 	qsoLon     float64
 	qsoTxPhase bool
+	// lastLoggedQSOKey dedupes the diagnostic Info log inside draw()
+	// so we only emit a "qso-arc" line when the partner or phase
+	// actually changes — without it, every Refresh would spam.
+	lastLoggedQSOKey string
 
 	tiles              *tileCache
 	raster             *canvas.Raster
@@ -614,6 +618,27 @@ func (m *MapWidget) UpdateMyGrid(grid string) {
 	m.raster.Refresh()
 }
 
+// RemoveStaleSpots drops every spot whose `seen` timestamp is older than
+// maxAge. Returns the number of spots removed so the caller can decide
+// whether to trigger a redraw (and whether to log it). Caller should
+// invoke Refresh() if n > 0.
+//
+// Used by the GUI's roster-staleness sweep so the map doesn't keep
+// painting stations that haven't been heard for a long time.
+func (m *MapWidget) RemoveStaleSpots(maxAge time.Duration) int {
+	cutoff := time.Now().Add(-maxAge)
+	m.spotsMu.Lock()
+	defer m.spotsMu.Unlock()
+	n := 0
+	for k, s := range m.spots {
+		if !s.seen.After(cutoff) {
+			delete(m.spots, k)
+			n++
+		}
+	}
+	return n
+}
+
 // SetQSOPartner records the active QSO partner for the propagation arc.
 // lat/lon (0,0) means "look up from the spot database at draw time."
 // txPhase=true → arc bows upward (we TX); false → bows downward (we RX).
@@ -1028,9 +1053,32 @@ func (m *MapWidget) draw(w, h int) image.Image {
 				}
 			}
 		}
+		// Diagnostic: log only when the call/phase changes so we don't
+		// spam every redraw. Tells us whether SetQSOPartner is firing
+		// and whether the partner was findable in the spot DB.
+		key := qsoCall
+		if qsoTxPhase {
+			key += "|tx"
+		} else {
+			key += "|rx"
+		}
+		if key != m.lastLoggedQSOKey {
+			m.lastLoggedQSOKey = key
+			if logging.L != nil {
+				logging.L.Infow("qso-arc",
+					"call", qsoCall,
+					"tx_phase", qsoTxPhase,
+					"resolved", arcOK,
+					"spots", len(spots),
+					"my_grid_set", myGrid != "",
+				)
+			}
+		}
 		if arcOK {
 			mapDrawQSOArc(img, toXW(myLon), toY(myLat), arcX, arcY, qsoTxPhase)
 		}
+	} else if qsoCall == "" && m.lastLoggedQSOKey != "" {
+		m.lastLoggedQSOKey = ""
 	}
 
 	// Group spots that share the same on-screen pixel so they can be spread
@@ -1884,9 +1932,94 @@ func mapDrawQSOArc(img *image.RGBA, sx, sy, ex, ey int, txPhase bool) {
 		}
 	}
 
-	// Filled dot at the destination end to mark the target station.
-	mapDrawDot(img, ex, ey, 5, c)
-	mapDrawDot(img, ex, ey, 2, color.RGBA{255, 255, 255, 220})
+	// Arrowhead at the destination, oriented along the bezier tangent
+	// at t=1 — `2*(P2 - P1)` for a quadratic, so the unit vector is
+	// (ex,ey) − (cx,cy) normalised. txPhase=true (we TX) → arrow points
+	// at the partner; txPhase=false (we RX) → arrow points back at us.
+	tipX, tipY := float64(ex), float64(ey)
+	tanX, tanY := tipX-cx, tipY-cy
+	if !txPhase {
+		// RX: flip so the arrow points toward our station instead.
+		tanX, tanY = -tanX, -tanY
+		tipX, tipY = float64(sx), float64(sy)
+	}
+	tlen := math.Sqrt(tanX*tanX + tanY*tanY)
+	if tlen > 0 {
+		const arrowLen, arrowHalfW = 14.0, 7.0
+		ux, uy := tanX/tlen, tanY/tlen
+		bcx := tipX - arrowLen*ux
+		bcy := tipY - arrowLen*uy
+		// Perpendicular to the tangent.
+		px, py := -uy, ux
+		ax := int(tipX)
+		ay := int(tipY)
+		bx := int(bcx + arrowHalfW*px)
+		by := int(bcy + arrowHalfW*py)
+		cxi := int(bcx - arrowHalfW*px)
+		cyi := int(bcy - arrowHalfW*py)
+		mapFillTriangle(img, ax, ay, bx, by, cxi, cyi, c)
+	}
+}
+
+// mapFillTriangle scan-fills a small triangle using sign-of-edge tests
+// over the bounding box. Only used for QSO-arc arrowheads (≤16 px on
+// a side) so the O(area) cost is negligible.
+func mapFillTriangle(img *image.RGBA, ax, ay, bx, by, cx, cy int, col color.RGBA) {
+	w := img.Bounds().Dx()
+	h := img.Bounds().Dy()
+	minX, maxX := ax, ax
+	if bx < minX {
+		minX = bx
+	}
+	if cx < minX {
+		minX = cx
+	}
+	if bx > maxX {
+		maxX = bx
+	}
+	if cx > maxX {
+		maxX = cx
+	}
+	minY, maxY := ay, ay
+	if by < minY {
+		minY = by
+	}
+	if cy < minY {
+		minY = cy
+	}
+	if by > maxY {
+		maxY = by
+	}
+	if cy > maxY {
+		maxY = cy
+	}
+	if minX < 0 {
+		minX = 0
+	}
+	if minY < 0 {
+		minY = 0
+	}
+	if maxX >= w {
+		maxX = w - 1
+	}
+	if maxY >= h {
+		maxY = h - 1
+	}
+	edge := func(x1, y1, x2, y2, x3, y3 int) int {
+		return (x1-x3)*(y2-y3) - (x2-x3)*(y1-y3)
+	}
+	for y := minY; y <= maxY; y++ {
+		for x := minX; x <= maxX; x++ {
+			d1 := edge(x, y, ax, ay, bx, by)
+			d2 := edge(x, y, bx, by, cx, cy)
+			d3 := edge(x, y, cx, cy, ax, ay)
+			hasNeg := d1 < 0 || d2 < 0 || d3 < 0
+			hasPos := d1 > 0 || d2 > 0 || d3 > 0
+			if !(hasNeg && hasPos) {
+				img.SetRGBA(x, y, col)
+			}
+		}
+	}
 }
 
 // mapDrawLegend draws the OTA icon legend in the bottom-left corner.

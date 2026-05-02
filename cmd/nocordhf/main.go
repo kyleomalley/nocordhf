@@ -473,7 +473,12 @@ func runTX(
 		close(combinedStop)
 	}()
 
-	g.AppendSystem("● TX " + displayMsg)
+	// Add the TX row in-progress so the operator sees the message
+	// before audio starts and can watch it go green character-by-
+	// character as it plays. The 1-Hz status ticker (advanceTxRows)
+	// fills in the green portion based on time elapsed; once the
+	// audio finishes the row flips fully green.
+	g.AppendTxEcho(displayMsg)
 	log.Infow("TX start", "msg", displayMsg)
 	capturer.Mute()
 	defer capturer.Unmute()
@@ -516,7 +521,9 @@ func runTX(
 		peakNote = "⚠ " + peakNote + " — clipping likely"
 	}
 	log.Infow("TX done", "msg", displayMsg, "peak", peak, "peak_dbfs", peakDBFS)
-	g.AppendTxEcho(displayMsg)
+	// AppendTxEcho already fired pre-play (in-progress); advanceTxRows
+	// will mark it complete once it sees txStart + txAudioDuration
+	// elapsed, so we don't append a duplicate here.
 	g.AppendSystem("✓ TX done · " + peakNote)
 }
 
