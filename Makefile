@@ -69,8 +69,22 @@ release-mac:
 	lipo -create -output ./build/nocordhf ./build/nocordhf-amd64 ./build/nocordhf-arm64
 	rm ./build/nocordhf-amd64 ./build/nocordhf-arm64
 	@echo "==> packaging .app via fyne"
-	cd ./build && fyne package --target darwin --executable ./nocordhf --src ../cmd/nocordhf --icon $(CURDIR)/docs/icon.png --app-id com.nocordhf.app --name NocordHF --app-version $(NOCORDHF_VERSION) --release
-	rm ./build/nocordhf
+	# `fyne package` rebuilds the binary even when --executable points
+	# to one that already exists, silently overwriting our universal
+	# lipo'd build with an amd64-only one stripped of our -ldflags
+	# (no BuildID injection, runtime falls back to "nongit-..."). Two
+	# defenses, both required:
+	#   1. Stash the universal binary, then restore it into the .app
+	#      bundle after fyne is done — preserves arm64 + amd64 fat.
+	#   2. Export GOFLAGS so any rebuild fyne does carries the same
+	#      ldflag we used above (so even fyne's amd64 build has the
+	#      right BuildID, in case the cp fails for any reason).
+	cp ./build/nocordhf ./build/nocordhf.universal
+	cd ./build && \
+		GOFLAGS='-ldflags=-X=main.BuildID=v$(NOCORDHF_VERSION)' \
+		fyne package --target darwin --executable ./nocordhf --src ../cmd/nocordhf --icon $(CURDIR)/docs/icon.png --app-id com.nocordhf.app --name NocordHF --app-version $(NOCORDHF_VERSION) --release
+	cp ./build/nocordhf.universal ./build/NocordHF.app/Contents/MacOS/nocordhf
+	rm ./build/nocordhf ./build/nocordhf.universal
 	@echo "==> patching Info.plist (NSMicrophoneUsageDescription, LSMinimumSystemVersion)"
 	# fyne package silently drops the FyneApp.toml [macOS] section, so
 	# without these keys the app gets a silent CoreAudio denial under

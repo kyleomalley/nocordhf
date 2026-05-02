@@ -19,7 +19,28 @@ package nocord
 import (
 	"fmt"
 	"strings"
+	"time"
 )
+
+// Retry policy for auto-replies: how many times we'll re-send the same
+// trailer to a station that hasn't responded, and how long we wait
+// between attempts. ~30 s = one of their TX slots + one of ours, the
+// minimum window for them to have heard our last TX and replied.
+const (
+	retryMaxAttempts = 4
+	retryWait        = 30 * time.Second
+)
+
+// pendingRetry tracks one auto-reply in flight: the trailer we sent,
+// how many times we've TX'd it, and when we last did. Re-queued by the
+// 1 Hz status ticker until either we see a response from `remote` (the
+// entry is then cleared) or attempts hits retryMaxAttempts (dropped
+// with a log line so a missed weak signal is at least visible).
+type pendingRetry struct {
+	tail     string
+	attempts int
+	lastSent time.Time
+}
 
 // autoReplyTail returns the trailer to put after "<them> <us>" in the
 // auto-progress reply. ourSNRofThem is the SNR estimate from the
