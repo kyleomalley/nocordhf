@@ -36,10 +36,32 @@ const (
 // 1 Hz status ticker until either we see a response from `remote` (the
 // entry is then cleared) or attempts hits retryMaxAttempts (dropped
 // with a log line so a missed weak signal is at least visible).
+//
+// stopCh is the most recently queued TxRequest's stop channel. Closing
+// it cancels that TX (in the slot countdown or mid-playback) so a
+// retry already sitting in txCh can be aborted when the QSO has
+// already advanced past the step we're retrying.
 type pendingRetry struct {
 	tail     string
 	attempts int
 	lastSent time.Time
+	stopCh   chan struct{}
+}
+
+// closeStopCh closes ch if it isn't already closed. Safe to call from
+// multiple paths (sweepPendingRetries replacing a stale entry, and
+// clearPendingRetry firing on an inbound) without a sync.Once or
+// risking a double-close panic.
+func closeStopCh(ch chan struct{}) {
+	if ch == nil {
+		return
+	}
+	select {
+	case <-ch:
+		// already closed
+	default:
+		close(ch)
+	}
 }
 
 // autoReplyTail returns the trailer to put after "<them> <us>" in the
