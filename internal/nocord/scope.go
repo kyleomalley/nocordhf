@@ -363,6 +363,10 @@ func newScopePane(myGrid string) *scopePane {
 		}
 		s.SetTxFreq(xFrac * scopeFreqMaxHz)
 	}
+	// Double-tap and drag both retune the TX cursor without touching
+	// queued / in-flight TX state — moving around the waterfall is
+	// just frequency selection, not a takeover gesture. Esc is the
+	// only explicit cancel.
 	tappable.onDouble = setTxFromX
 	tappable.onDrag = setTxFromX
 	tappable.onSecondary = func(local fyne.Position, abs fyne.Position) {

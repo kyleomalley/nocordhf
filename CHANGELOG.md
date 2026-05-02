@@ -3,6 +3,45 @@
 All notable changes to NocordHF are tracked in this file. Version
 numbers follow [Semantic Versioning](https://semver.org/).
 
+## [1.0.7] - 2026-05-02
+
+### Manual takeover
+
+- **Esc** anywhere on the window cancels every TX in flight or
+  queued (active playback, anything sitting in `txCh`, all pending
+  auto-reply retries) and clears the retry map. Use it whenever the
+  auto-reply chain is going somewhere you don't want.
+
+### Map
+
+- HamDB auto-lookup on every decode upgrades coarse-prefix map
+  placement to the operator's actual home coordinates. First
+  decode of a callsign in a session fires a background lookup;
+  cached entries apply inline. Portable stations transmitting from
+  a grid different to their home QTH are NOT overwritten — the
+  message grid wins (`UpgradeSpotLocation` already had this
+  guard).
+
+### Chat
+
+- Tiny "?" badge next to the topic bar opens a reference dialog
+  covering colour conventions, L/O badges, keyboard / mouse
+  shortcuts, the Auto-progress chain, and chat-input shorthand.
+
+### Fixes
+
+- Stale auto-reply retries no longer fire after the QSO has moved
+  on. The retry sweep can re-queue a TX (e.g. another `R-NN`) into
+  `txCh` ~30 s after the original send; if the remote then sends us
+  the next-step token in that window, `clearPendingRetry` removed
+  the map entry but the queued TX kept playing — and the chat would
+  show the operator going backwards in the QSO sequence (sending
+  `R-4` after the QSO had already been logged from a `RR73`).
+  `pendingRetry` now stashes the most recently queued TxRequest's
+  `StopCh`; both `clearPendingRetry` and the next sweep close it
+  before swapping in a new one, so `runTX`'s slot countdown /
+  playback loop aborts the stale TX cleanly.
+
 ## [1.0.6] - 2026-05-01
 
 ### Map

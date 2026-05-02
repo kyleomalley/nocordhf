@@ -35,6 +35,7 @@ import (
 	"github.com/kyleomalley/nocordhf/lib/callsign"
 	"github.com/kyleomalley/nocordhf/lib/cat"
 	"github.com/kyleomalley/nocordhf/lib/ft8"
+	"github.com/kyleomalley/nocordhf/lib/hamdb"
 	"github.com/kyleomalley/nocordhf/lib/logging"
 	"github.com/kyleomalley/nocordhf/lib/lotw"
 	mapview "github.com/kyleomalley/nocordhf/lib/mapview"
@@ -239,7 +240,7 @@ type GUI struct {
 	usersList    *widget.List
 	bandList     *widget.List
 	statusText   *canvas.Text
-	input        *widget.Entry
+	input        *historyEntry
 	bandLabel    *canvas.Text
 	userCallText *canvas.Text // bottom-of-channel-column user bar -operator's callsign
 	userGridText *canvas.Text // bottom-of-channel-column user bar -operator's grid
@@ -347,6 +348,14 @@ type GUI struct {
 	// QSO close so partial logs go up promptly.
 	tqslCfg        *tqsl.Config
 	tqslAutoUpload bool
+	// hamdb client + per-session in-flight dedupe. The first time we
+	// hear a station's call we fire an async lookup; on success we
+	// upgrade their map pin from coarse-grid placement to HamDB's
+	// precise home coordinates (UpgradeSpotLocation handles the
+	// portable-vs-home logic so we don't overwrite a station that's
+	// transmitting from a grid different to their home QTH).
+	hamdb          *hamdb.Client
+	hamdbSubmitted map[string]struct{}
 
 	// radio is the live CAT handle owned by main.go. Held here so the
 	// Radio settings tab can hot-swap (Connect / Disconnect) the running
@@ -385,10 +394,29 @@ func NewGUI(a fyne.App, buildID string, txCh chan TxRequest, tuneCh chan uint64)
 		current:        DefaultBands[4], // 20m default
 		peerPeriods:    make(map[string]int),
 		pendingRetries: make(map[string]*pendingRetry),
+		hamdbSubmitted: make(map[string]struct{}),
+	}
+	// HamDB client (on-disk cache + in-flight dedupe baked in). Best-
+	// effort: if cache dir creation fails we degrade to coarse-prefix
+	// map placement — log it once so the operator knows.
+	if c, err := hamdb.New(); err == nil {
+		g.hamdb = c
+	} else if logging.L != nil {
+		logging.L.Warnw("hamdb init failed", "err", err)
 	}
 	g.window = a.NewWindow("NocordHF [build=" + buildID + "]")
 	g.window.Resize(fyne.NewSize(1100, 720))
 	g.window.SetContent(g.buildLayout())
+	// ESC anywhere on the window cancels every in-flight + queued TX
+	// and wipes pending auto-reply retries. Fyne dispatches TypedKey
+	// to the canvas only when no widget consumed the key first; the
+	// chat input doesn't claim ESC, so this fires regardless of which
+	// pane has focus.
+	g.window.Canvas().SetOnTypedKey(func(ev *fyne.KeyEvent) {
+		if ev.Name == fyne.KeyEscape {
+			g.cancelAllSends("Esc", true)
+		}
+	})
 	return g
 }
 
@@ -1073,6 +1101,9 @@ func (g *GUI) AppendDecode(d ft8.Decoded) {
 	// glance without scrolling through ADIF or the map.
 	if sender := senderFromMessage(d.Message.Text); sender != "" {
 		row.confirmStatus = g.confirmStatusForCall(sender)
+		// Async HamDB lookup for accurate map placement. Idempotent
+		// per session; cache hits apply inline.
+		g.lookupHamdbAsync(sender)
 	}
 	// Mark messages addressed to us (first token == myCall) for highlighting.
 	g.mu.Lock()
@@ -1247,11 +1278,20 @@ func (g *GUI) maybeAutoReply(d ft8.Decoded, myCall string, slotSec int64) {
 			if ok && prev.tail == tail {
 				prev.attempts++
 				prev.lastSent = time.Now()
+				prev.stopCh = req.StopCh
 			} else {
+				// Different tail (or first time): close the previous
+				// in-flight TX (if any) so a stale retry sitting in
+				// txCh from the prior QSO step doesn't fire after
+				// the QSO has moved on.
+				if ok {
+					closeStopCh(prev.stopCh)
+				}
 				g.pendingRetries[ru] = &pendingRetry{
 					tail:     tail,
 					attempts: 1,
 					lastSent: time.Now(),
+					stopCh:   req.StopCh,
 				}
 			}
 			g.mu.Unlock()
@@ -1320,6 +1360,16 @@ func (g *GUI) sweepPendingRetries() {
 		select {
 		case g.txCh <- req:
 			g.AppendSystem(fmt.Sprintf("retry: %s %s %s", t.remote, myCall, t.tail))
+			// Stash the new TX's stop channel so clearPendingRetry
+			// can cancel this in-flight retry the moment the remote
+			// responds — otherwise a stale retry already sitting in
+			// txCh will fire after the QSO has moved on.
+			g.mu.Lock()
+			if p := g.pendingRetries[t.remote]; p != nil {
+				closeStopCh(p.stopCh) // belt + braces against any prior in-flight
+				p.stopCh = req.StopCh
+			}
+			g.mu.Unlock()
 		default:
 			// Queue full — leave the entry in pendingRetries for next sweep.
 		}
@@ -1421,12 +1471,64 @@ func (g *GUI) sweepStaleRoster() {
 // AppendDecode when an inbound from `call` addressed at us arrives:
 // they responded, so the previous TX leg succeeded and the next leg
 // (if any) will register a fresh entry via maybeAutoReply.
+// cancelAllSends aborts every TX in flight or queued: the actively-
+// playing TX (closes its stop channel), every TxRequest still sitting
+// in g.txCh (drained, each with its StopCh closed), and every
+// pendingRetry entry (StopCh closed + map cleared).
+//
+// Called from the ESC key shortcut (verbose=true) and from the
+// waterfall double-tap path (verbose=false). The double-tap is an
+// implicit takeover — the operator clearly meant to retune — so a
+// chat banner about it would just be noise.
+func (g *GUI) cancelAllSends(reason string, verbose bool) {
+	g.mu.Lock()
+	active := g.activeStopCh
+	pending := g.pendingRetries
+	g.pendingRetries = make(map[string]*pendingRetry)
+	g.mu.Unlock()
+
+	closeStopCh(active)
+	for _, p := range pending {
+		closeStopCh(p.stopCh)
+	}
+	// Drain queued TxRequests. Non-blocking — stop as soon as the
+	// channel is empty. Each drained request gets its StopCh closed
+	// in case runTX picked it up between the drain and the close
+	// (slot countdown will then exit before keying).
+	drained := 0
+	for {
+		select {
+		case req, ok := <-g.txCh:
+			if !ok {
+				goto done
+			}
+			closeStopCh(req.StopCh)
+			drained++
+		default:
+			goto done
+		}
+	}
+done:
+	if verbose && (drained > 0 || len(pending) > 0 || active != nil) {
+		g.AppendSystem(fmt.Sprintf("✕ all sends cancelled (%s)", reason))
+	}
+}
+
 func (g *GUI) clearPendingRetry(call string) {
 	if call == "" {
 		return
 	}
+	key := strings.ToUpper(call)
 	g.mu.Lock()
-	delete(g.pendingRetries, strings.ToUpper(call))
+	if p, ok := g.pendingRetries[key]; ok {
+		// Cancel the in-flight TX (if any) so a stale retry queued
+		// before this response — sitting in txCh waiting its slot —
+		// doesn't fire. runTX honours StopCh in both the slot
+		// countdown and during playback, so this aborts cleanly
+		// regardless of where the TX is in its lifecycle.
+		closeStopCh(p.stopCh)
+		delete(g.pendingRetries, key)
+	}
 	g.mu.Unlock()
 }
 
@@ -1536,6 +1638,36 @@ func (g *GUI) AppendTxEcho(msg string) {
 		if len(fields) >= 2 && fields[0] != "CQ" && !strings.EqualFold(fields[0], myCall) {
 			scope.mapWidget.SetQSOPartner(fields[0], 0, 0, true)
 		}
+	}
+	// Push the input-shorthand for this TX onto the chat-input
+	// history so the operator can Up-arrow to recall it. Convert the
+	// full TX message back to the shorthand handleSubmit accepts:
+	//   "CQ X Y"               → "CQ"
+	//   "CALL US grid"         → "CALL"        (initial directed call, our own grid)
+	//   "CALL US TAIL"         → "CALL TAIL"   (sig report / R / RR73 / 73 / their grid)
+	// Auto-replies and retries push the same way, so e.g. retrying a
+	// directed call by arrow-Up + Enter Just Works.
+	g.mu.Lock()
+	myGrid := g.myGrid
+	input := g.input
+	g.mu.Unlock()
+	if input != nil {
+		fields := strings.Fields(strings.ToUpper(strings.TrimSpace(msg)))
+		var shorthand string
+		switch {
+		case len(fields) == 0:
+			// nothing to push
+		case fields[0] == "CQ":
+			shorthand = "CQ"
+		case len(fields) >= 3:
+			shorthand = fields[0]
+			if !strings.EqualFold(fields[2], myGrid) {
+				shorthand += " " + fields[2]
+			}
+		default:
+			shorthand = fields[0]
+		}
+		input.push(shorthand)
 	}
 }
 
@@ -1706,19 +1838,16 @@ func (g *GUI) refreshStatus() {
 		fmt.Sprintf("UTC %s", now.Format("15:04:05")),
 		fmt.Sprintf("slot +%ds", slotPhase),
 	}
-	// "decodes" cell: live count for the current slot, plus the
-	// previous slot's final count so both are visible at a glance.
-	// During the silent gap before the first decode of a new slot,
-	// curCount is 0 — show "rx 0/N" rather than dropping the cell so
-	// the header doesn't shrink and reflow other parts.
-	nowSlot := now.Unix() - now.Unix()%15
-	cur := curCount
-	if curSlot != nowSlot {
-		cur = 0 // we've rolled into a new slot; current is fresh
-	}
-	if cur > 0 || prevCount > 0 {
-		parts = append(parts, fmt.Sprintf("rx %d/%d", cur, prevCount))
-	}
+	// "decodes" cell. curCount is the live count for the slot the
+	// decoder is currently producing results for (increments as each
+	// new decode lands), and prevCount is the previous slot's final
+	// count. Auto-rolls in AppendDecode when the first decode of a
+	// new slot arrives. We display straight from those — don't gate
+	// on wall-clock slot equality, because the decoder finishes
+	// ~2 s after a slot ends so the "current decoding slot" is
+	// always 1 slot behind wall clock and was always reading 0.
+	_ = curSlot
+	parts = append(parts, fmt.Sprintf("rx: %d (last: %d)", curCount, prevCount))
 
 	statusColor := color.RGBA{170, 175, 185, 255}
 	if checker != nil {
@@ -1754,6 +1883,80 @@ func absDur(d time.Duration) time.Duration {
 		return -d
 	}
 	return d
+}
+
+// showChatHelp opens a reference dialog covering chat colour
+// conventions, the L/O badges, keyboard / mouse shortcuts, and the
+// auto-progress chain. Triggered by the help icon next to the
+// topic-bar status line. Uses widget.RichText markdown rather than
+// dialog.ShowInformation so headings render bold + left-aligned
+// instead of centring as a wall of plain text.
+func (g *GUI) showChatHelp() {
+	if g.window == nil {
+		return
+	}
+	const md = `
+## Topic bar
+
+**rx N/M** — decodes in the current slot / previous slot.
+
+
+## Chat colours
+
+- **cyan** — message addressed to your call
+- **orange** — one of your open QSO targets is busy with someone else
+- **amber** — CQ from a heard station
+- **green** — your transmission (splits green / grey while audio plays)
+
+
+## Prior-contact badges
+
+Right side of each chat row, and on the HEARD list.
+
+- **L** (italic message) — LoTW-confirmed QSL on this band
+- **O** — ADIF-logged QSO on this band, no LoTW yet
+
+
+## Auto checkbox
+
+Next to the chat input. When checked, an inbound directed at you
+triggers the right next-step reply automatically:
+
+grid → sig report → R+report → RR73 → 73
+
+Retries up to 4 times, 30 seconds apart, if they don't respond.
+**Esc** cancels everything in flight.
+
+
+## Keyboard
+
+- **Esc** — cancel ALL queued + in-flight TX
+- **Enter** (in chat input) — queue what you typed
+- **↑ / ↓** (in chat input) — recall previous TX from history
+
+
+## Mouse
+
+- click a decode box — select the call, scroll chat to it
+- double-click waterfall — snap TX freq here AND cancel queued TX
+- drag waterfall — live retune TX freq
+- right-click any callsign — Profile / Reply / Copy / Open QRZ
+
+
+## Chat input shorthand
+
+- **CQ** — send a CQ
+- **CALL** — first directed call to CALL (sends your grid)
+- **CALL TAIL** — send to CALL with TAIL appended, where TAIL is a
+  signal report (–10, +03), an R-report (R-10), RR73, 73, or a
+  Maidenhead grid (DM13)
+- **/tune** — pure-carrier tune (no FT8 modulation)
+`
+	rt := widget.NewRichTextFromMarkdown(md)
+	rt.Wrapping = fyne.TextWrapWord
+	scroll := container.NewScroll(rt)
+	scroll.SetMinSize(fyne.NewSize(600, 620))
+	dialog.ShowCustom("NocordHF — chat reference", "Close", scroll, g.window)
 }
 
 // showCallContextMenu opens a small popup menu at the given canvas
@@ -2439,6 +2642,69 @@ func (g *GUI) localWorkedGridsOnActiveBand() map[string]bool {
 	return out
 }
 
+// lookupHamdbAsync kicks off a HamDB lookup for `call` so the map's
+// pin can be upgraded from coarse-prefix placement to the operator's
+// real home coordinates. Idempotent per session — repeated decodes
+// from the same call don't re-fire the lookup.
+//
+// Fast-path: if the on-disk cache already has the record, we apply
+// it inline (no network, no goroutine). Otherwise we spawn a goroutine
+// that does the network call with a short context, then dispatches
+// the upgrade on success.
+//
+// Skips hashed senders, our own call, anything shorter than 3 chars,
+// and silently no-ops when the hamdb client failed to initialise.
+func (g *GUI) lookupHamdbAsync(call string) {
+	if g.hamdb == nil {
+		return
+	}
+	call = strings.ToUpper(strings.TrimSpace(call))
+	if len(call) < 3 || strings.HasPrefix(call, "<") {
+		return
+	}
+	g.mu.Lock()
+	if strings.EqualFold(call, g.myCall) {
+		g.mu.Unlock()
+		return
+	}
+	if _, seen := g.hamdbSubmitted[call]; seen {
+		g.mu.Unlock()
+		return
+	}
+	g.hamdbSubmitted[call] = struct{}{}
+	scope := g.scope
+	g.mu.Unlock()
+	if scope == nil || scope.mapWidget == nil {
+		return
+	}
+	apply := func(rec *hamdb.Record) {
+		if rec == nil {
+			return
+		}
+		lat, _ := strconv.ParseFloat(strings.TrimSpace(rec.Lat), 64)
+		lon, _ := strconv.ParseFloat(strings.TrimSpace(rec.Lon), 64)
+		if lat == 0 && lon == 0 {
+			return
+		}
+		scope.mapWidget.UpgradeSpotLocation(call, strings.ToUpper(rec.Grid), lat, lon)
+	}
+	if rec, found, hasEntry := g.hamdb.LookupCached(call); hasEntry {
+		if found {
+			apply(rec)
+		}
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		rec, err := g.hamdb.Lookup(ctx, call)
+		if err != nil {
+			return // ErrNotFound + network errors are both normal; cache absorbs both
+		}
+		apply(rec)
+	}()
+}
+
 // confirmStatusForCall returns the strongest prior-contact level we
 // have with `call` on the current band:
 //
@@ -2823,7 +3089,16 @@ func (g *GUI) buildLayout() fyne.CanvasObject {
 	// face is fine here.
 	g.statusText.TextStyle = fyne.TextStyle{Bold: true}
 	g.statusText.TextSize = 11
-	header := container.NewPadded(g.statusText)
+	// Tiny help icon next to the topic line — opens an info dialog
+	// covering chat colour conventions, badges, keyboard shortcuts,
+	// and the auto-progress chain. Use canvas.Image (not a Button)
+	// because Button's built-in padding makes the topic bar twice as
+	// tall; the raw icon at the topic font size keeps the bar tight.
+	helpImg := canvas.NewImageFromResource(theme.HelpIcon())
+	helpImg.FillMode = canvas.ImageFillContain
+	helpImg.SetMinSize(fyne.NewSize(13, 13))
+	helpTap := newTappableContainer(helpImg, func() { g.showChatHelp() })
+	header := container.NewPadded(container.NewHBox(g.statusText, helpTap))
 	// Spin up the NTP checker + 1 Hz status ticker. The checker runs its
 	// own goroutine internally; startStatusTicker drives refreshStatus so
 	// the clock + slot phase tick in real time.
@@ -3065,7 +3340,7 @@ func (g *GUI) buildLayout() fyne.CanvasObject {
 		g.window.Canvas().Focus(g.input)
 	}
 
-	g.input = widget.NewEntry()
+	g.input = newHistoryEntry()
 	g.input.OnSubmitted = func(s string) {
 		g.handleSubmit(s)
 		g.input.SetText("")
@@ -3785,6 +4060,95 @@ func formatRowSegments(r chatRow) (ts, meta, msg string) {
 // Used for chip / icon visuals that aren't natively interactive.
 // Implements fyne.Tappable on a BaseWidget so Fyne's pointer-event
 // dispatch finds it and routes single-clicks here.
+// historyEntry is the chat input box with shell-style Up/Down history
+// recall. Every TX (manual or auto) gets pushed via push() — pressing
+// Up walks backwards through that buffer and Down forward, with the
+// in-progress draft preserved on first Up so Down at the bottom
+// restores it. Dedupes consecutive identical pushes so a 4-attempt
+// retry doesn't bloat the history with the same string.
+type historyEntry struct {
+	widget.Entry
+	mu      sync.Mutex
+	history []string
+	cursor  int    // -1 = current draft, 0..len-1 = position in history
+	saved   string // snapshot of the in-progress draft when navigation starts
+}
+
+const historyMaxLen = 100
+
+func newHistoryEntry() *historyEntry {
+	e := &historyEntry{cursor: -1}
+	e.ExtendBaseWidget(e)
+	return e
+}
+
+func (e *historyEntry) push(s string) {
+	if s == "" {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if n := len(e.history); n > 0 && e.history[n-1] == s {
+		return // skip consecutive duplicates (typical of retry sweeps)
+	}
+	e.history = append(e.history, s)
+	if len(e.history) > historyMaxLen {
+		e.history = e.history[len(e.history)-historyMaxLen:]
+	}
+	e.cursor = -1
+}
+
+func (e *historyEntry) TypedKey(ev *fyne.KeyEvent) {
+	switch ev.Name {
+	case fyne.KeyUp:
+		e.recall(-1)
+	case fyne.KeyDown:
+		e.recall(+1)
+	default:
+		e.Entry.TypedKey(ev)
+	}
+}
+
+// recall walks the history. dir=-1 = older (Up), dir=+1 = newer (Down).
+// Past the newest entry restores the draft we snapshotted on first Up.
+func (e *historyEntry) recall(dir int) {
+	e.mu.Lock()
+	if len(e.history) == 0 {
+		e.mu.Unlock()
+		return
+	}
+	if e.cursor < 0 {
+		// First nav: snapshot whatever the operator was typing so
+		// Down past the newest entry can restore it.
+		e.saved = e.Text
+		if dir < 0 {
+			e.cursor = len(e.history) - 1
+		} else {
+			// Down with no nav in progress = no-op (nothing newer
+			// than the draft).
+			e.mu.Unlock()
+			return
+		}
+	} else {
+		e.cursor += dir
+		if e.cursor < 0 {
+			e.cursor = 0
+		} else if e.cursor >= len(e.history) {
+			e.cursor = -1
+		}
+	}
+	var text string
+	if e.cursor < 0 {
+		text = e.saved
+	} else {
+		text = e.history[e.cursor]
+	}
+	e.mu.Unlock()
+	e.SetText(text)
+	e.CursorColumn = len(text)
+	e.Refresh()
+}
+
 type tappableContainer struct {
 	widget.BaseWidget
 	content fyne.CanvasObject
