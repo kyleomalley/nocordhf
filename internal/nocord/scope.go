@@ -218,9 +218,8 @@ type scopePane struct {
 	txFreqHz       float64
 	txBox          *canvas.Rectangle
 	txOverlay      *fyne.Container
-	wfWithOverlay  fyne.CanvasObject   // the tappable+overlay stack added to VSplit
-	onTxFreqChange func(hz float64)    // callback for main.go to read latest TX freq
-	onCancelSends  func(reason string) // GUI hook fired by manual-takeover gestures (waterfall double-tap)
+	wfWithOverlay  fyne.CanvasObject // the tappable+overlay stack added to VSplit
+	onTxFreqChange func(hz float64)  // callback for main.go to read latest TX freq
 
 	// Frequency-axis strip docked under the waterfall. Replaces the
 	// old "SCOPE | TX 1234 Hz" header. Shows tick labels at 500-Hz
@@ -364,20 +363,11 @@ func newScopePane(myGrid string) *scopePane {
 		}
 		s.SetTxFreq(xFrac * scopeFreqMaxHz)
 	}
-	// Double-tap is the operator's "I'm taking over" gesture: cancel
-	// any in-flight or queued auto-reply TX before retuning so the
-	// snap-once doesn't get clobbered by a stale retry firing right
-	// after. Drag stays gesture-only (no cancel) so the operator can
-	// sweep frequencies without nuking active QSO state.
-	tappable.onDouble = func(local fyne.Position) {
-		s.mu.Lock()
-		cancel := s.onCancelSends
-		s.mu.Unlock()
-		if cancel != nil {
-			cancel("waterfall double-tap")
-		}
-		setTxFromX(local)
-	}
+	// Double-tap and drag both retune the TX cursor without touching
+	// queued / in-flight TX state — moving around the waterfall is
+	// just frequency selection, not a takeover gesture. Esc is the
+	// only explicit cancel.
+	tappable.onDouble = setTxFromX
 	tappable.onDrag = setTxFromX
 	tappable.onSecondary = func(local fyne.Position, abs fyne.Position) {
 		size := tappable.Size()
@@ -563,17 +553,6 @@ func (s *scopePane) TxFreq() float64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.txFreqHz
-}
-
-// SetOnCancelSends registers a callback that the scope fires from
-// gestures the operator uses to take manual control — currently only
-// double-tap on the waterfall, which is also the "snap-once" TX-tune
-// gesture. The GUI wires this to cancelAllSends so a deliberate
-// retune wipes any in-flight or queued auto-reply TXs.
-func (s *scopePane) SetOnCancelSends(fn func(reason string)) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.onCancelSends = fn
 }
 
 // SetOnTxFreqChange registers a callback fired whenever the operator clicks

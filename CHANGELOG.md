@@ -3,6 +3,26 @@
 All notable changes to NocordHF are tracked in this file. Version
 numbers follow [Semantic Versioning](https://semver.org/).
 
+## [1.0.8] - 2026-05-03
+
+### Map
+
+- HamDB auto-lookup on every decode upgrades coarse-prefix map
+  placement to the operator's actual home coordinates. First
+  decode of a callsign in a session fires a background lookup
+  (8 s timeout, on-disk cache + per-call in-flight dedupe baked
+  into the client); cached entries apply inline. Portable stations
+  transmitting from a grid different to their home QTH are NOT
+  overwritten — the message grid wins (`UpgradeSpotLocation`
+  already had this guard).
+
+### Cleanup
+
+- Reverted v1.0.7's "double-tap on waterfall cancels queued
+  retries" behaviour. Moving around the waterfall is just
+  frequency selection, not a takeover gesture; **Esc** remains
+  the only explicit cancel.
+
 ## [1.0.7] - 2026-05-02
 
 ### Manual takeover

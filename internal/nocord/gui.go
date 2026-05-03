@@ -35,6 +35,7 @@ import (
 	"github.com/kyleomalley/nocordhf/lib/callsign"
 	"github.com/kyleomalley/nocordhf/lib/cat"
 	"github.com/kyleomalley/nocordhf/lib/ft8"
+	"github.com/kyleomalley/nocordhf/lib/hamdb"
 	"github.com/kyleomalley/nocordhf/lib/logging"
 	"github.com/kyleomalley/nocordhf/lib/lotw"
 	mapview "github.com/kyleomalley/nocordhf/lib/mapview"
@@ -347,6 +348,14 @@ type GUI struct {
 	// QSO close so partial logs go up promptly.
 	tqslCfg        *tqsl.Config
 	tqslAutoUpload bool
+	// hamdb client + per-session in-flight dedupe. The first time we
+	// hear a station's call we fire an async lookup; on success we
+	// upgrade their map pin from coarse-grid placement to HamDB's
+	// precise home coordinates (UpgradeSpotLocation handles the
+	// portable-vs-home logic so we don't overwrite a station that's
+	// transmitting from a grid different to their home QTH).
+	hamdb          *hamdb.Client
+	hamdbSubmitted map[string]struct{}
 
 	// radio is the live CAT handle owned by main.go. Held here so the
 	// Radio settings tab can hot-swap (Connect / Disconnect) the running
@@ -385,6 +394,15 @@ func NewGUI(a fyne.App, buildID string, txCh chan TxRequest, tuneCh chan uint64)
 		current:        DefaultBands[4], // 20m default
 		peerPeriods:    make(map[string]int),
 		pendingRetries: make(map[string]*pendingRetry),
+		hamdbSubmitted: make(map[string]struct{}),
+	}
+	// HamDB client (on-disk cache + in-flight dedupe baked in). Best-
+	// effort: if cache dir creation fails we degrade to coarse-prefix
+	// map placement — log it once so the operator knows.
+	if c, err := hamdb.New(); err == nil {
+		g.hamdb = c
+	} else if logging.L != nil {
+		logging.L.Warnw("hamdb init failed", "err", err)
 	}
 	g.window = a.NewWindow("NocordHF [build=" + buildID + "]")
 	g.window.Resize(fyne.NewSize(1100, 720))
@@ -1083,6 +1101,9 @@ func (g *GUI) AppendDecode(d ft8.Decoded) {
 	// glance without scrolling through ADIF or the map.
 	if sender := senderFromMessage(d.Message.Text); sender != "" {
 		row.confirmStatus = g.confirmStatusForCall(sender)
+		// Async HamDB lookup for accurate map placement. Idempotent
+		// per session; cache hits apply inline.
+		g.lookupHamdbAsync(sender)
 	}
 	// Mark messages addressed to us (first token == myCall) for highlighting.
 	g.mu.Lock()
@@ -2621,6 +2642,69 @@ func (g *GUI) localWorkedGridsOnActiveBand() map[string]bool {
 	return out
 }
 
+// lookupHamdbAsync kicks off a HamDB lookup for `call` so the map's
+// pin can be upgraded from coarse-prefix placement to the operator's
+// real home coordinates. Idempotent per session — repeated decodes
+// from the same call don't re-fire the lookup.
+//
+// Fast-path: if the on-disk cache already has the record, we apply
+// it inline (no network, no goroutine). Otherwise we spawn a goroutine
+// that does the network call with a short context, then dispatches
+// the upgrade on success.
+//
+// Skips hashed senders, our own call, anything shorter than 3 chars,
+// and silently no-ops when the hamdb client failed to initialise.
+func (g *GUI) lookupHamdbAsync(call string) {
+	if g.hamdb == nil {
+		return
+	}
+	call = strings.ToUpper(strings.TrimSpace(call))
+	if len(call) < 3 || strings.HasPrefix(call, "<") {
+		return
+	}
+	g.mu.Lock()
+	if strings.EqualFold(call, g.myCall) {
+		g.mu.Unlock()
+		return
+	}
+	if _, seen := g.hamdbSubmitted[call]; seen {
+		g.mu.Unlock()
+		return
+	}
+	g.hamdbSubmitted[call] = struct{}{}
+	scope := g.scope
+	g.mu.Unlock()
+	if scope == nil || scope.mapWidget == nil {
+		return
+	}
+	apply := func(rec *hamdb.Record) {
+		if rec == nil {
+			return
+		}
+		lat, _ := strconv.ParseFloat(strings.TrimSpace(rec.Lat), 64)
+		lon, _ := strconv.ParseFloat(strings.TrimSpace(rec.Lon), 64)
+		if lat == 0 && lon == 0 {
+			return
+		}
+		scope.mapWidget.UpgradeSpotLocation(call, strings.ToUpper(rec.Grid), lat, lon)
+	}
+	if rec, found, hasEntry := g.hamdb.LookupCached(call); hasEntry {
+		if found {
+			apply(rec)
+		}
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		rec, err := g.hamdb.Lookup(ctx, call)
+		if err != nil {
+			return // ErrNotFound + network errors are both normal; cache absorbs both
+		}
+		apply(rec)
+	}()
+}
+
 // confirmStatusForCall returns the strongest prior-contact level we
 // have with `call` on the current band:
 //
@@ -3578,11 +3662,6 @@ func (g *GUI) buildLayout() fyne.CanvasObject {
 	myGrid := g.myGrid
 	g.mu.Unlock()
 	g.scope = newScopePane(myGrid)
-	// Double-tap on the waterfall (the snap-once retune gesture)
-	// also wipes pending auto-reply TXs, so the operator's manual
-	// retune isn't immediately overwritten by a stale retry that's
-	// still in the queue.
-	g.scope.SetOnCancelSends(func(reason string) { g.cancelAllSends(reason, false) })
 
 	// QSO logger: ADIF writer + in-memory log + state tracker. Reads
 	// any pre-existing nocordhf.adif at startup so the worked-grid
