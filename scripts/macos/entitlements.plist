@@ -9,10 +9,19 @@
     silent denial from CoreAudio and decode nothing — Info.plist's
     NSMicrophoneUsageDescription on its own only governs the user
     consent prompt, not the underlying capability.
+
+  com.apple.security.device.bluetooth
+    Required so the MeshCore BLE transport can scan for and connect
+    to companion-firmware LoRa radios. Same pattern as audio-input:
+    Info.plist's NSBluetoothAlwaysUsageDescription handles the user
+    prompt; this entitlement opens the underlying CoreBluetooth API
+    under the hardened runtime.
 -->
 <plist version="1.0">
 <dict>
     <key>com.apple.security.device.audio-input</key>
+    <true/>
+    <key>com.apple.security.device.bluetooth</key>
     <true/>
 </dict>
 </plist>

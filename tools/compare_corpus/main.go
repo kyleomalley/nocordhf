@@ -99,7 +99,7 @@ func main() {
 	extraAll := make(map[string]int)  // cand-only message → count of slots
 
 	if len(refOnlySlots) > 0 || len(candOnlySlots) > 0 {
-		fmt.Fprintf(out, "> ⚠️ Partial coverage: %d slot(s) only in ref, %d slot(s) only in cand. Aggregate metrics use the %d shared slot(s).\n\n",
+		fmt.Fprintf(out, "> Note: partial coverage — %d slot(s) only in ref, %d slot(s) only in cand. Aggregate metrics use the %d shared slot(s).\n\n",
 			len(refOnlySlots), len(candOnlySlots), len(common))
 	}
 

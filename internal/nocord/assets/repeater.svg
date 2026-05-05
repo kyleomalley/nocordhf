@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+  <!-- Antenna mast: tapered triangle from base to tip -->
+  <path d="M12 3 L8 21 L16 21 Z"/>
+  <!-- Cross-bracing: two zigzag struts -->
+  <path d="M9.5 9 L14.5 13"/>
+  <path d="M14.5 9 L9.5 13"/>
+  <path d="M9 15 L15 17.5"/>
+  <path d="M15 15 L9 17.5"/>
+  <!-- Signal arc: outward-bowing waves at the top -->
+  <path d="M5 5 Q12 1 19 5"/>
+  <path d="M7 7.5 Q12 4.5 17 7.5"/>
+</svg>

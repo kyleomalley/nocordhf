@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+  <!-- Gauge dial: half-circle arc -->
+  <path d="M4 17 A 8 8 0 0 1 20 17"/>
+  <!-- Tick marks at 0, 90, 180 -->
+  <path d="M4 17 L5.5 17"/>
+  <path d="M12 9 L12 10.5"/>
+  <path d="M20 17 L18.5 17"/>
+  <!-- Needle pointing up-right -->
+  <path d="M12 17 L16 11"/>
+  <!-- Needle pivot -->
+  <circle cx="12" cy="17" r="1.2" fill="currentColor"/>
+</svg>
