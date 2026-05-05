@@ -61,12 +61,22 @@ type MapWidget struct {
 	zoom      float64
 
 	// Spots (guarded by spotsMu).
-	spotsMu   sync.RWMutex
-	spots     map[string]spotEntry
-	myGrid    string
-	myLat     float64
-	myLon     float64
-	hoverCall string // callsign to highlight; empty = none
+	spotsMu sync.RWMutex
+	spots   map[string]spotEntry
+	myGrid  string
+	myLat   float64
+	myLon   float64
+	// myOverrideValid pins the operator's diamond to an exact
+	// lat/lon supplied via SetSelfPosition, overriding the
+	// myGrid centroid. MeshCore mode reads SelfInfo.AdvLat/Lon
+	// from the device (GPS-derived on T1000-E and similar
+	// boards) and pushes it here so the diamond shows actual
+	// position rather than the FT8 6-char-grid centroid (which
+	// can be tens of miles off).
+	myOverrideValid bool
+	myOverrideLat   float64
+	myOverrideLon   float64
+	hoverCall       string // callsign to highlight; empty = none
 
 	// QSO propagation arc (guarded by spotsMu).
 	// qsoCall is the active QSO partner's callsign; empty = no arc.
@@ -86,6 +96,16 @@ type MapWidget struct {
 	raster             *canvas.Raster
 	onSpotTap          func(call string)                       // called when the user taps a station dot
 	onSpotSecondaryTap func(call string, absPos fyne.Position) // called when the user right-clicks a station dot
+	// onMeshNodeSecondaryTap fires for right-clicks on a MeshCore
+	// node dot. The pubkey identifies the contact (caller looks it
+	// up in its roster) and absPos lets the GUI place a popup menu.
+	onMeshNodeSecondaryTap func(pub [32]byte, absPos fyne.Position)
+	// onMapTap fires for any left-tap that doesn't land on a known
+	// station dot or mesh node — gives the caller the unprojected
+	// geographic point. Used by the Profile-settings location
+	// picker to let the operator click anywhere on the map to set
+	// their advert lat/lon.
+	onMapTap func(lat, lon float64)
 
 	// recentCQFn returns true when the GUI has heard the call transmit
 	// a CQ recently. Used to render a green "CQ" badge next to the
@@ -115,7 +135,82 @@ type MapWidget struct {
 
 	// showWorkedOverlay toggles the red tint over worked 4-char grid squares.
 	showWorkedOverlay bool
+	// hideLegend suppresses the bottom-left OTA / status legend
+	// overlay. Defaults to false so existing FT8 callers see it
+	// unchanged; the MeshCore mode flips this to true since the FT8
+	// OTA glyphs (POTA / SOTA / WWFF / …) don't apply to mesh
+	// traffic and a mesh-specific legend will replace them later.
+	hideLegend bool
+	// hideGrids suppresses both Maidenhead grid systems (field
+	// 20°×10° and square 2°×1°), their tick labels, and the
+	// worked-tile tint overlay. MeshCore mode wants a clean
+	// basemap — grids only mean something for HF DX work.
+	hideGrids bool
+	// showMeshcoreLegend draws a small bottom-right swatch
+	// explaining the node-type colours and path overlay style.
+	// Independent of hideLegend (which gates the FT8 OTA
+	// legend) so MeshCore mode shows mesh-relevant content
+	// instead of being a blank basemap.
+	showMeshcoreLegend bool
+	// meshNodes is the set of MeshCore peers to plot — fed from
+	// the contact roster's broadcast lat/lon. Nil / empty means
+	// nothing extra rendered. Independent of the FT8 spot table.
+	meshNodes []MeshNode
+	// messagePaths holds in-flight animated message-path overlays.
+	// Each entry has its own startedAt clock so the renderer
+	// computes a "lightning-strike" reveal (segments appear
+	// progressively) followed by an alpha fade — old paths drop
+	// off naturally when their alpha hits zero. Multiple
+	// concurrent paths overlay so a busy mesh's traffic is
+	// readable as a swarm of fading arcs.
+	messagePaths             []activeMessagePath
+	messagePathTickerRunning bool // single ticker pumps refreshes for the whole set
 }
+
+// activeMessagePath is one animated path overlay. Stored on the
+// MapWidget; refreshed by the animation ticker until the entry's
+// total elapsed exceeds mcPathTotalDuration. The newest appended
+// path is marked persistent — its reveal still animates, but it
+// holds full alpha indefinitely (the previous persistent path is
+// demoted to fading at append time). This gives the operator a
+// stable view of the most recent route while a busy mesh's older
+// strikes still fade naturally.
+type activeMessagePath struct {
+	nodes      []MessagePathNode
+	startedAt  time.Time
+	persistent bool
+}
+
+// MessagePathNode is one waypoint along a received-message route.
+// Lat/Lon are float-degrees. Placeholder = true means the hop's
+// pubkey-prefix didn't match any contact in the roster, so the
+// renderer draws it as a smaller faded dot at an interpolated
+// position between known endpoints.
+type MessagePathNode struct {
+	Name        string
+	Lat, Lon    float64
+	Placeholder bool
+}
+
+// MeshNode is one peer to plot on the map in MeshCore mode. Type
+// is an integer that mirrors meshcore.AdvType (1=Chat, 2=Repeater,
+// 3=Room, 4=Sensor); we store it as int here to avoid an import
+// cycle from mapview to lib/meshcore.
+type MeshNode struct {
+	Name   string
+	PubKey [32]byte
+	Lat    float64
+	Lon    float64
+	Type   int
+}
+
+// MeshNode type identifiers — kept in sync with lib/meshcore.AdvType.
+const (
+	MeshNodeChat     = 1
+	MeshNodeRepeater = 2
+	MeshNodeRoom     = 3
+	MeshNodeSensor   = 4
+)
 
 // NewMapWidget creates a map widget centred on the operator's grid at a
 // regional zoom (~1/8 of the world's longitude span visible at startup).
@@ -206,7 +301,7 @@ func (m *MapWidget) Scrolled(ev *fyne.ScrollEvent) {
 		m.centerLat = -85.0511
 	}
 	m.mu.Unlock()
-	m.raster.Refresh()
+	m.refresh()
 }
 
 // Dragged implements fyne.Draggable — pan the map.
@@ -232,7 +327,7 @@ func (m *MapWidget) Dragged(ev *fyne.DragEvent) {
 		}
 	}
 	m.mu.Unlock()
-	m.raster.Refresh()
+	m.refresh()
 }
 
 // DragEnd implements fyne.Draggable.
@@ -244,8 +339,24 @@ func (m *MapWidget) DragEnd() {}
 func (m *MapWidget) Refresh() {
 	m.BaseWidget.Refresh()
 	if m.raster != nil {
-		m.raster.Refresh()
+		m.refresh()
 	}
+}
+
+// refresh is the always-safe entry point for raster repaints. Many
+// callers (setter methods invoked from contact-roster refresh
+// goroutines, the path-animation ticker, BLE / serial event
+// handlers) sit OFF the Fyne UI thread, and Fyne 2.7 strictly
+// enforces "UI mutations on the UI thread" via the
+// "*** Error in Fyne call thread" guard. fyne.Do schedules the
+// refresh onto the UI thread; calling it from the UI thread itself
+// is a cheap no-op-equivalent. Use this everywhere instead of
+// m.raster.Refresh() directly.
+func (m *MapWidget) refresh() {
+	if m.raster == nil {
+		return
+	}
+	fyne.Do(func() { m.raster.Refresh() })
 }
 
 // SetOnSpotTap registers a callback invoked when the user taps a station dot.
@@ -258,6 +369,14 @@ func (m *MapWidget) SetOnSpotTap(fn func(call string)) {
 // for positioning a popup menu.
 func (m *MapWidget) SetOnSpotSecondaryTap(fn func(call string, absPos fyne.Position)) {
 	m.onSpotSecondaryTap = fn
+}
+
+// SetOnMeshNodeSecondaryTap registers a callback invoked on right-click of a
+// MeshCore node dot. The pubkey lets the GUI look up the matching contact
+// (display name, type, last-heard etc.) without the map widget needing to
+// know about meshcore.Contact.
+func (m *MapWidget) SetOnMeshNodeSecondaryTap(fn func(pub [32]byte, absPos fyne.Position)) {
+	m.onMeshNodeSecondaryTap = fn
 }
 
 // SetRecentCQFunc installs a callback the renderer uses to decide
@@ -303,29 +422,298 @@ func (m *MapWidget) SetShowWorkedOverlay(on bool) {
 	m.showWorkedOverlay = on
 	m.mu.Unlock()
 	if changed {
-		m.raster.Refresh()
+		m.refresh()
 	}
 }
 
-// Tapped implements fyne.Tappable. It hit-tests all visible station dots and
-// calls onSpotTap with the nearest callsign within 12 pixels.
-func (m *MapWidget) Tapped(ev *fyne.PointEvent) {
-	if m.onSpotTap == nil {
+// SetShowLegend toggles the bottom-left OTA / status legend overlay.
+// FT8 mode wants it on (default); MeshCore mode wants it off because
+// the legend's POTA / SOTA / WWFF / portable glyphs don't apply to
+// mesh contacts.
+func (m *MapWidget) SetShowLegend(on bool) {
+	m.mu.Lock()
+	changed := m.hideLegend == on
+	m.hideLegend = !on
+	m.mu.Unlock()
+	if changed {
+		m.refresh()
+	}
+}
+
+// SetShowMeshcoreLegend toggles the bottom-right swatch explaining
+// MeshCore node-type colours (Repeater / Companion / Room / Sensor)
+// and the path overlay's "real hop / unknown hop / route line"
+// glyphs. MeshCore mode shows it; FT8 mode hides it.
+func (m *MapWidget) SetShowMeshcoreLegend(on bool) {
+	m.mu.Lock()
+	changed := m.showMeshcoreLegend != on
+	m.showMeshcoreLegend = on
+	m.mu.Unlock()
+	if changed {
+		m.refresh()
+	}
+}
+
+// SetShowGrids toggles the Maidenhead grid lines (field + square),
+// their labels, and the worked-tile tint. FT8 mode wants them on
+// (default); MeshCore mode wants them off — grid squares are an
+// HF-DX construct, irrelevant on the mesh.
+func (m *MapWidget) SetShowGrids(on bool) {
+	m.mu.Lock()
+	changed := m.hideGrids == on
+	m.hideGrids = !on
+	m.mu.Unlock()
+	if changed {
+		m.refresh()
+	}
+}
+
+// SetMeshNodes replaces the MeshCore-node overlay set. Pass nil or
+// an empty slice to clear. Nodes with lat=lon=0 are ignored on
+// render so contacts that haven't broadcast a position don't pile
+// up in the Atlantic.
+func (m *MapWidget) SetMeshNodes(nodes []MeshNode) {
+	m.mu.Lock()
+	m.meshNodes = nodes
+	m.mu.Unlock()
+	m.refresh()
+}
+
+// ClearMeshNodes is a convenience wrapper for SetMeshNodes(nil).
+// Called on FT8-mode return so the FT8 view stays uncluttered.
+func (m *MapWidget) ClearMeshNodes() { m.SetMeshNodes(nil) }
+
+// Animation timings for message-path overlays. mcPathRevealTotal is
+// the FIXED wall-clock budget the entire path's reveal animation
+// uses, regardless of hop count — a 2-hop path and an 8-hop path
+// both finish in mcPathRevealTotal. Per-segment time is divided
+// evenly (mcPathRevealTotal / segCount) so longer paths just draw
+// each segment faster instead of a uniformly long sweep that scales
+// with hops. Within each segment the arc reveals progressively
+// (the line "draws itself" rather than popping in), and an
+// arrowhead at the destination signals direction. After the reveal
+// completes the alpha fades to zero over FadeDuration.
+const (
+	mcPathRevealTotal   = 2 * time.Second
+	mcPathFadeDuration  = 5 * time.Second
+	mcPathMaxConcurrent = 12 // cap so a busy mesh doesn't wedge the renderer
+)
+
+// AppendMessagePath adds an animated path overlay with its own age
+// clock. Multiple paths may be in flight at once — each fades
+// independently. Older paths beyond mcPathMaxConcurrent are dropped.
+// No explicit Refresh — the animation ticker (started here when not
+// already running) drives the next paint, which avoids a spike of
+// N synchronous Refresh calls when a fan-out send queues a path
+// per roster member.
+func (m *MapWidget) AppendMessagePath(nodes []MessagePathNode) {
+	m.AppendMessagePaths([][]MessagePathNode{nodes})
+}
+
+// AppendMessagePaths is the batch form. Useful for outbound channel
+// sends that need one path-fade per roster member — call once with
+// every endpoint instead of N separate AppendMessagePath calls,
+// each of which would otherwise schedule its own UI refresh. The
+// last entry of the batch becomes the persistent path (held at full
+// alpha until the next AppendMessagePaths call); previously
+// persistent paths are demoted to fading from now.
+func (m *MapWidget) AppendMessagePaths(batch [][]MessagePathNode) {
+	now := time.Now()
+	added := false
+	m.mu.Lock()
+	// Demote any existing persistent path to a fading one,
+	// rebasing its clock so the fade starts now (not from when
+	// it was first appended).
+	for i := range m.messagePaths {
+		if m.messagePaths[i].persistent {
+			m.messagePaths[i].persistent = false
+			// Rebase so the fade starts immediately rather than from
+			// the moment the path first appeared. Since the reveal
+			// budget is fixed (mcPathRevealTotal), all paths share
+			// the same lifetime regardless of hop count.
+			m.messagePaths[i].startedAt = now.Add(-mcPathRevealTotal)
+		}
+	}
+	// Append the new batch. Track the index of the last valid
+	// entry so we can mark it persistent after the loop.
+	lastIdx := -1
+	for _, nodes := range batch {
+		if len(nodes) < 2 {
+			continue
+		}
+		cp := append([]MessagePathNode(nil), nodes...)
+		m.messagePaths = append(m.messagePaths, activeMessagePath{
+			nodes:     cp,
+			startedAt: now,
+		})
+		lastIdx = len(m.messagePaths) - 1
+		added = true
+	}
+	if lastIdx >= 0 {
+		m.messagePaths[lastIdx].persistent = true
+	}
+	if len(m.messagePaths) > mcPathMaxConcurrent {
+		m.messagePaths = m.messagePaths[len(m.messagePaths)-mcPathMaxConcurrent:]
+	}
+	m.mu.Unlock()
+	if added {
+		m.ensureMessagePathTicker()
+	}
+}
+
+// SetMessagePath is the legacy single-path API kept for the
+// right-click "Show path on map" action — clears any in-flight
+// animations and pins the supplied path with a fresh clock so it
+// fades like the auto-fired ones.
+func (m *MapWidget) SetMessagePath(nodes []MessagePathNode) {
+	m.mu.Lock()
+	m.messagePaths = nil
+	m.mu.Unlock()
+	m.AppendMessagePath(nodes)
+}
+
+// ClearMessagePath drops every in-flight animation immediately.
+func (m *MapWidget) ClearMessagePath() {
+	m.mu.Lock()
+	m.messagePaths = nil
+	m.mu.Unlock()
+	m.refresh()
+}
+
+// ensureMessagePathTicker spins up a 30 Hz refresh loop while any
+// path animation is active. Self-stops when the active set drains.
+// Idempotent — multiple calls during a busy burst share one ticker.
+func (m *MapWidget) ensureMessagePathTicker() {
+	m.mu.Lock()
+	if m.messagePathTickerRunning {
+		m.mu.Unlock()
 		return
 	}
-	if call := m.hitTestSpot(ev.Position); call != "" {
-		m.onSpotTap(call)
+	m.messagePathTickerRunning = true
+	m.mu.Unlock()
+	go func() {
+		// 30 Hz — needed for the arc-draw + arrowhead animation
+		// to look smooth (the line's leading edge advances along
+		// a quadratic Bezier; at 15 Hz the head visibly hops).
+		// Each tick prunes expired entries then issues exactly
+		// one Refresh, so the cost is bounded regardless of how
+		// many concurrent paths are in flight.
+		t := time.NewTicker(33 * time.Millisecond)
+		defer t.Stop()
+		for range t.C {
+			m.mu.Lock()
+			now := time.Now()
+			kept := m.messagePaths[:0]
+			anyAnimating := false
+			for _, p := range m.messagePaths {
+				if p.persistent {
+					// Persistent path stays forever (until the
+					// next AppendMessagePaths demotes it).
+					kept = append(kept, p)
+					// Still animating during its reveal phase.
+					if now.Sub(p.startedAt) < mcPathRevealTotal {
+						anyAnimating = true
+					}
+					continue
+				}
+				if now.Sub(p.startedAt) < mcPathRevealTotal+mcPathFadeDuration {
+					kept = append(kept, p)
+					anyAnimating = true
+				}
+			}
+			m.messagePaths = kept
+			// Stop the ticker once everything has finished
+			// animating — the persistent path is static after
+			// its reveal completes, so re-rendering at 15 Hz
+			// would be pure waste. AppendMessagePaths spins the
+			// ticker back up the next time something new arrives.
+			if !anyAnimating {
+				m.messagePathTickerRunning = false
+			}
+			done := !anyAnimating
+			m.mu.Unlock()
+			// raster.Refresh must run on the Fyne UI thread.
+			// Calling it from this background ticker goroutine
+			// directly trips the "*** Error in Fyne call thread"
+			// guard at higher tick rates (30 Hz). fyne.Do
+			// schedules the refresh onto the UI thread.
+			fyne.Do(func() { m.raster.Refresh() })
+			if done {
+				return
+			}
+		}
+	}()
+}
+
+// Tapped implements fyne.Tappable. Hit-tests visible station dots
+// first; if no spot is within range and an onMapTap callback is
+// registered, falls through to the geographic-tap path with the
+// unprojected lat/lon under the cursor.
+func (m *MapWidget) Tapped(ev *fyne.PointEvent) {
+	if m.onSpotTap != nil {
+		if call := m.hitTestSpot(ev.Position); call != "" {
+			m.onSpotTap(call)
+			return
+		}
 	}
+	if m.onMapTap != nil {
+		if lat, lon, ok := m.unproject(ev.Position); ok {
+			m.onMapTap(lat, lon)
+		}
+	}
+}
+
+// SetOnMapTap registers a callback fired when the user taps an
+// empty area of the map (no station dot nearby). Lat/lon are
+// decimal degrees in the standard WGS-84 frame. Pass nil to
+// disable. The Profile-settings location picker uses this to let
+// the operator click anywhere to set their advert position.
+func (m *MapWidget) SetOnMapTap(fn func(lat, lon float64)) {
+	m.onMapTap = fn
+}
+
+// unproject converts a screen pixel position into geographic
+// lat/lon by inverting the same Web-Mercator projection the
+// renderer uses. Returns ok=false when the raster hasn't sized
+// yet (no viewport to project against).
+func (m *MapWidget) unproject(pos fyne.Position) (lat, lon float64, ok bool) {
+	size := m.raster.Size()
+	w := float64(size.Width)
+	h := float64(size.Height)
+	if w == 0 || h == 0 {
+		return 0, 0, false
+	}
+	m.mu.Lock()
+	zoom := m.zoom
+	centerLon := m.centerLon
+	centerLat := m.centerLat
+	m.mu.Unlock()
+	ppd := w * zoom / 360.0
+	_, tNF, tSPx := tileGeom(ppd)
+	cMX := lonToTileX(centerLon, tNF)
+	cMY := latToTileY(centerLat, tNF)
+	mx := float64(pos.X) - w/2
+	my := float64(pos.Y) - h/2
+	lon = tileXToLon(cMX+mx/tSPx, tNF)
+	lat = tileYToLat(cMY+my/tSPx, tNF)
+	return lat, normLon(lon), true
 }
 
 // TappedSecondary implements fyne.SecondaryTappable. Right-click on a station
-// dot invokes onSpotSecondaryTap, used to open the profile viewer.
+// dot invokes onSpotSecondaryTap, used to open the profile viewer. If no FT8
+// spot is hit we fall through to the MeshCore node overlay so the operator
+// can right-click a peer to inspect / DM / show its path.
 func (m *MapWidget) TappedSecondary(ev *fyne.PointEvent) {
-	if m.onSpotSecondaryTap == nil {
-		return
+	if m.onSpotSecondaryTap != nil {
+		if call := m.hitTestSpot(ev.Position); call != "" {
+			m.onSpotSecondaryTap(call, ev.AbsolutePosition)
+			return
+		}
 	}
-	if call := m.hitTestSpot(ev.Position); call != "" {
-		m.onSpotSecondaryTap(call, ev.AbsolutePosition)
+	if m.onMeshNodeSecondaryTap != nil {
+		if pub, ok := m.hitTestMeshNode(ev.Position); ok {
+			m.onMeshNodeSecondaryTap(pub, ev.AbsolutePosition)
+		}
 	}
 }
 
@@ -378,7 +766,7 @@ func (m *MapWidget) DoubleTapped(ev *fyne.PointEvent) {
 		"px", ev.Position.X, "py", ev.Position.Y,
 		"from_lat", oldLat, "from_lon", oldLon, "from_zoom", oldZoom,
 		"to_lat", newLat, "to_lon", newLon, "to_zoom", newZoom)
-	m.raster.Refresh()
+	m.refresh()
 }
 
 // hitTestSpot returns the callsign of the station dot or label under pos,
@@ -521,6 +909,65 @@ func (m *MapWidget) hitTestSpot(pos fyne.Position) string {
 	return best
 }
 
+// hitTestMeshNode returns the pubkey of the MeshCore node dot under pos,
+// preferring the nearest dot within 12 px. Mirrors the draw-loop projection
+// (toX/toY use the same wrapLon-aware path used in the renderer's mesh-node
+// pass) so right-click hits land on the node the operator actually sees.
+func (m *MapWidget) hitTestMeshNode(pos fyne.Position) ([32]byte, bool) {
+	size := m.raster.Size()
+	w := float64(size.Width)
+	h := float64(size.Height)
+	if w == 0 || h == 0 {
+		return [32]byte{}, false
+	}
+
+	m.mu.Lock()
+	zoom := m.zoom
+	centerLon := m.centerLon
+	centerLat := m.centerLat
+	nodes := append([]MeshNode(nil), m.meshNodes...)
+	m.mu.Unlock()
+
+	if len(nodes) == 0 {
+		return [32]byte{}, false
+	}
+
+	ppd := w * zoom / 360.0
+	_, tNF, tSPx := tileGeom(ppd)
+	cMX := lonToTileX(centerLon, tNF)
+	cMY := latToTileY(centerLat, tNF)
+
+	toX := func(lon float64) int {
+		return int((lonToTileX(wrapLon(lon, centerLon), tNF)-cMX)*tSPx + w/2)
+	}
+	toY := func(lat float64) int {
+		return int((latToTileY(lat, tNF)-cMY)*tSPx + h/2)
+	}
+
+	tx := float64(pos.X)
+	ty := float64(pos.Y)
+	const dotHitR2 = 12.0 * 12.0
+
+	var (
+		bestPub   [32]byte
+		bestFound bool
+		bestScore = math.MaxFloat64
+	)
+	for _, n := range nodes {
+		if n.Lat == 0 && n.Lon == 0 {
+			continue
+		}
+		dx := tx - float64(toX(n.Lon))
+		dy := ty - float64(toY(n.Lat))
+		if d2 := dx*dx + dy*dy; d2 <= dotHitR2 && d2 < bestScore {
+			bestScore = d2
+			bestPub = n.PubKey
+			bestFound = true
+		}
+	}
+	return bestPub, bestFound
+}
+
 // FlyTo centres the map on the given lat/lon. If the map is very zoomed out
 // (zoom < 15) it also zooms in to a useful level so the target is visible.
 // The destination longitude is normalised to the nearest wrap copy of the
@@ -533,7 +980,53 @@ func (m *MapWidget) FlyTo(lat, lon float64) {
 		m.zoom = 20
 	}
 	m.mu.Unlock()
-	m.raster.Refresh()
+	m.refresh()
+}
+
+// FlyToRadius centres the map on the given lat/lon and sets zoom so
+// roughly the requested radius (in statute miles) is visible from
+// centre to the shorter window edge. Used by MeshCore mode to open
+// the map zoomed to ~50 miles around the operator's broadcast
+// position rather than the default mid-North-America regional view.
+//
+// The pixels-per-degree formula matches the rest of the widget:
+// ppd = w * zoom / 360. We solve for zoom against a radius
+// converted to degrees of latitude (1° ≈ 69 mi). Falls back to a
+// conservative default zoom if the widget hasn't been laid out yet
+// (no width to compute against).
+func (m *MapWidget) FlyToRadius(lat, lon, miles float64) {
+	if miles <= 0 {
+		m.FlyTo(lat, lon)
+		return
+	}
+	size := m.raster.Size()
+	w := float64(size.Width)
+	h := float64(size.Height)
+	short := w
+	if h > 0 && h < w {
+		short = h
+	}
+	radiusDeg := miles / 69.0 // 1° latitude ≈ 69 statute miles
+	m.mu.Lock()
+	m.centerLat = lat
+	m.centerLon = wrapLon(lon, m.centerLon)
+	if short > 0 && radiusDeg > 0 {
+		// We want centre→edge to span radiusDeg, so the visible
+		// span across the short axis is 2*radiusDeg degrees:
+		// short / (2*radiusDeg) = ppd; zoom = ppd * 360 / w.
+		ppd := short / (2 * radiusDeg)
+		m.zoom = ppd * 360.0 / w
+		if m.zoom < 0.9 {
+			m.zoom = 0.9
+		}
+		if m.zoom > 131072 {
+			m.zoom = 131072
+		}
+	} else if m.zoom < 15 {
+		m.zoom = 20
+	}
+	m.mu.Unlock()
+	m.refresh()
 }
 
 // GetSpotLocation returns the lat/lon of a spotted callsign, or false if unknown.
@@ -605,7 +1098,7 @@ func (m *MapWidget) SetHighlight(call string) {
 	m.hoverCall = call
 	m.spotsMu.Unlock()
 	if changed {
-		m.raster.Refresh()
+		m.refresh()
 	}
 }
 
@@ -615,8 +1108,30 @@ func (m *MapWidget) UpdateMyGrid(grid string) {
 	m.myGrid = grid
 	m.myLat, m.myLon, _ = gridToLatLon(grid)
 	m.spotsMu.Unlock()
-	m.raster.Refresh()
+	m.refresh()
 }
+
+// SetSelfPosition pins the operator's diamond to an explicit
+// lat/lon, overriding the myGrid-derived centroid. MeshCore mode
+// uses this to show the firmware-reported (often GPS-derived)
+// position rather than the coarser FT8 6-char-grid square.
+// Lat=0 && Lon=0 clears the override and falls back to myGrid.
+func (m *MapWidget) SetSelfPosition(lat, lon float64) {
+	m.spotsMu.Lock()
+	if lat == 0 && lon == 0 {
+		m.myOverrideValid = false
+	} else {
+		m.myOverrideValid = true
+		m.myOverrideLat = lat
+		m.myOverrideLon = lon
+	}
+	m.spotsMu.Unlock()
+	m.refresh()
+}
+
+// ClearSelfPosition is a convenience wrapper to drop the override
+// and fall back to the myGrid centroid (FT8 mode).
+func (m *MapWidget) ClearSelfPosition() { m.SetSelfPosition(0, 0) }
 
 // RemoveStaleSpots drops every spot whose `seen` timestamp is older than
 // maxAge. Returns the number of spots removed so the caller can decide
@@ -752,6 +1267,7 @@ func (m *MapWidget) draw(w, h int) image.Image {
 	centerLat := m.centerLat
 	zoom := m.zoom
 	showWorked := m.showWorkedOverlay
+	showGrids := !m.hideGrids
 	m.mu.Unlock()
 
 	img := image.NewRGBA(image.Rect(0, 0, w, h))
@@ -837,6 +1353,14 @@ func (m *MapWidget) draw(w, h int) image.Image {
 	myGrid := m.myGrid
 	myLat := m.myLat
 	myLon := m.myLon
+	if m.myOverrideValid {
+		// MeshCore mode supplies an exact lat/lon (firmware-
+		// reported, often GPS-derived) — preferred over the
+		// FT8-grid centroid.
+		myLat = m.myOverrideLat
+		myLon = m.myOverrideLon
+		myGrid = "x" // non-empty so the downstream draw block fires
+	}
 	qsoCall := m.qsoCall
 	qsoLat := m.qsoLat
 	qsoLon := m.qsoLon
@@ -873,40 +1397,45 @@ func (m *MapWidget) draw(w, h int) image.Image {
 	//   ppd <  7  : field only (2-char, 20°×10°)
 	//   ppd >= 7  : + square lines (4-char, 2°×1°)
 	//   ppd >= 45 : + square labels
+	//
+	// Whole block is gated on showGrids — MeshCore mode hides it
+	// since grid squares are an HF-DX construct.
 	face := basicfont.Face7x13
 
-	// Field grid (20°×10°) — always visible.
-	// Vertical lines are iterated over the extended visible-longitude range so
-	// they continue to appear after the map has been panned past ±180°.
-	fieldCol := color.RGBA{18, 45, 82, 255}
-	fieldLabelCol := color.RGBA{180, 210, 255, 255}
-	lnStart20 := math.Floor(visLonMin/20) * 20
-	for lon := lnStart20; lon <= visLonMax+20; lon += 20 {
-		x := toX(lon)
-		if x >= 0 && x < w {
-			mapVline(img, x, 0, h-1, fieldCol)
-		}
-	}
-	for i := 0; i <= 18; i++ {
-		lat := -90.0 + float64(i)*10
-		y := toY(lat)
-		if y >= 0 && y < h {
-			mapHline(img, 0, w-1, y, fieldCol)
-		}
-	}
-	// Field labels: shown when squares are NOT labeled.
-	if ppd < 45 {
-		for lon := lnStart20; lon < visLonMax; lon += 20 {
-			col := int(math.Floor((normLon(lon) + 180) / 20))
-			if col < 0 || col >= 18 {
-				continue
+	if showGrids {
+		// Field grid (20°×10°) — always visible in HF mode.
+		// Vertical lines are iterated over the extended visible-longitude range so
+		// they continue to appear after the map has been panned past ±180°.
+		fieldCol := color.RGBA{18, 45, 82, 255}
+		fieldLabelCol := color.RGBA{180, 210, 255, 255}
+		lnStart20 := math.Floor(visLonMin/20) * 20
+		for lon := lnStart20; lon <= visLonMax+20; lon += 20 {
+			x := toX(lon)
+			if x >= 0 && x < w {
+				mapVline(img, x, 0, h-1, fieldCol)
 			}
-			cx := toX(lon + 10)
-			for row := 0; row < 18; row++ {
-				lbl := string([]byte{byte('A' + col), byte('A' + row)})
-				cy := toY(-85.0+float64(row)*10) + 5
-				if onScreen(cx, cy) {
-					mapDrawTextOutlined(img, lbl, cx-6, cy, fieldLabelCol, face)
+		}
+		for i := 0; i <= 18; i++ {
+			lat := -90.0 + float64(i)*10
+			y := toY(lat)
+			if y >= 0 && y < h {
+				mapHline(img, 0, w-1, y, fieldCol)
+			}
+		}
+		// Field labels: shown when squares are NOT labeled.
+		if ppd < 45 {
+			for lon := lnStart20; lon < visLonMax; lon += 20 {
+				col := int(math.Floor((normLon(lon) + 180) / 20))
+				if col < 0 || col >= 18 {
+					continue
+				}
+				cx := toX(lon + 10)
+				for row := 0; row < 18; row++ {
+					lbl := string([]byte{byte('A' + col), byte('A' + row)})
+					cy := toY(-85.0+float64(row)*10) + 5
+					if onScreen(cx, cy) {
+						mapDrawTextOutlined(img, lbl, cx-6, cy, fieldLabelCol, face)
+					}
 				}
 			}
 		}
@@ -916,7 +1445,7 @@ func (m *MapWidget) draw(w, h int) image.Image {
 	// band: red for LoTW-confirmed (QSL), yellow for LoTW-known QSOs with no
 	// QSL yet, blue for contacts we have locally but LoTW doesn't reflect.
 	// Drawn beneath the square grid lines so boundaries stay visible.
-	if showWorked && ppd >= 7 {
+	if showGrids && showWorked && ppd >= 7 {
 		var lotwWorked, confirmed, local map[string]bool
 		if m.workedGridsFn != nil {
 			lotwWorked = m.workedGridsFn()
@@ -978,7 +1507,7 @@ func (m *MapWidget) draw(w, h int) image.Image {
 	}
 
 	// Square grid (2°×1°).
-	if ppd >= 7 {
+	if showGrids && ppd >= 7 {
 		sqCol := color.RGBA{14, 36, 66, 255}
 		sqLabelCol := color.RGBA{180, 210, 255, 255}
 		lonStart := math.Floor(visLonMin/2) * 2
@@ -1306,9 +1835,272 @@ func (m *MapWidget) draw(w, h int) image.Image {
 		}
 	}
 
-	mapDrawLegend(img, w, h)
+	if !m.hideLegend {
+		mapDrawLegend(img, w, h)
+	}
+	if m.showMeshcoreLegend {
+		mapDrawMeshcoreLegend(img, w, h)
+	}
+
+	// MeshCore node overlay — one colored dot per peer that
+	// broadcast a position. Type drives colour so the operator can
+	// scan the topology at a glance: repeaters in red (the
+	// infrastructure), rooms in green (group endpoints), sensors
+	// in orange (telemetry sources), chat peers in blue. Drawn
+	// after the legend so labels can sit on top of grid lines.
+	m.mu.Lock()
+	nodes := append([]MeshNode(nil), m.meshNodes...)
+	m.mu.Unlock()
+	if len(nodes) > 0 {
+		labelCol := color.RGBA{220, 230, 245, 255}
+		for _, n := range nodes {
+			if n.Lat == 0 && n.Lon == 0 {
+				continue
+			}
+			x := toX(n.Lon)
+			y := toY(n.Lat)
+			if !onScreen(x, y) {
+				continue
+			}
+			var c color.RGBA
+			switch n.Type {
+			case MeshNodeRepeater:
+				c = color.RGBA{220, 60, 60, 255}
+			case MeshNodeRoom:
+				c = color.RGBA{60, 200, 100, 255}
+			case MeshNodeSensor:
+				c = color.RGBA{230, 160, 40, 255}
+			default:
+				c = color.RGBA{80, 150, 240, 255}
+			}
+			mapDrawDot(img, x, y, 5, c)
+			if n.Name != "" {
+				mapDrawTinyTextOutlined(img, n.Name, x+8, y+4, labelCol)
+			}
+		}
+	}
+
+	// MeshCore message-path overlay — animated cyan polylines, one
+	// per active path. Each path "lights up" segment-by-segment
+	// (relay-style) then fades to invisible over mcPathFadeDuration.
+	// Multiple concurrent overlays so a busy mesh's traffic reads
+	// as overlapping fading strikes rather than a single sticky line.
+	m.mu.Lock()
+	paths := append([]activeMessagePath(nil), m.messagePaths...)
+	m.mu.Unlock()
+	if len(paths) > 0 {
+		now := time.Now()
+		for _, p := range paths {
+			drawAnimatedMessagePath(img, p, now, toX, toY, onScreen)
+		}
+	}
 
 	return img
+}
+
+// drawAnimatedMessagePath renders one animated path. Each hop pair
+// is drawn as a quadratic-Bezier arc that "draws itself" from the
+// previous node toward the next, with a small arrowhead at the
+// destination once a segment completes. The whole path's reveal
+// budget is mcPathRevealTotal regardless of hop count — divided
+// evenly between segments so longer paths just animate each leg
+// faster. After the reveal completes the alpha fades to zero over
+// mcPathFadeDuration. Persistent paths hold full alpha forever.
+func drawAnimatedMessagePath(img *image.RGBA, p activeMessagePath, now time.Time,
+	toX func(float64) int, toY func(float64) int, onScreen func(int, int) bool,
+) {
+	segCount := len(p.nodes) - 1
+	if segCount < 1 {
+		return
+	}
+	elapsed := now.Sub(p.startedAt)
+	revealTotal := mcPathRevealTotal
+	perSeg := revealTotal / time.Duration(segCount)
+	// Fractional reveal: integer part = fully-completed segments,
+	// fractional part = progress along the in-flight segment.
+	fractionalReveal := float64(elapsed) / float64(perSeg)
+	if maxR := float64(segCount); fractionalReveal > maxR {
+		fractionalReveal = maxR
+	}
+	fullSegs := int(fractionalReveal)
+	partialProg := fractionalReveal - float64(fullSegs)
+
+	alpha := 1.0
+	if !p.persistent && elapsed > revealTotal {
+		fadeProgress := float64(elapsed-revealTotal) / float64(mcPathFadeDuration)
+		if fadeProgress >= 1 {
+			return
+		}
+		alpha = 1 - fadeProgress
+	}
+	scaled := func(c color.RGBA) color.RGBA {
+		return color.RGBA{c.R, c.G, c.B, byte(float64(c.A) * alpha)}
+	}
+	pathCol := scaled(color.RGBA{60, 200, 230, 220})
+	arrowCol := scaled(color.RGBA{120, 220, 240, 255})
+	dotCol := scaled(color.RGBA{120, 220, 240, 255})
+	placeholderCol := scaled(color.RGBA{160, 165, 175, 200})
+	labelCol := scaled(color.RGBA{200, 230, 245, 255})
+
+	// Project every node up-front so arc + dot rendering use the
+	// same screen coordinates.
+	type pt struct{ x, y int }
+	pts := make([]pt, len(p.nodes))
+	for i, n := range p.nodes {
+		pts[i] = pt{toX(n.Lon), toY(n.Lat)}
+	}
+
+	// Fully-revealed segments: full arc + arrowhead at destination.
+	for i := 0; i < fullSegs; i++ {
+		drawPathArc(img, pts[i].x, pts[i].y, pts[i+1].x, pts[i+1].y, 1.0, pathCol)
+		dx, dy := arcEndTangent(pts[i].x, pts[i].y, pts[i+1].x, pts[i+1].y, 1.0)
+		drawArrowhead(img, pts[i+1].x, pts[i+1].y, dx, dy, arrowCol)
+	}
+	// In-flight segment: partial arc, no arrowhead until it
+	// completes (the next tick promotes it to fullSegs).
+	if fullSegs < segCount && partialProg > 0 {
+		i := fullSegs
+		drawPathArc(img, pts[i].x, pts[i].y, pts[i+1].x, pts[i+1].y, partialProg, pathCol)
+	}
+
+	// Dots for every node we've reached so far. Source dot of the
+	// in-flight segment is the destination dot of the previous
+	// segment (or the path origin); both are drawn here.
+	upTo := fullSegs
+	if partialProg > 0 && fullSegs < segCount {
+		upTo = fullSegs // source already shown by previous loop pass; destination not yet
+	}
+	for i := 0; i <= upTo && i < len(p.nodes); i++ {
+		n := p.nodes[i]
+		x, y := pts[i].x, pts[i].y
+		if !onScreen(x, y) {
+			continue
+		}
+		if n.Placeholder {
+			mapDrawDot(img, x, y, 3, placeholderCol)
+		} else {
+			mapDrawDot(img, x, y, 5, dotCol)
+		}
+		if n.Name != "" {
+			mapDrawTinyTextOutlined(img, n.Name, x+8, y+4, labelCol)
+		}
+	}
+}
+
+// drawPathArc renders a quadratic-Bezier arc from (x0,y0) to (x1,y1)
+// up to the fractional reveal `progress` ∈ (0, 1]. The control
+// point sits perpendicular to the chord at its midpoint, with bow
+// magnitude scaled to the chord length so short hops bow gently
+// and long hops curve more visibly. Drawn as a polyline of small
+// straight segments — sample density scales with chord length so
+// short arcs don't burn samples and long arcs don't go faceted.
+func drawPathArc(img *image.RGBA, x0, y0, x1, y1 int, progress float64, c color.RGBA) {
+	if progress <= 0 {
+		return
+	}
+	if progress > 1 {
+		progress = 1
+	}
+	fx0, fy0 := float64(x0), float64(y0)
+	fx1, fy1 := float64(x1), float64(y1)
+	dx, dy := fx1-fx0, fy1-fy0
+	length := math.Hypot(dx, dy)
+	if length < 1 {
+		return
+	}
+	// Perpendicular unit vector (rotate chord 90° counter-clockwise
+	// in screen coords — y grows downward, so this consistently bows
+	// arcs upward when reading left-to-right).
+	px, py := -dy/length, dx/length
+	bow := length * 0.18
+	if bow > 32 {
+		bow = 32
+	}
+	if bow < 6 {
+		bow = 6
+	}
+	cx := (fx0+fx1)/2 + px*bow
+	cy := (fy0+fy1)/2 + py*bow
+	// Sample density: ~one sample every 4 px of arc length, capped
+	// so a giant continent-spanning hop doesn't stall the renderer.
+	samples := int(length/4) + 8
+	if samples > 80 {
+		samples = 80
+	}
+	prevX, prevY := x0, y0
+	for i := 1; i <= samples; i++ {
+		t := float64(i) / float64(samples) * progress
+		u := 1 - t
+		// Quadratic Bezier: B(t) = (1-t)² P0 + 2(1-t)t C + t² P1
+		x := u*u*fx0 + 2*u*t*cx + t*t*fx1
+		y := u*u*fy0 + 2*u*t*cy + t*t*fy1
+		ix, iy := int(x), int(y)
+		mapDrawLine(img, prevX, prevY, ix, iy, c)
+		prevX, prevY = ix, iy
+	}
+}
+
+// arcEndTangent returns the direction vector of the arc at its
+// final sampled point (just shy of progress==1). Used to orient
+// arrowheads so they point along the arrival vector rather than
+// the chord.
+func arcEndTangent(x0, y0, x1, y1 int, progress float64) (dx, dy float64) {
+	fx0, fy0 := float64(x0), float64(y0)
+	fx1, fy1 := float64(x1), float64(y1)
+	chordX, chordY := fx1-fx0, fy1-fy0
+	length := math.Hypot(chordX, chordY)
+	if length < 1 {
+		return 0, 0
+	}
+	px, py := -chordY/length, chordX/length
+	bow := length * 0.18
+	if bow > 32 {
+		bow = 32
+	}
+	if bow < 6 {
+		bow = 6
+	}
+	cx := (fx0+fx1)/2 + px*bow
+	cy := (fy0+fy1)/2 + py*bow
+	// Quadratic Bezier derivative at t=1: B'(1) = 2(P1 - C).
+	t := progress
+	if t > 1 {
+		t = 1
+	}
+	tx := 2 * (1 - t) * (cx - fx0)
+	ty := 2 * (1 - t) * (cy - fy0)
+	tx += 2 * t * (fx1 - cx)
+	ty += 2 * t * (fy1 - cy)
+	tlen := math.Hypot(tx, ty)
+	if tlen < 1 {
+		return 0, 0
+	}
+	return tx / tlen, ty / tlen
+}
+
+// drawArrowhead renders a small filled-look V at (x,y) opening in
+// the (-dx,-dy) direction (so the V's tip sits at (x,y) and points
+// where dx,dy says the line was going). Drawn with two short lines
+// rather than a filled polygon — keeps it lightweight and matches
+// the existing line-based rendering style.
+func drawArrowhead(img *image.RGBA, x, y int, dx, dy float64, c color.RGBA) {
+	if dx == 0 && dy == 0 {
+		return
+	}
+	const (
+		arrowLen   = 8.0  // px back from the tip
+		arrowAngle = 0.45 // radians off the line — ~26°, looks balanced
+	)
+	cosA, sinA := math.Cos(arrowAngle), math.Sin(arrowAngle)
+	// Backwards vector along the line.
+	bx, by := -dx, -dy
+	// Rotate ±arrowAngle.
+	x1 := bx*cosA - by*sinA
+	y1 := bx*sinA + by*cosA
+	x2 := bx*cosA + by*sinA
+	y2 := -bx*sinA + by*cosA
+	mapDrawLine(img, x, y, x+int(x1*arrowLen), y+int(y1*arrowLen), c)
+	mapDrawLine(img, x, y, x+int(x2*arrowLen), y+int(y2*arrowLen), c)
 }
 
 // ── Web Mercator helpers ──────────────────────────────────────────────────────
@@ -2019,6 +2811,103 @@ func mapFillTriangle(img *image.RGBA, ax, ay, bx, by, cx, cy int, col color.RGBA
 				img.SetRGBA(x, y, col)
 			}
 		}
+	}
+}
+
+// mapDrawMeshcoreLegend draws a compact bottom-right swatch
+// explaining the MeshCore overlay's colour code: one row per
+// node-type dot (Repeater / Companion / Room / Sensor) plus a
+// "Route" line and "Unknown hop" placeholder. Lives in the
+// opposite corner from the FT8 OTA legend so the two never
+// collide visually if both modes' legends were ever shown
+// simultaneously.
+func mapDrawMeshcoreLegend(img *image.RGBA, w, h int) {
+	type legendEntry struct {
+		label    string
+		dotColor color.RGBA
+		dotR     int  // dot radius
+		lineSeg  bool // true → render as a line segment instead of a dot
+		ringOnly bool // true → outline (placeholder hop)
+		diamond  bool // true → diamond (operator's own station)
+	}
+	entries := []legendEntry{
+		{label: "You", dotColor: color.RGBA{255, 220, 0, 255}, dotR: 5, diamond: true},
+		{label: "Repeater", dotColor: color.RGBA{220, 60, 60, 255}, dotR: 5},
+		{label: "Companion", dotColor: color.RGBA{80, 150, 240, 255}, dotR: 5},
+		{label: "Room", dotColor: color.RGBA{60, 200, 100, 255}, dotR: 5},
+		{label: "Sensor", dotColor: color.RGBA{230, 160, 40, 255}, dotR: 5},
+		{label: "Route", dotColor: color.RGBA{60, 200, 230, 220}, lineSeg: true},
+		{label: "Hop", dotColor: color.RGBA{120, 220, 240, 255}, dotR: 5},
+		{label: "Unknown hop", dotColor: color.RGBA{160, 165, 175, 200}, dotR: 3, ringOnly: true},
+	}
+
+	const (
+		rowH        = 18
+		swatchX     = 14 // centre of the dot/line column inside the box
+		textX       = 30
+		padX        = 8
+		padY        = 6
+		glyphW      = 7
+		rightGutter = 8
+	)
+	maxLabelChars := 0
+	for _, e := range entries {
+		if len(e.label) > maxLabelChars {
+			maxLabelChars = len(e.label)
+		}
+	}
+	boxW := textX + maxLabelChars*glyphW + rightGutter
+	boxH := len(entries)*rowH + padY*2
+
+	// Bottom-right corner — opposite of the FT8 OTA legend so
+	// they don't fight for the same real estate.
+	bx := w - boxW - padX
+	by := h - boxH - padX
+
+	bg := color.RGBA{5, 15, 35, 210}
+	border := color.RGBA{40, 80, 130, 255}
+	for y := by; y <= by+boxH; y++ {
+		for x := bx; x <= bx+boxW; x++ {
+			if x < 0 || x >= w || y < 0 || y >= h {
+				continue
+			}
+			if x == bx || x == bx+boxW || y == by || y == by+boxH {
+				img.SetRGBA(x, y, border)
+			} else {
+				img.SetRGBA(x, y, bg)
+			}
+		}
+	}
+
+	face := basicfont.Face7x13
+	labelCol := color.RGBA{200, 215, 240, 255}
+	for i, e := range entries {
+		iy := by + padY + i*rowH + rowH/2
+		switch {
+		case e.diamond:
+			mapDrawDiamond(img, bx+swatchX, iy, e.dotR, e.dotColor)
+		case e.lineSeg:
+			// Short horizontal stroke showing the route colour.
+			x0 := bx + swatchX - 6
+			x1 := bx + swatchX + 6
+			mapDrawLine(img, x0, iy, x1, iy, e.dotColor)
+			// Slight thickness — second pass one pixel below.
+			mapDrawLine(img, x0, iy+1, x1, iy+1, e.dotColor)
+		case e.ringOnly:
+			// Ring outline communicates "placeholder / unknown".
+			r := e.dotR + 1
+			for dx := -r; dx <= r; dx++ {
+				for dy := -r; dy <= r; dy++ {
+					d2 := dx*dx + dy*dy
+					if d2 >= (r-1)*(r-1) && d2 <= r*r {
+						img.SetRGBA(bx+swatchX+dx, iy+dy, e.dotColor)
+					}
+				}
+			}
+		default:
+			mapDrawDot(img, bx+swatchX, iy, e.dotR, e.dotColor)
+		}
+		mapDrawTextOutlined(img, e.label, bx+textX, iy+4, labelCol, face)
 	}
 }
 

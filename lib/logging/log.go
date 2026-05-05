@@ -89,6 +89,34 @@ func Close() {
 	}
 }
 
+// NewFileLogger constructs a standalone *zap.SugaredLogger that
+// writes ONLY to the named file at the requested level — independent
+// of the package-global L. Used by features that want a dedicated
+// tail-able log (the MeshCore client's wire trace lives in
+// nocordhf-meshcore.log so the operator can `tail -f` it without
+// hunting through the main app log).
+//
+// The returned logger is safe to share across goroutines. buildID
+// stamps every line so multi-process / multi-build setups stay
+// distinguishable.
+func NewFileLogger(path, buildID string, level zapcore.Level) (*zap.SugaredLogger, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("open log file %s: %w", path, err)
+	}
+	enc := zapcore.NewConsoleEncoder(zapcore.EncoderConfig{
+		TimeKey:          "ts",
+		LevelKey:         "level",
+		MessageKey:       "msg",
+		EncodeTime:       zapcore.TimeEncoderOfLayout("Jan 02 15:04:05"),
+		EncodeLevel:      syslogLevel,
+		EncodeDuration:   zapcore.StringDurationEncoder,
+		ConsoleSeparator: " ",
+	})
+	core := zapcore.NewCore(enc, zapcore.AddSync(f), level)
+	return zap.New(core, zap.Fields(zap.String("b", buildID))).Sugar(), nil
+}
+
 // syslogLevel formats levels as syslog severity words, uppercase padded.
 func syslogLevel(l zapcore.Level, enc zapcore.PrimitiveArrayEncoder) {
 	switch l {

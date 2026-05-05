@@ -209,21 +209,21 @@ func main() {
 			log.Infow("opening saved radio profile", "type", rType, "port", rPort, "baud", rBaud)
 			if r, err := cat.OpenByType(rType, rPort, rBaud); err != nil {
 				log.Warnw("saved radio profile failed to open; running without radio control", "err", err)
-				g.AppendSystem(fmt.Sprintf("⚠ no radio: %s on %s — %v", rType, rPort, err))
+				g.AppendSystem(fmt.Sprintf("no radio: %s on %s — %v", rType, rPort, err))
 			} else {
 				radio.Swap(r)
 				log.Infow("CAT connected from saved profile", "type", rType, "port", rPort)
-				g.AppendSystem(fmt.Sprintf("ⓘ radio: %s on %s", rType, rPort))
+				g.AppendSystem(fmt.Sprintf("radio: %s on %s", rType, rPort))
 			}
 		} else {
 			log.Infow("auto-detecting radio")
 			if res, err := cat.AutoDetect(); err != nil {
 				log.Warnw("CAT auto-detect failed; running without radio control", "err", err)
-				g.AppendSystem("⚠ no radio: " + err.Error())
+				g.AppendSystem("no radio: " + err.Error())
 			} else {
 				radio.Swap(res.Radio)
 				log.Infow("CAT connected", "radio", res.Name, "port", res.Port)
-				g.AppendSystem(fmt.Sprintf("ⓘ radio: %s on %s", res.Name, res.Port))
+				g.AppendSystem(fmt.Sprintf("radio: %s on %s", res.Name, res.Port))
 			}
 		}
 	}
@@ -285,6 +285,15 @@ func main() {
 						log.Debugw("rx frame saved", "path", path, "slot", frame.SlotStart.Format("15:04:05"))
 					}
 				}
+				// Skip the heavy FT8 decode when the operator is in
+				// MeshCore mode — they're not looking at the FT8 chat
+				// or the waterfall, and ft8.Decode burns 300–800 ms
+				// of CPU per slot. Audio capture + waterfall
+				// processing keep running so a flip back to FT8 mode
+				// resumes seamlessly.
+				if !g.IsFT8Active() {
+					continue
+				}
 				if *myCall != "" {
 					ft8.SetAPContext(*myCall, "")
 				}
@@ -327,7 +336,7 @@ func main() {
 			}
 			if err := radio.SetFrequency(hz); err != nil {
 				log.Warnw("tune failed", "hz", hz, "err", err)
-				g.AppendSystem(fmt.Sprintf("⚠ tune to %.3f MHz failed: %v", float64(hz)/1e6, err))
+				g.AppendSystem(fmt.Sprintf("tune to %.3f MHz failed: %v", float64(hz)/1e6, err))
 			} else {
 				log.Infow("tuned", "hz", hz)
 			}
@@ -401,7 +410,7 @@ func runTX(
 	}
 	if err != nil {
 		log.Warnw("TX encode failed", "err", err)
-		g.AppendSystem("⚠ encode error: " + err.Error())
+		g.AppendSystem("encode error: " + err.Error())
 		return
 	}
 
@@ -501,7 +510,7 @@ func runTX(
 		if radio.Inner() != nil {
 			pttOffWithRetry(radio, log)
 		}
-		g.AppendSystem("⚠ play error: " + err.Error())
+		g.AppendSystem("play error: " + err.Error())
 		return
 	}
 
@@ -518,13 +527,13 @@ func runTX(
 	}
 	peakNote := fmt.Sprintf("peak %.2f (%.1f dBFS)", peak, peakDBFS)
 	if peak >= 0.95 {
-		peakNote = "⚠ " + peakNote + " — clipping likely"
+		peakNote = peakNote + " — clipping likely"
 	}
 	log.Infow("TX done", "msg", displayMsg, "peak", peak, "peak_dbfs", peakDBFS)
 	// AppendTxEcho already fired pre-play (in-progress); advanceTxRows
 	// will mark it complete once it sees txStart + txAudioDuration
 	// elapsed, so we don't append a duplicate here.
-	g.AppendSystem("✓ TX done · " + peakNote)
+	g.AppendSystem("TX done. " + peakNote)
 }
 
 // pttOffWithRetry keeps attempting PTTOff until it succeeds or 10s elapses.

@@ -3,6 +3,8 @@
 /nocordhf
 /nocordhf.log
 /nocordhf-stderr.log
+/nocordhf-meshcore.log
+/nocordhf-meshcore.db
 /nocordhf.adif
 recordings/
 *.prof

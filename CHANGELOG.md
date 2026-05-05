@@ -3,6 +3,288 @@
 All notable changes to NocordHF are tracked in this file. Version
 numbers follow [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] - 2026-05-05
+
+### MeshCore (new mode)
+
+- Mode rail gains a MESH chip alongside FT8 (FT4 stays the
+  "coming soon" placeholder). Selecting it switches the active
+  mode, hides the FT8 waterfall, gives the map the full
+  right-hand pane, and swaps the channel column from the bands
+  list to a Contacts + Channels sidebar. Selection persists
+  across launches via the `active_mode` preference; the chip
+  palette repaints so the active mode is the only Discord-blurple
+  chip on the rail.
+- New `lib/meshcore/` package — full companion-radio modem in
+  pure Go, modelled on `liamcottle/meshcore.js`. Supports the
+  serial framing protocol (`<` outgoing / `>` incoming with
+  uint16-LE length prefix), AppStart handshake, GetContacts /
+  GetChannels enumeration, SendContactMessage /
+  SendChannelMessage, SyncNextMessage drain, SetDeviceTime,
+  and an event stream for adverts, msg-waiting pushes, and
+  send confirmations. Frame reader handles partial reads,
+  byte-stream resync after a noisy boot banner, and a 8-KiB
+  payload cap to fail fast on a stray length field.
+- Known-board table for USB-attached LoRa devboards (Heltec V3,
+  LilyGO T-Beam / T-Deck, RAK4631, Adafruit / Seeed nRF52840 +
+  LoRa, generic). Settings → MeshCore tab picks board / port /
+  baud; persisted as `meshcore_board`, `meshcore_port`,
+  `meshcore_baud`.
+- Mode entry lazy-opens the configured device, runs AppStart,
+  syncs the device clock (so per-message senderTimestamp is
+  meaningful on RTC-less boards), and pulls the contact +
+  channel tables. Sidebar shows "CONTACTS (n)" with one row per
+  contact (R/M/S marker for Repeater/Room/Sensor types), a
+  divider, and "CHANNELS (n)" with one row per configured
+  channel. Selecting a contact / channel switches the chat to
+  that thread; the input field sends to the active selection.
+- Per-thread chat history is preserved across thread + mode
+  flips. Switching FT8 → MeshCore stashes the FT8 chat buffer
+  and restores it on the way back; switching threads within
+  MeshCore swaps in that thread's saved rows. Inbound messages
+  arriving for a non-active thread are buffered silently in
+  the background and surfaced when the operator selects them.
+- Topic bar in MeshCore mode shows "DM with X" for a contact
+  thread or "#channel" for a channel thread instead of the FT8
+  slot / NTP / TX status line.
+
+### MeshCore chat + RxLog
+
+- Per-message delivery state tracking. Outbound contact + channel
+  messages now land as Pending (`⏳ sending…`), flip to Delivered
+  (`✓ delivered`) when the firmware emits `PushSendConfirmed` with
+  a matching ack-CRC, or to Failed (`✗ failed`) after 90 s without
+  confirmation. Status sweep runs from the existing 1 Hz ticker.
+- New RxLog pane in MeshCore mode — sits below the map in a draggable
+  VSplit and shows every mesh packet the radio decodes off-air. One
+  row per packet: time, route type (FLOOD / DIRECT / TRANSPORT_*),
+  payload type (TXT_MSG / ADVERT / PATH / ACK / …), hop count, SNR,
+  RSSI. Ring-buffer-capped at 200 entries; newest at the top.
+- New `lib/meshcore/packet.go` — pure-Go port of liamcottle/meshcore.js
+  `packet.js`. `PacketFromBytes` decodes the mesh-layer header
+  (route + payload type + version bits), transport codes, path
+  hashes, and payload. Round-trip tests for FLOOD TXT_MSG and
+  TRANSPORT_FLOOD ADVERT shapes lock the byte layout.
+- New `meshcore.EventRxLog` event carrying SNR/RSSI + parsed
+  `Packet` for every `PushLogRxData` push the firmware emits.
+  Previously logged but unused; now drives the new viewer.
+
+### MeshCore transport
+
+- Bluetooth Low Energy support — connect to MeshCore companion
+  devices that ship with the BLE-only firmware (LilyGO T1000-E,
+  most nRF52840 trackers, anything you'd otherwise drive from
+  the official mobile / web apps). New `lib/meshcore` `Transport`
+  interface abstracts the link layer; existing serial path moved
+  behind `serialTransport`, BLE path is `bleTransport` (Nordic
+  UART Service GATT — service `6e400001-…`, write to `…0002`,
+  notify on `…0003`).
+- Settings → MeshCore → Device gains a Transport picker (USB
+  Serial / Bluetooth) at the top with a swappable sub-form. The
+  Bluetooth side has a Scan… button that opens a modal listing
+  every nearby peripheral advertising the MeshCore service UUID;
+  tap one to select, tap Connect now (or Save) to use it. Both
+  sides' state persists independently, so flipping the radio
+  picker doesn't lose the unused side's pick.
+- New `meshcore.transport`, `meshcore.ble.address`,
+  `meshcore.ble.device_name` preference keys. macOS bundle gains
+  `NSBluetoothAlwaysUsageDescription` Info.plist entry +
+  `com.apple.security.device.bluetooth` entitlement (parallel to
+  the audio-input pair shipped in 1.0.5).
+- New `tinygo.org/x/bluetooth` dependency for cross-platform GATT
+  (CoreBluetooth on macOS, BlueZ on Linux, WinRT on Windows).
+- `meshcore.ScanBLE(duration)` discovers peripherals advertising
+  the MeshCore service UUID; `meshcore.OpenBLE(address, timeout)`
+  reconnects to a saved peripheral. `meshcore.OpenSerial` is the
+  renamed serial constructor (was `Open`).
+
+### Settings
+
+- Settings dialog is now mode-contextual. Tapping the gear in FT8
+  mode opens the FT8 dialog (Profile, Radio, Map / Decoder, LoTW,
+  TQSL Upload); tapping it in MeshCore mode opens a focused
+  MeshCore dialog (Device, Profile). Each mode sees only the
+  knobs that are relevant to it — no mixed concerns, no scrolling
+  past inapplicable tabs.
+- MeshCore prefs are namespaced under `meshcore.device.*` and
+  `meshcore.profile.*` so they can never collide with FT8's
+  flat-key prefs. (No migration: MeshCore was new in this
+  release, so the old short-lived `meshcore_board` /
+  `meshcore_port` / `meshcore_baud` keys are simply ignored.)
+- MeshCore Profile tab persists `meshcore.profile.name`,
+  `meshcore.profile.lat`, `meshcore.profile.lon` and pushes them
+  to the live device on Save (or on the next connect when the
+  client isn't open). Includes a "Send self-advert" button so the
+  operator can announce the change without waiting for the
+  firmware's periodic advert.
+
+### Fixes
+
+- FT8 chat no longer bleeds into MeshCore mode. `appendRow`
+  parks decode / TX rows in `ft8RowsBackup` instead of `g.rows`
+  when the active mode is MeshCore (system rows still surface
+  live as operator notifications). `mcAppendRow` likewise gates
+  live-view writes on both the active-mode AND active-thread
+  matching, so an inbound MeshCore message arriving for a
+  non-active thread or a different mode is buffered silently in
+  history.
+
+### Scope
+
+- `scopePane.SetWaterfallVisible(bool)` swaps the right
+  pane between the FT8 waterfall+map VSplit and a
+  map-only layout. Same `MapWidget` instance in both
+  modes so worked-grid overlay state, spot pins, and
+  the QSO partner arc all carry through a mode flip.
+- MeshCore scope layout: RxLog moved to the top of the
+  right pane, map underneath. Newest RxLog entry at the
+  bottom of the list with autoscroll-to-bottom on append.
+
+### MeshCore chat
+
+- @-mention tab completion. Type `@`, press Tab to insert
+  the first matching contact name (alphabetical, case-
+  insensitive). Repeated Tab cycles. Inserts as
+  `@[Name] ` so other clients render the mention.
+- Inbound `@[Name]` mentions render as bracket-stripped
+  styled spans — cool blue for someone-pinged-someone,
+  warm amber for "you got pinged".
+- Mention-of-self threads flagged in the sidebar with
+  `(@N)` and amber bold text instead of plain `(N)`.
+- Inline path-hash links: comma-separated 2/4/6-byte
+  hex series (`df,b7,43`) auto-detected against the
+  contact roster. Matched hops become clickable links
+  that fly the map to that contact.
+- Inline URL links: `http(s)://` URLs render underlined
+  and open in the system browser on click. Right-click
+  for Open / Copy.
+- 140-byte text length pre-validated before send so
+  oversize messages fail fast instead of silently
+  timing out at the firmware. Live `N/140` character
+  counter at the right edge of the input — amber within
+  10 of the cap, red over.
+- Hover any timestamp (chat row or RxLog row) for the
+  full local datetime tooltip.
+- `(sending...)` → `(delivered)` / `(failed)` delivery
+  state footer on tracked TX rows.
+- Persistent path-trace data on `StoredMessage` —
+  bytes captured at receive time and stored in bbolt so
+  the chat-row right-click "Map Trace" works on
+  historical messages after a relaunch.
+- Chat-row right-click: Info (full route, SNR, delivery,
+  persisted path), Map Trace (animate the route the
+  message took).
+
+### MeshCore contacts + channels
+
+- Persistent favorite stars on contact rows. Click the
+  star to toggle; favorites pin to the top of any sort.
+- Distance sort (haversine from operator's broadcast
+  position).
+- Bulk delete dialog with presets: stale > 7d / 30d,
+  never heard, broken timestamps.
+- Manual-add-contacts toggle in Profile — when on, the
+  radio stops auto-adding every advert it hears.
+- Reset path action on the contact + map-node right-
+  click menus. Clears the radio's cached out-route so
+  the next DM re-discovers via FLOOD.
+- Auto path reset after `mcAutoResetThreshold = 2`
+  consecutive failed DMs to the same contact. Surfaces
+  in chat as a system line; counter clears on any
+  successful delivery or a manual reset.
+- `PushPathUpdated` surfaces as a "path updated for
+  Name" system line and triggers a debounced contact
+  refresh so `Contact.OutPathLen` / `OutPath` stay
+  fresh.
+- Hashtag channel auto-derive: `Add hashtag channel`
+  computes the secret as `SHA-256(name)[:16]` so
+  community channels (`#volcano`, `#meshbud`, …) join
+  by name.
+- `+` button in the Channels header opens a popup with
+  Add hashtag channel / Add private channel.
+- Channel message routing tries both interpretations of
+  the firmware's channel-id byte (slot index AND
+  `SHA-256(secret)[0]`) and falls back to a synthetic
+  `channel:unknown:XX` thread when neither resolves.
+  Diagnostic log per route decision.
+- `SyncNextMessage` decode errors now surface as system
+  lines instead of being silently swallowed.
+
+### MeshCore map
+
+- Self-position pinned to the radio's GNSS-derived
+  `SelfInfo.AdvLatE6/AdvLonE6` (yellow diamond),
+  separate from the FT8 grid centroid.
+- Curved-arc path animation. Each route segment draws
+  progressively along a quadratic Bezier with an
+  arrowhead at every completed hop. Total reveal is a
+  fixed 2 s regardless of hop count; non-persistent
+  paths fade over 5 s.
+- Right-click any MeshCore node dot for Favorite, Info,
+  Open chat, Show last path. Reuses the same context
+  menu the contact sidebar offers.
+
+### MeshCore connection
+
+- Auto-reconnect on link drop. Configurable interval,
+  default 5 minutes; 0 disables. Handles macOS
+  sleep/wake gracefully — the BLE link silently dies
+  during sleep and we now surface a "link dropped"
+  system line and retry on schedule.
+- Transport write failures close the underlying
+  connection so `EventDisconnected` fires exactly once
+  instead of every subsequent send timing out.
+
+### Settings
+
+- Profile tab: lat/lon picker. **Use radio GPS** snaps
+  the entries from the radio's GNSS chip;
+  **Pick on map…** opens a modal map-widget where a
+  click drops the diamond. Manual edits override.
+
+### Chrome
+
+- Mode rail simplified to FT8 + MESH (FT4 placeholder
+  removed).
+- Hover tooltips use a non-blocking primitive overlay
+  (instead of `widget.PopUp` which intercepted clicks)
+  with a 400 ms debounce.
+- Map widget refreshes always dispatch via `fyne.Do`
+  (eliminates "Error in Fyne call thread" warnings on
+  off-UI-thread setter calls).
+- Star SVG icon (`internal/nocord/assets/star.svg` +
+  `star_filled.svg`) replaces the Unicode glyph used
+  for the contact-row favorite control.
+- System messages and chat-row delivery footers no
+  longer use Unicode glyph decorations.
+
+### Documentation
+
+- README rewrite: Getting Started section with macOS
+  release / build-from-source / per-mode first-run
+  config. Per-mode FT8 + MeshCore detail sections.
+  Compatible-radios + compatible-boards tables.
+
+## [1.0.8] - 2026-05-03
+
+### Map
+
+- HamDB auto-lookup on every decode upgrades coarse-prefix map
+  placement to the operator's actual home coordinates. First
+  decode of a callsign in a session fires a background lookup
+  (8 s timeout, on-disk cache + per-call in-flight dedupe baked
+  into the client); cached entries apply inline. Portable stations
+  transmitting from a grid different to their home QTH are NOT
+  overwritten — the message grid wins (`UpgradeSpotLocation`
+  already had this guard).
+
+### Cleanup
+
+- Reverted v1.0.7's "double-tap on waterfall cancels queued
+  retries" behaviour. Moving around the waterfall is just
+  frequency selection, not a takeover gesture; **Esc** remains
+  the only explicit cancel.
+
 ## [1.0.7] - 2026-05-02
 
 ### Manual takeover

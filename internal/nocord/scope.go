@@ -119,7 +119,14 @@ type scopePane struct {
 	wfImg     *image.RGBA
 	wfCanvas  *canvas.Image
 	mapWidget *ui.MapWidget
-	container fyne.CanvasObject // root — added to the main layout
+	container *fyne.Container // root — added to the main layout (NewStack of bg + child)
+	bg        *canvas.Rectangle
+	// wfWithAxis is the waterfall + freq-axis pair that becomes the
+	// VSplit's leading object in FT8 mode. wfMapSplit is the live
+	// VSplit; rebuilt on every flip back to FT8 mode (Fyne doesn't
+	// reattach a Split's Trailing cleanly after we reparent it).
+	wfWithAxis *fyne.Container
+	wfMapSplit *container.Split
 
 	// Snap-to-slots state. The waterfall image is sized to an integer number
 	// of FT8 slots and rebuilt when the live pane height crosses a slot
@@ -218,9 +225,8 @@ type scopePane struct {
 	txFreqHz       float64
 	txBox          *canvas.Rectangle
 	txOverlay      *fyne.Container
-	wfWithOverlay  fyne.CanvasObject   // the tappable+overlay stack added to VSplit
-	onTxFreqChange func(hz float64)    // callback for main.go to read latest TX freq
-	onCancelSends  func(reason string) // GUI hook fired by manual-takeover gestures (waterfall double-tap)
+	wfWithOverlay  fyne.CanvasObject // the tappable+overlay stack added to VSplit
+	onTxFreqChange func(hz float64)  // callback for main.go to read latest TX freq
 
 	// Frequency-axis strip docked under the waterfall. Replaces the
 	// old "SCOPE | TX 1234 Hz" header. Shows tick labels at 500-Hz
@@ -364,20 +370,11 @@ func newScopePane(myGrid string) *scopePane {
 		}
 		s.SetTxFreq(xFrac * scopeFreqMaxHz)
 	}
-	// Double-tap is the operator's "I'm taking over" gesture: cancel
-	// any in-flight or queued auto-reply TX before retuning so the
-	// snap-once doesn't get clobbered by a stale retry firing right
-	// after. Drag stays gesture-only (no cancel) so the operator can
-	// sweep frequencies without nuking active QSO state.
-	tappable.onDouble = func(local fyne.Position) {
-		s.mu.Lock()
-		cancel := s.onCancelSends
-		s.mu.Unlock()
-		if cancel != nil {
-			cancel("waterfall double-tap")
-		}
-		setTxFromX(local)
-	}
+	// Double-tap and drag both retune the TX cursor without touching
+	// queued / in-flight TX state — moving around the waterfall is
+	// just frequency selection, not a takeover gesture. Esc is the
+	// only explicit cancel.
+	tappable.onDouble = setTxFromX
 	tappable.onDrag = setTxFromX
 	tappable.onSecondary = func(local fyne.Position, abs fyne.Position) {
 		size := tappable.Size()
@@ -449,13 +446,59 @@ func newScopePane(myGrid string) *scopePane {
 	// Stack waterfall on top + axis strip on bottom, then VSplit
 	// between that pair and the map. The axis strip rides with the
 	// waterfall through the VSplit drag; the map gets the bottom.
-	wfWithAxis := container.NewBorder(nil, s.freqAxis, nil, nil, s.wfWithOverlay)
-	split := container.NewVSplit(wfWithAxis, s.mapWidget)
-	split.SetOffset(0.55) // slightly more waterfall by default
+	s.wfWithAxis = container.NewBorder(nil, s.freqAxis, nil, nil, s.wfWithOverlay)
+	s.wfMapSplit = container.NewVSplit(s.wfWithAxis, s.mapWidget)
+	s.wfMapSplit.SetOffset(0.55) // slightly more waterfall by default
 
-	bg := canvas.NewRectangle(color.RGBA{30, 32, 38, 255})
-	s.container = container.NewStack(bg, split)
+	s.bg = canvas.NewRectangle(color.RGBA{30, 32, 38, 255})
+	s.container = container.NewStack(s.bg, s.wfMapSplit)
 	return s
+}
+
+// SetWaterfallVisible swaps the right-pane layout between the full
+// waterfall+map VSplit (FT8 mode) and a map-only view (MeshCore mode).
+// Called by the GUI on mode-rail selection. The map widget itself is
+// the same instance in both layouts — we just reparent it between the
+// VSplit and the bare stack so worked-grid overlay state, spot pins,
+// QSO partner arc, etc. all carry through a mode flip.
+func (s *scopePane) SetWaterfallVisible(show bool) {
+	if s == nil || s.container == nil {
+		return
+	}
+	if show {
+		// Rebuild the VSplit with the same children — Fyne doesn't
+		// like reusing a Split whose Trailing was reparented, so a
+		// fresh Split is the cleanest way back from map-only.
+		s.wfMapSplit = container.NewVSplit(s.wfWithAxis, s.mapWidget)
+		s.wfMapSplit.SetOffset(0.55)
+		s.container.Objects = []fyne.CanvasObject{s.bg, s.wfMapSplit}
+	} else {
+		s.container.Objects = []fyne.CanvasObject{s.bg, s.mapWidget}
+	}
+	s.container.Refresh()
+}
+
+// SetMeshcoreLayout swaps the right pane into an RxLog-on-top +
+// map-on-bottom VSplit. The RxLog sits where the waterfall lives
+// in FT8 mode (top of the scope pane); the map takes the larger
+// bottom panel. Pass nil for top to fall back to a bare map.
+// The "top" arg is conventionally the packet log but the helper
+// stays generic so future surfaces can swap in.
+func (s *scopePane) SetMeshcoreLayout(top fyne.CanvasObject) {
+	if s == nil || s.container == nil {
+		return
+	}
+	if top == nil {
+		s.container.Objects = []fyne.CanvasObject{s.bg, s.mapWidget}
+	} else {
+		split := container.NewVSplit(top, s.mapWidget)
+		// Top pane gets ~35% (compact log header), map ~65%
+		// (matches the FT8 waterfall:map weighting feel and
+		// gives geographic context plenty of room).
+		split.SetOffset(0.35)
+		s.container.Objects = []fyne.CanvasObject{s.bg, split}
+	}
+	s.container.Refresh()
 }
 
 // AddSpots plots decoded stations as pins on the map. Forwards directly to
@@ -563,17 +606,6 @@ func (s *scopePane) TxFreq() float64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.txFreqHz
-}
-
-// SetOnCancelSends registers a callback that the scope fires from
-// gestures the operator uses to take manual control — currently only
-// double-tap on the waterfall, which is also the "snap-once" TX-tune
-// gesture. The GUI wires this to cancelAllSends so a deliberate
-// retune wipes any in-flight or queued auto-reply TXs.
-func (s *scopePane) SetOnCancelSends(fn func(reason string)) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.onCancelSends = fn
 }
 
 // SetOnTxFreqChange registers a callback fired whenever the operator clicks

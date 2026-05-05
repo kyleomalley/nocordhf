@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+  <!-- Two horizontal cross-bars + two slightly-slanted vertical bars,
+       like Discord's # channel glyph. -->
+  <path d="M5 9 L20 9"/>
+  <path d="M4 15 L19 15"/>
+  <path d="M11 4 L8 20"/>
+  <path d="M16 4 L13 20"/>
+</svg>

@@ -8,7 +8,7 @@
   Icon = "docs/icon.png"
   Name = "NocordHF"
   ID = "com.nocordhf.app"
-  Version = "1.0.7"
+  Version = "1.1.0"
   Build = 1
 
 [Development]
@@ -21,4 +21,5 @@
 # macOS-specific Info.plist additions injected into the bundle.
 [macOS]
   NSMicrophoneUsageDescription = "NocordHF captures audio from your radio's USB CODEC interface to decode FT8 transmissions."
+  NSBluetoothAlwaysUsageDescription = "NocordHF connects to MeshCore companion-firmware LoRa radios over Bluetooth Low Energy."
   LSMinimumSystemVersion = "11.0"
