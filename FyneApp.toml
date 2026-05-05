@@ -19,7 +19,17 @@
 [Source]
 
 # macOS-specific Info.plist additions injected into the bundle.
+#
+# LSMinimumSystemVersion = "13.0"
+#   Bumped from 11.0 after a notarized build crashed at startup on
+#   macOS 26 (Tahoe) inside +[NSApplication initialize] →
+#   _NS_SetBasicPasteTelemetry → XPC bootstrap_look_up. Tahoe routes
+#   apps that declare an ancient minimum through a legacy paste-
+#   telemetry path that watchdog-aborts when LaunchServices marks
+#   the process Role:Background. Declaring a more recent minimum
+#   (Ventura 13.0) keeps us on the modern AppKit init path. Apple
+#   Silicon Macs are 11.0+ already so this loses no users.
 [macOS]
   NSMicrophoneUsageDescription = "NocordHF captures audio from your radio's USB CODEC interface to decode FT8 transmissions."
   NSBluetoothAlwaysUsageDescription = "NocordHF connects to MeshCore companion-firmware LoRa radios over Bluetooth Low Energy."
-  LSMinimumSystemVersion = "11.0"
+  LSMinimumSystemVersion = "13.0"

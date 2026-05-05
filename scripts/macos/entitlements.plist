@@ -16,12 +16,31 @@
     Info.plist's NSBluetoothAlwaysUsageDescription handles the user
     prompt; this entitlement opens the underlying CoreBluetooth API
     under the hardened runtime.
+
+  com.apple.security.cs.allow-jit
+  com.apple.security.cs.allow-unsigned-executable-memory
+  com.apple.security.cs.disable-library-validation
+    Standard relaxations for Cgo-backed Go programs (Fyne/glfw):
+    the Go runtime allocates W+X memory for some scenarios, malgo's
+    miniaudio backend dlopens system frameworks dynamically, and
+    library validation refuses to load unsigned helper dylibs that
+    Fyne's GL backend pulls in on first frame. Without these,
+    hardened-runtime notarized builds either fail to launch on
+    Tahoe (XPC paste-telemetry watchdog SIGABRTs during
+    +[NSApplication initialize]) or silently break specific
+    subsystems (Metal pipeline cache, malgo audio).
 -->
 <plist version="1.0">
 <dict>
     <key>com.apple.security.device.audio-input</key>
     <true/>
     <key>com.apple.security.device.bluetooth</key>
+    <true/>
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    <key>com.apple.security.cs.disable-library-validation</key>
     <true/>
 </dict>
 </plist>
