@@ -186,12 +186,23 @@ release-staple:
 release-win:
 	@if [ -z "$(NOCORDHF_VERSION)" ]; then echo "NOCORDHF_VERSION is required"; exit 1; fi
 	@command -v fyne >/dev/null 2>&1 || { echo "installing fyne CLI"; go install fyne.io/tools/cmd/fyne@latest; }
-	@echo "==> packaging Windows .exe via fyne"
 	rm -rf ./build/NocordHF.exe ./build/NocordHF-$(NOCORDHF_VERSION)-windows-amd64.zip
 	mkdir -p ./build
+	# Pre-build the binary with the canonical capitalised filename
+	# fyne package --target windows --name NocordHF produces
+	# `nocordhf.exe` (lowercase, mirrors the cmd/nocordhf basename)
+	# regardless of --name, which controls the install title only.
+	# Building the .exe ourselves first then handing it to fyne via
+	# --executable lets fyne layer on the icon + version manifest
+	# into the file we actually want to ship.
+	@echo "==> building Windows binary"
+	GOOS=windows GOARCH=amd64 CGO_ENABLED=1 \
+		go build -trimpath -ldflags "-s -w -X main.BuildID=v$(NOCORDHF_VERSION)" \
+		-o ./build/NocordHF.exe ./cmd/nocordhf
+	@echo "==> packaging Windows .exe via fyne (icon + manifest)"
 	cd ./build && \
-		GOFLAGS='-ldflags=-X=main.BuildID=v$(NOCORDHF_VERSION)' \
-		fyne package --target windows --src ../cmd/nocordhf \
+		fyne package --target windows --executable NocordHF.exe \
+			--src ../cmd/nocordhf \
 			--icon $(CURDIR)/docs/icon.png \
 			--app-id com.nocordhf.app --name NocordHF \
 			--app-version $(NOCORDHF_VERSION) --release
