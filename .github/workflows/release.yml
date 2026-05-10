@@ -139,21 +139,28 @@ jobs:
         run: go install fyne.io/tools/cmd/fyne@latest
 
       - name: Build + package .exe
-        # fyne package emits NocordHF.exe with the icon embedded into
-        # the PE resource section so Explorer shows it correctly.
+        # Pre-build the binary as build/NocordHF.exe (capitalised),
+        # then hand it to fyne package --executable so fyne only
+        # layers the icon + Windows version manifest in. Without the
+        # pre-build, fyne emits build/nocordhf.exe (lowercase, mirrors
+        # the cmd/nocordhf basename) regardless of --name; the
+        # subsequent zip step expects the canonical capitalisation.
         env:
           NOCORDHF_VERSION: ${{ steps.ver.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p build
-          cd build
           export PATH="$(go env GOPATH)/bin:$PATH"
-          GOFLAGS="-ldflags=-X=main.BuildID=v${NOCORDHF_VERSION}" \
-            fyne package --target windows --src ../cmd/nocordhf \
-              --icon "${GITHUB_WORKSPACE}/docs/icon.png" \
-              --app-id com.nocordhf.app --name NocordHF \
-              --app-version "${NOCORDHF_VERSION}" --release
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=1 \
+            go build -trimpath -ldflags "-s -w -X main.BuildID=v${NOCORDHF_VERSION}" \
+            -o build/NocordHF.exe ./cmd/nocordhf
+          cd build
+          fyne package --target windows --executable NocordHF.exe \
+            --src ../cmd/nocordhf \
+            --icon "${GITHUB_WORKSPACE}/docs/icon.png" \
+            --app-id com.nocordhf.app --name NocordHF \
+            --app-version "${NOCORDHF_VERSION}" --release
 
       - name: Zip the .exe for release upload
         env:
