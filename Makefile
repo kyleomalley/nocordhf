@@ -242,10 +242,20 @@ release-linux:
 			--app-version $(NOCORDHF_VERSION) --release
 	mv ./build/NocordHF.tar.xz ./build/NocordHF-$(NOCORDHF_VERSION)-linux-$(NOCORDHF_ARCH).tar.xz
 	@echo "==> packaging .deb via nfpm"
-	NOCORDHF_VERSION=$(NOCORDHF_VERSION) NOCORDHF_ARCH=$(NOCORDHF_ARCH) \
-		nfpm pkg --packager deb \
-			--config ./scripts/linux/nfpm.yaml \
-			--target ./build/nocordhf_$(NOCORDHF_VERSION)_$(NOCORDHF_ARCH).deb
+	# Pre-render the nfpm config: nfpm's env-var substitution is
+	# inconsistent across versions for the contents.src field
+	# (top-level `arch` / `version` get expanded but nested glob
+	# paths sometimes don't, leaving "${NOCORDHF_ARCH}" as a
+	# literal filename and failing with "glob failed: ... no
+	# matching files"). Bake the values in with sed instead so
+	# every nfpm version sees concrete strings.
+	sed -e 's/$${NOCORDHF_VERSION}/$(NOCORDHF_VERSION)/g' \
+		-e 's/$${NOCORDHF_ARCH}/$(NOCORDHF_ARCH)/g' \
+		./scripts/linux/nfpm.yaml > ./build/nfpm.rendered.yaml
+	nfpm pkg --packager deb \
+		--config ./build/nfpm.rendered.yaml \
+		--target ./build/nocordhf_$(NOCORDHF_VERSION)_$(NOCORDHF_ARCH).deb
+	rm ./build/nfpm.rendered.yaml
 	@echo
 	@echo "release-linux done:"
 	@echo "    ./build/nocordhf-linux-$(NOCORDHF_ARCH)"
