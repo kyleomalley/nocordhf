@@ -461,6 +461,7 @@ func newScopePane(myGrid string) *scopePane {
 // the same instance in both layouts — we just reparent it between the
 // VSplit and the bare stack so worked-grid overlay state, spot pins,
 // QSO partner arc, etc. all carry through a mode flip.
+
 func (s *scopePane) SetWaterfallVisible(show bool) {
 	if s == nil || s.container == nil {
 		return

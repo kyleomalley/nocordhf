@@ -66,11 +66,14 @@ func ScanPorts() []string {
 func preferredType(port string) string {
 	base := strings.ToLower(filepath.Base(port))
 	if strings.Contains(base, "slab") {
-		return "icom" // Silicon Labs CP210x — IC-7300 built-in USB
+		return "icom" // Silicon Labs CP210x — IC-7300 built-in USB (macOS)
 	}
 	if strings.Contains(base, "usbserial") {
-		return "yaesu" // generic USB serial — DigiRig / FT-891
+		return "yaesu" // generic USB serial — DigiRig / FT-891 (macOS)
 	}
+	// On Linux both the IC-7300 and the DigiRig (CP2102N) enumerate as
+	// ttyUSB*. We can't distinguish them by name alone, so return "" and
+	// let AutoDetect try all known types on the port.
 	return ""
 }
 
@@ -83,9 +86,11 @@ func isLikelyRadio(port string) bool {
 			return false
 		}
 	}
-	return strings.Contains(base, "slab") ||
-		strings.Contains(base, "usbserial") ||
-		strings.Contains(base, "serial")
+	return strings.Contains(base, "slab") || // macOS: Silicon Labs CP210x
+		strings.Contains(base, "usbserial") || // macOS: generic USB serial
+		strings.Contains(base, "serial") || // generic fallback
+		strings.Contains(base, "ttyusb") || // Linux: /dev/ttyUSB* (FTDI, CP210x, DigiRig)
+		strings.Contains(base, "ttyacm") // Linux: /dev/ttyACM* (some radios)
 }
 
 // AutoDetectResult holds the result of a successful auto-detect.

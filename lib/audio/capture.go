@@ -4,6 +4,7 @@ package audio
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -43,8 +44,10 @@ type Capturer struct {
 	wg         sync.WaitGroup
 	sinkMu     sync.RWMutex
 	sink       SampleSink
-	muted      atomic.Bool // when true, incoming samples are zeroed (TX mute)
+	muted      atomic.Bool  // when true, incoming samples are zeroed (TX mute)
 	dropped    atomic.Int64
+	rxGain     atomic.Uint64 // float64 bits; 0 = unset (treated as 1.0)
+	rxPeak     atomic.Uint32 // float32 bits; peak amplitude of most recent chunk
 }
 
 // New creates a Capturer targeting a device whose name contains deviceName (case-insensitive).
@@ -55,6 +58,25 @@ func New(deviceName string) *Capturer {
 		frames:     make(chan Frame, 16),
 		stop:       make(chan struct{}),
 	}
+}
+
+// SetRXGain sets a linear gain applied to captured samples before the
+// waterfall sink and FT8 decoder. 1.0 = unity (default); 2.0 ≈ +6 dB.
+func (c *Capturer) SetRXGain(g float32) {
+	c.rxGain.Store(math.Float64bits(float64(g)))
+}
+
+// RXGain returns the current RX gain (1.0 if not explicitly set).
+func (c *Capturer) RXGain() float32 {
+	if v := math.Float64frombits(c.rxGain.Load()); v != 0 {
+		return float32(v)
+	}
+	return 1.0
+}
+
+// RXPeak returns the peak sample amplitude of the most recent audio chunk, in [0, 1].
+func (c *Capturer) RXPeak() float32 {
+	return math.Float32frombits(c.rxPeak.Load())
 }
 
 // Mute silences the audio input (zeroes samples) while transmitting.
@@ -79,7 +101,7 @@ func (c *Capturer) Frames() <-chan Frame {
 // Start begins audio capture. It blocks until the device is opened, then returns.
 // Call Stop to shut down.
 func (c *Capturer) Start() error {
-	ctx, err := malgo.InitContext([]malgo.Backend{malgo.BackendCoreaudio}, malgo.ContextConfig{}, nil)
+	ctx, err := malgo.InitContext(nil, malgo.ContextConfig{}, nil)
 	if err != nil {
 		return fmt.Errorf("malgo init context: %w", err)
 	}
@@ -158,6 +180,23 @@ func (c *Capturer) Start() error {
 		bufStart := len(buf)
 		buf = dec.processInto(buf, floats)
 		newSamples := buf[bufStart:]
+
+		// Apply RX gain and track peak amplitude.
+		if gain := c.RXGain(); gain != 1.0 {
+			for i, s := range newSamples {
+				newSamples[i] = s * gain
+			}
+		}
+		var peak float32
+		for _, s := range newSamples {
+			if s < 0 {
+				s = -s
+			}
+			if s > peak {
+				peak = s
+			}
+		}
+		c.rxPeak.Store(math.Float32bits(peak))
 
 		// Deliver decimated samples to the waterfall sink. The waterfall is
 		// built against the 12 kHz output rate, so sending native-rate
@@ -278,20 +317,50 @@ func (c *Capturer) Stop() {
 	logging.L.Infow("shutdown: Capturer.Stop() done")
 }
 
-// ListDevices prints all available capture device names to stdout.
-func ListDevices() error {
-	ctx, err := malgo.InitContext([]malgo.Backend{malgo.BackendCoreaudio}, malgo.ContextConfig{}, nil)
+// CaptureDeviceNames returns the names of all available audio capture devices.
+func CaptureDeviceNames() ([]string, error) {
+	ctx, err := malgo.InitContext(nil, malgo.ContextConfig{}, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer ctx.Uninit() //nolint
-
 	devices, err := ctx.Devices(malgo.Capture)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, len(devices))
+	for i, d := range devices {
+		names[i] = d.Name()
+	}
+	return names, nil
+}
+
+// PlaybackDeviceNames returns the names of all available audio playback devices.
+func PlaybackDeviceNames() ([]string, error) {
+	ctx, err := malgo.InitContext(nil, malgo.ContextConfig{}, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer ctx.Uninit() //nolint
+	devices, err := ctx.Devices(malgo.Playback)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, len(devices))
+	for i, d := range devices {
+		names[i] = d.Name()
+	}
+	return names, nil
+}
+
+// ListDevices prints all available capture device names to stdout.
+func ListDevices() error {
+	names, err := CaptureDeviceNames()
 	if err != nil {
 		return err
 	}
-	for _, d := range devices {
-		fmt.Printf("  capture: %s\n", d.Name())
+	for _, n := range names {
+		fmt.Printf("  capture: %s\n", n)
 	}
 	return nil
 }

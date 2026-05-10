@@ -232,7 +232,22 @@ func main() {
 	// and pushes results into the chat. The capturer also fans samples out
 	// to the waterfall processor via SetSink, decoupled from the slot-frame
 	// queue so the scope updates continuously rather than once per slot.
+	//
+	// Saved device names (Settings → Radio → RX/TX audio) override the
+	// CLI flag defaults so the operator's explicit pick survives relaunches.
+	savedRX, savedTX, rxGain := g.LoadSavedAudio()
+	if savedRX != "" {
+		*audioDev = savedRX
+	}
+	if savedTX != "" {
+		*playbackDev = savedTX
+	}
+	if savedRX != "" || savedTX != "" {
+		log.Infow("audio devices from saved prefs", "rx", *audioDev, "tx", *playbackDev, "rx_gain", rxGain)
+	}
 	capturer := audio.New(*audioDev)
+	capturer.SetRXGain(rxGain)
+	g.SetRXGainCallback(func(gain float32) { capturer.SetRXGain(gain) })
 	wfProc := waterfall.New(128)
 	capturer.SetSink(func(samples []float32, now time.Time) {
 		wfProc.Write(samples, now)
@@ -276,6 +291,15 @@ func main() {
 	}
 
 	if audioOK {
+		// Poll RX peak level at ~12 Hz to drive the scope level bar.
+		go func() {
+			ticker := time.NewTicker(80 * time.Millisecond)
+			defer ticker.Stop()
+			for range ticker.C {
+				g.SetRXLevel(capturer.RXPeak())
+			}
+		}()
+
 		go func() {
 			for frame := range capturer.Frames() {
 				if rxRecorder != nil {

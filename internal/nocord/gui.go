@@ -34,6 +34,7 @@ import (
 	"fyne.io/fyne/v2/widget"
 
 	"github.com/kyleomalley/nocordhf/lib/adif"
+	"github.com/kyleomalley/nocordhf/lib/audio"
 	"github.com/kyleomalley/nocordhf/lib/callsign"
 	"github.com/kyleomalley/nocordhf/lib/cat"
 	"github.com/kyleomalley/nocordhf/lib/ft8"
@@ -437,6 +438,8 @@ type GUI struct {
 	// channel suffices.
 	txActive     bool
 	activeStopCh chan struct{}
+	rxGainFn     func(float32) // called when RX gain slider changes; wired to capturer.SetRXGain
+	rxPeakLevel  float32      // most recent RX audio peak [0,1]; updated by main.go polling goroutine
 
 	// Magnification popup — two modes:
 	//   - Preview (decodePopupPinned == false): driven by hover.
@@ -705,6 +708,47 @@ func (g *GUI) SetRadio(r *cat.AtomicRadio) {
 	g.mu.Unlock()
 }
 
+// LoadSavedAudio returns the persisted audio device names and RX gain chosen
+// via Settings → Radio. Empty device strings mean "use CLI default".
+func (g *GUI) LoadSavedAudio() (rx, tx string, rxGain float32) {
+	if g.app == nil {
+		return "", "", 1.0
+	}
+	prefs := g.app.Preferences()
+	rx = prefs.String("audio_rx_device")
+	tx = prefs.String("audio_tx_device")
+	rxGain = float32(prefs.FloatWithFallback("rx_gain", 1.0))
+	return
+}
+
+// SetRXGainCallback registers a callback invoked when the operator moves the
+// RX gain slider. main.go wires this to capturer.SetRXGain so the change
+// applies to the live session without a restart.
+func (g *GUI) SetRXGainCallback(fn func(float32)) {
+	g.mu.Lock()
+	g.rxGainFn = fn
+	g.mu.Unlock()
+}
+
+// SetRXLevel stores the current audio peak for display in the settings dialog.
+func (g *GUI) SetRXLevel(peak float32) {
+	g.mu.Lock()
+	g.rxPeakLevel = peak
+	g.mu.Unlock()
+}
+
+// SendTune fires a pure-carrier tune transmission. Safe to call from any goroutine.
+func (g *GUI) SendTune() {
+	if g.txCh == nil {
+		return
+	}
+	select {
+	case g.txCh <- TxRequest{Tune: true, StopCh: make(chan struct{})}:
+	default:
+		g.AppendSystem("TX busy — wait for current transmission to finish")
+	}
+}
+
 // LoadSavedRadio returns the persisted radio profile (type, port, baud)
 // and ok=true if the user has configured one via Settings → Radio. main.go
 // prefers this over auto-detect so an explicit choice survives reboots and
@@ -970,12 +1014,17 @@ func (g *GUI) showFT8Settings() {
 		widget.NewLabel("TQSL must already have your callsign certificate installed and at least one Station location configured. Auto-upload re-signs the running nocordhf.adif on every QSO completion."),
 	)
 
-	// ── Radio tab ──────────────────────────────────────────────────
-	// Persisted radio profile: type ("icom" / "yaesu" / "" = none),
-	// serial port path, and baud. On Save, the saved values are written
-	// to prefs and (if "Connect now" was used) the live AtomicRadio is
-	// swapped. Decouples startup from the radio: nocordhf launches even
-	// with no rig attached, and the operator picks a profile when ready.
+	// ── Radio tab ─────────────────────────────────────────────────
+	// Three independent sections: which radio model, CAT serial
+	// control, and audio device + levels.
+
+	// ─ RADIO section ─
+	sectionHdr := func(label string) fyne.CanvasObject {
+		t := canvas.NewText(label, color.RGBA{140, 145, 165, 255})
+		t.TextStyle = fyne.TextStyle{Bold: true}
+		t.TextSize = 11
+		return t
+	}
 	const radioNone = "None (RX-only)"
 	radioTypeOpts := append([]string{radioNone}, cat.RadioTypeNames()...)
 	radioTypeSel := widget.NewSelect(radioTypeOpts, nil)
@@ -985,6 +1034,8 @@ func (g *GUI) showFT8Settings() {
 	} else {
 		radioTypeSel.SetSelected(radioNone)
 	}
+
+	// ─ CAT section ─
 	availablePorts := cat.ScanPorts()
 	radioPortSel := widget.NewSelect(availablePorts, nil)
 	radioPortSel.PlaceHolder = "Select serial port"
@@ -995,18 +1046,8 @@ func (g *GUI) showFT8Settings() {
 	if b := prefs.IntWithFallback("radio_baud", 0); b > 0 {
 		radioBaudEntry.SetText(fmt.Sprintf("%d", b))
 	}
-	radioBaudEntry.SetPlaceHolder("default for the selected radio")
-	radioStatus := canvas.NewText("", color.RGBA{160, 165, 175, 255})
-	radioStatus.TextStyle = fyne.TextStyle{Monospace: true}
-	radioStatus.TextSize = 11
-	g.mu.Lock()
-	if g.radio != nil && g.radio.Inner() != nil {
-		radioStatus.Text = "Connected"
-	} else {
-		radioStatus.Text = "Disconnected"
-	}
-	g.mu.Unlock()
-	// Auto-fill baud when type changes if the user hasn't typed a custom value.
+	radioBaudEntry.SetPlaceHolder("default for selected model")
+	// Auto-fill baud when model changes if the operator hasn't typed a custom value.
 	radioTypeSel.OnChanged = func(name string) {
 		if kr, ok := cat.RadioByName(name); ok {
 			if strings.TrimSpace(radioBaudEntry.Text) == "" {
@@ -1014,41 +1055,51 @@ func (g *GUI) showFT8Settings() {
 			}
 		}
 	}
-	radioRescanBtn := widget.NewButton("Rescan", func() {
-		ports := cat.ScanPorts()
-		radioPortSel.Options = ports
-		radioPortSel.Refresh()
-		if len(ports) == 0 {
-			radioStatus.Text = "No serial ports found"
-			radioStatus.Refresh()
+	catStatus := canvas.NewText("", color.RGBA{160, 165, 175, 255})
+	catStatus.TextStyle = fyne.TextStyle{Monospace: true}
+	catStatus.TextSize = 11
+	radioConnectBtn := widget.NewButton("Connect", nil)
+	setCATState := func(connected bool, msg string) {
+		if connected {
+			radioConnectBtn.SetText("Connected")
+			radioConnectBtn.Importance = widget.SuccessImportance
+		} else {
+			radioConnectBtn.SetText("Connect")
+			radioConnectBtn.Importance = widget.MediumImportance
 		}
-	})
-	radioConnectBtn := widget.NewButton("Connect now", func() {
+		radioConnectBtn.Refresh()
+		catStatus.Text = msg
+		catStatus.Refresh()
+	}
+	g.mu.Lock()
+	if g.radio != nil && g.radio.Inner() != nil {
+		setCATState(true, "Connected")
+	} else {
+		setCATState(false, "")
+	}
+	g.mu.Unlock()
+	radioConnectBtn.OnTapped = func() {
 		g.mu.Lock()
 		ar := g.radio
 		g.mu.Unlock()
 		if ar == nil {
-			radioStatus.Text = "Radio control unavailable in this build"
-			radioStatus.Refresh()
+			setCATState(false, "CAT unavailable")
 			return
 		}
 		name := radioTypeSel.Selected
 		if name == "" || name == radioNone {
 			ar.Swap(nil)
-			radioStatus.Text = "Disconnected"
-			radioStatus.Refresh()
+			setCATState(false, "Disconnected")
 			return
 		}
 		kr, ok := cat.RadioByName(name)
 		if !ok {
-			radioStatus.Text = "Unknown radio type"
-			radioStatus.Refresh()
+			setCATState(false, "Unknown radio model")
 			return
 		}
 		port := radioPortSel.Selected
 		if port == "" {
-			radioStatus.Text = "Pick a serial port first"
-			radioStatus.Refresh()
+			setCATState(false, "Pick a serial port first")
 			return
 		}
 		baud := kr.Baud
@@ -1059,45 +1110,131 @@ func (g *GUI) showFT8Settings() {
 		}
 		r, err := cat.OpenByType(kr.Type, port, baud)
 		if err != nil {
-			radioStatus.Text = "Connect failed: " + err.Error()
-			radioStatus.Refresh()
+			setCATState(false, "Connect failed: "+err.Error())
 			return
 		}
 		ar.Swap(r)
-		radioStatus.Text = fmt.Sprintf("Connected: %s on %s", kr.Name, port)
-		radioStatus.Refresh()
+		setCATState(true, fmt.Sprintf("%s on %s", kr.Name, port))
 		g.AppendSystem(fmt.Sprintf("radio: %s on %s", kr.Name, port))
+	}
+	radioRescanBtn := widget.NewButton("Rescan ports", func() {
+		ports := cat.ScanPorts()
+		radioPortSel.Options = ports
+		radioPortSel.Refresh()
+		if len(ports) == 0 {
+			catStatus.Text = "No serial ports found"
+			catStatus.Refresh()
+		}
 	})
-	// TX audio level slider. On USB-CODEC rigs the rig's ALC follows
-	// the audio drive linearly, so this acts as a soft "TX power"
-	// control: 0.02 (≈ -34 dBFS) at the bottom for a faint signal,
-	// 0.5 (≈ -6 dBFS) at the top for full ALC drive. Default 0.18
-	// is a conservative setting that keeps ALC happy while
-	// still putting out useful power on most rigs.
+
+	// ─ AUDIO section ─
+	const audioDefault = "System default"
+	audioRXNames, _ := audio.CaptureDeviceNames()
+	audioTXNames, _ := audio.PlaybackDeviceNames()
+	audioRXOpts := append([]string{audioDefault}, audioRXNames...)
+	audioTXOpts := append([]string{audioDefault}, audioTXNames...)
+	audioRXSel := widget.NewSelect(audioRXOpts, nil)
+	if saved := prefs.String("audio_rx_device"); saved != "" {
+		audioRXSel.SetSelected(saved)
+	} else {
+		audioRXSel.SetSelected(audioDefault)
+	}
+	audioTXSel := widget.NewSelect(audioTXOpts, nil)
+	if saved := prefs.String("audio_tx_device"); saved != "" {
+		audioTXSel.SetSelected(saved)
+	} else {
+		audioTXSel.SetSelected(audioDefault)
+	}
+	audioRescanBtn := widget.NewButton("Rescan audio", func() {
+		rxNames, _ := audio.CaptureDeviceNames()
+		txNames, _ := audio.PlaybackDeviceNames()
+		audioRXSel.Options = append([]string{audioDefault}, rxNames...)
+		audioTXSel.Options = append([]string{audioDefault}, txNames...)
+		audioRXSel.Refresh()
+		audioTXSel.Refresh()
+	})
+
+	// RX gain — amplifies weak signals before waterfall + decoder.
+	curRXGain := prefs.FloatWithFallback("rx_gain", 1.0)
+	rxGainLabel := canvas.NewText(fmt.Sprintf("%.1f×", curRXGain), color.RGBA{200, 205, 215, 255})
+	rxGainLabel.TextStyle = fyne.TextStyle{Monospace: true}
+	rxGainLabel.TextSize = 11
+	rxGainSlider := widget.NewSlider(0.5, 4.0)
+	rxGainSlider.Step = 0.5
+	rxGainSlider.SetValue(curRXGain)
+	rxGainSlider.OnChanged = func(v float64) {
+		rxGainLabel.Text = fmt.Sprintf("%.1f×", v)
+		rxGainLabel.Refresh()
+		g.mu.Lock()
+		fn := g.rxGainFn
+		g.mu.Unlock()
+		if fn != nil {
+			fn(float32(v))
+		}
+	}
+	rxGainRow := container.NewBorder(nil, nil, nil, rxGainLabel, rxGainSlider)
+
+	// TX level slider.
+	// Run Tune and watch the radio's ALC meter; aim for ALC just touching full scale.
+	const (
+		txSliderMin = 0.02
+		txSliderMax = 0.5
+	)
 	curTxLevel := g.TxLevel()
-	txLevelLabel := canvas.NewText(fmt.Sprintf("%.2f (%.0f%%)", curTxLevel, curTxLevel*100/0.5), color.RGBA{200, 205, 215, 255})
+	txHintFor := func(v float64) string {
+		switch {
+		case v < 0.10:
+			return fmt.Sprintf("%.2f — too low", v)
+		case v < 0.30:
+			return fmt.Sprintf("%.2f — good", v)
+		case v < 0.40:
+			return fmt.Sprintf("%.2f — warm", v)
+		default:
+			return fmt.Sprintf("%.2f — hot", v)
+		}
+	}
+	txLevelLabel := canvas.NewText(txHintFor(curTxLevel), color.RGBA{200, 205, 215, 255})
 	txLevelLabel.TextStyle = fyne.TextStyle{Monospace: true}
 	txLevelLabel.TextSize = 11
-	txLevelSlider := widget.NewSlider(0.02, 0.5)
+	txLevelSlider := widget.NewSlider(txSliderMin, txSliderMax)
 	txLevelSlider.Step = 0.01
 	txLevelSlider.SetValue(curTxLevel)
 	txLevelSlider.OnChanged = func(v float64) {
 		g.SetTxLevel(v)
-		txLevelLabel.Text = fmt.Sprintf("%.2f (%.0f%%)", v, v*100/0.5)
+		txLevelLabel.Text = txHintFor(v)
 		txLevelLabel.Refresh()
 	}
 	txLevelRow := container.NewBorder(nil, nil, nil, txLevelLabel, txLevelSlider)
+	tuneBtn := widget.NewButton("Tune (3s carrier)", func() { g.SendTune() })
 
-	radioForm := widget.NewForm(
-		widget.NewFormItem("Radio", radioTypeSel),
-		widget.NewFormItem("Port", radioPortSel),
-		widget.NewFormItem("Baud", radioBaudEntry),
-		widget.NewFormItem("TX level", txLevelRow),
-	)
+	// RX level meter — widget.ProgressBar updates reliably from goroutines
+	// via SetValue(), unlike canvas.Raster which caches its image.
+	rxLevelBar := widget.NewProgressBar()
+	rxLevelBar.Max = 1.0
+	rxLevelBar.TextFormatter = func() string { return "" }
+
 	radioTab := container.NewVBox(
-		radioForm,
-		container.NewHBox(radioConnectBtn, radioRescanBtn, radioStatus),
-		widget.NewLabel("Pick \"None\" to run RX-only. Save persists the choice; \"Connect now\" applies it to the running session without closing the dialog. TX level controls the audio drive into the rig's USB CODEC — adjust until the rig's ALC just kisses full scale on transmit."),
+		sectionHdr("RADIO"),
+		widget.NewForm(widget.NewFormItem("Model", radioTypeSel)),
+		widget.NewSeparator(),
+		sectionHdr("CAT"),
+		widget.NewForm(
+			widget.NewFormItem("Port", radioPortSel),
+			widget.NewFormItem("Baud", radioBaudEntry),
+		),
+		container.NewHBox(radioConnectBtn, radioRescanBtn, catStatus),
+		widget.NewSeparator(),
+		sectionHdr("AUDIO"),
+		widget.NewForm(
+			widget.NewFormItem("RX device", audioRXSel),
+			widget.NewFormItem("RX gain", rxGainRow),
+			widget.NewFormItem("RX level", rxLevelBar),
+			widget.NewFormItem("TX device", audioTXSel),
+			widget.NewFormItem("TX level", txLevelRow),
+			widget.NewFormItem("", tuneBtn),
+		),
+		container.NewHBox(audioRescanBtn),
+		widget.NewRichTextFromMarkdown("- **RX level**: bar should show movement when receiving. If it stays flat, check your RX device or raise gain.\n- **TX level**: click Tune and watch the radio's ALC — back off until ALC just reaches full scale.\n- Audio device changes take effect on restart."),
 	)
 
 	tabs := container.NewAppTabs(
@@ -1107,10 +1244,29 @@ func (g *GUI) showFT8Settings() {
 		container.NewTabItem("LoTW", lotwTab),
 		container.NewTabItem("TQSL Upload", tqslTab),
 	)
+	// Poll RX peak and push to the progress bar while the settings dialog is open.
+	rxLevelDone := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(80 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				g.mu.Lock()
+				peak := g.rxPeakLevel
+				g.mu.Unlock()
+				fyne.Do(func() { rxLevelBar.SetValue(float64(peak)) })
+			case <-rxLevelDone:
+				return
+			}
+		}
+	}()
+
 	d := dialog.NewCustomConfirm(
 		"NocordHF settings", "Save", "Cancel",
 		tabs,
 		func(ok bool) {
+			close(rxLevelDone) // stop level refresh goroutine
 			if !ok {
 				return
 			}
@@ -1130,8 +1286,7 @@ func (g *GUI) showFT8Settings() {
 				scope.mapWidget.SetShowWorkedOverlay(overlayChk.Checked)
 			}
 
-			// Radio: type / port / baud. "None" clears the saved
-			// profile so the next launch falls back to auto-detect.
+			// Radio model + CAT: type / port / baud.
 			if rname := radioTypeSel.Selected; rname == "" || rname == radioNone {
 				prefs.SetString("radio_type", "")
 				prefs.SetString("radio_port", "")
@@ -1147,6 +1302,19 @@ func (g *GUI) showFT8Settings() {
 				}
 				prefs.SetInt("radio_baud", baud)
 			}
+
+			// Audio: RX/TX device names and RX gain.
+			if audioRXSel.Selected == audioDefault {
+				prefs.SetString("audio_rx_device", "")
+			} else {
+				prefs.SetString("audio_rx_device", audioRXSel.Selected)
+			}
+			if audioTXSel.Selected == audioDefault {
+				prefs.SetString("audio_tx_device", "")
+			} else {
+				prefs.SetString("audio_tx_device", audioTXSel.Selected)
+			}
+			prefs.SetFloat("rx_gain", rxGainSlider.Value)
 
 			// LoTW: persist creds, build client, kick off a sync if
 			// both fields were supplied. Empty fields clear the

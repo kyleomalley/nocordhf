@@ -37,7 +37,7 @@ func NewPlayer(deviceName string) *Player {
 // When stopCh fires, playback is silenced immediately and Play returns early.
 // Pass a nil channel to play to completion unconditionally.
 func (p *Player) Play(samples []float32, stopCh <-chan struct{}) error {
-	ctx, err := malgo.InitContext([]malgo.Backend{malgo.BackendCoreaudio}, malgo.ContextConfig{}, nil)
+	ctx, err := malgo.InitContext(nil, malgo.ContextConfig{}, nil)
 	if err != nil {
 		return fmt.Errorf("malgo init context: %w", err)
 	}
