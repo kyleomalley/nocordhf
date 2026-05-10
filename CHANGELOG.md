@@ -3,6 +3,28 @@
 All notable changes to NocordHF are tracked in this file. Version
 numbers follow [Semantic Versioning](https://semver.org/).
 
+## [1.1.1] - 2026-05-09
+
+### Release tooling
+
+- Cross-platform release pipeline. Tagging `v*.*.*` now produces
+  three sets of artefacts in parallel:
+  - macOS: signed + notarized `.app` and `.dmg` (existing).
+  - Windows: native `.exe` packaged via `fyne package` with the
+    icon embedded into the PE resource section, zipped as
+    `NocordHF-<ver>-windows-amd64.zip`.
+  - Linux: bare `NocordHF-<ver>-linux-amd64.tar.xz` (any distro)
+    plus a `nocordhf_<ver>_amd64.deb` (Debian / Ubuntu) packaged
+    via `nfpm` with the right runtime depends, an XDG `.desktop`
+    entry, and a `/usr/share/icons/hicolor/256x256/apps/` icon so
+    GNOME / KDE / Xfce app menus pick it up.
+- Local Makefile targets (`release-win`, `release-linux`) mirror
+  the CI flow so contributors can repro outside CI without
+  guessing at goreleaser config.
+- CI now runs build + vet + test on Ubuntu in addition to macOS,
+  so X11 / OpenGL / ALSA Cgo regressions surface on PRs instead
+  of waiting for a release tag.
+
 ## [1.1.0] - 2026-05-05
 
 ### MeshCore (new mode)

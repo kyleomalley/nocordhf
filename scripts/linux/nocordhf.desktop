@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=NocordHF
+GenericName=Amateur Radio Chat Client
+Comment=Discord-style chat-focused FT8 + MeshCore client for amateur radio
+Exec=nocordhf
+Icon=nocordhf
+Terminal=false
+Categories=HamRadio;Network;
+Keywords=ham;amateur;radio;ft8;meshcore;lora;
+StartupWMClass=nocordhf

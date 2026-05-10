@@ -1,4 +1,4 @@
-.PHONY: build run clean release-snapshot release-mac release-staple icon precommit
+.PHONY: build run clean release-snapshot release-mac release-staple release-win release-linux icon precommit
 
 # BuildID is stamped into the binary so a running NocordHF advertises
 # its origin in the title bar / log lines. Local builds use a
@@ -168,6 +168,89 @@ release-staple:
 	@echo "    gh release upload v$(NOCORDHF_VERSION) \\"
 	@echo "      ./build/NocordHF-$(NOCORDHF_VERSION).dmg \\"
 	@echo "      ./build/NocordHF.app  (zip first: ditto -c -k --keepParent ./build/NocordHF.app ./build/NocordHF-$(NOCORDHF_VERSION).app.zip)"
+
+# Build a Windows release .exe locally. Requires:
+#   - Go 1.22+ on Windows (or cross-compile from Linux/macOS with
+#     mingw-w64 + CGO_ENABLED=1, but the supported path is native).
+#   - The fyne CLI (auto-installed).
+#
+# Required env:
+#   NOCORDHF_VERSION   e.g. 1.1.1
+#
+# Produces under ./build/:
+#   NocordHF.exe                   icon-embedded GUI binary
+#   NocordHF-<ver>-windows-amd64.zip  zipped for release upload
+#
+# Run from a native Windows shell (PowerShell, cmd, or Git Bash):
+#   make release-win NOCORDHF_VERSION=1.1.1
+release-win:
+	@if [ -z "$(NOCORDHF_VERSION)" ]; then echo "NOCORDHF_VERSION is required"; exit 1; fi
+	@command -v fyne >/dev/null 2>&1 || { echo "installing fyne CLI"; go install fyne.io/tools/cmd/fyne@latest; }
+	@echo "==> packaging Windows .exe via fyne"
+	rm -rf ./build/NocordHF.exe ./build/NocordHF-$(NOCORDHF_VERSION)-windows-amd64.zip
+	mkdir -p ./build
+	cd ./build && \
+		GOFLAGS='-ldflags=-X=main.BuildID=v$(NOCORDHF_VERSION)' \
+		fyne package --target windows --src ../cmd/nocordhf \
+			--icon $(CURDIR)/docs/icon.png \
+			--app-id com.nocordhf.app --name NocordHF \
+			--app-version $(NOCORDHF_VERSION) --release
+	@echo "==> zipping for release upload"
+	cd ./build && zip -q "NocordHF-$(NOCORDHF_VERSION)-windows-amd64.zip" NocordHF.exe
+	@echo
+	@echo "release-win done:"
+	@echo "    ./build/NocordHF.exe"
+	@echo "    ./build/NocordHF-$(NOCORDHF_VERSION)-windows-amd64.zip"
+
+# Build a Linux release locally — emits both a bare .tar.xz from
+# fyne package (for any distro) and a .deb via nfpm (for Debian /
+# Ubuntu / derivatives).
+#
+# Required env:
+#   NOCORDHF_VERSION   e.g. 1.1.1
+#
+# Optional env:
+#   NOCORDHF_ARCH      defaults to host arch (amd64 / arm64)
+#
+# System packages needed on the build host:
+#   gcc libgl1-mesa-dev xorg-dev libasound2-dev
+#
+# Produces under ./build/:
+#   nocordhf-linux-<arch>                              raw binary
+#   NocordHF-<ver>-linux-<arch>.tar.xz                fyne tarball (icon + .desktop)
+#   nocordhf_<ver>_<arch>.deb                          Debian package
+NOCORDHF_ARCH ?= $(shell go env GOARCH)
+release-linux:
+	@if [ -z "$(NOCORDHF_VERSION)" ]; then echo "NOCORDHF_VERSION is required"; exit 1; fi
+	@command -v fyne >/dev/null 2>&1 || { echo "installing fyne CLI"; go install fyne.io/tools/cmd/fyne@latest; }
+	@command -v nfpm >/dev/null 2>&1 || { echo "installing nfpm"; go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest; }
+	@echo "==> building Linux binary ($(NOCORDHF_ARCH))"
+	mkdir -p ./build
+	rm -f ./build/nocordhf-linux-$(NOCORDHF_ARCH) \
+		./build/NocordHF-$(NOCORDHF_VERSION)-linux-$(NOCORDHF_ARCH).tar.xz \
+		./build/nocordhf_$(NOCORDHF_VERSION)_$(NOCORDHF_ARCH).deb
+	GOOS=linux GOARCH=$(NOCORDHF_ARCH) CGO_ENABLED=1 \
+		go build -trimpath -ldflags "-s -w -X main.BuildID=v$(NOCORDHF_VERSION)" \
+		-o ./build/nocordhf-linux-$(NOCORDHF_ARCH) ./cmd/nocordhf
+	@echo "==> packaging tar.xz via fyne (icon + .desktop)"
+	cd ./build && \
+		GOFLAGS='-ldflags=-X=main.BuildID=v$(NOCORDHF_VERSION)' \
+		fyne package --target linux --executable ./nocordhf-linux-$(NOCORDHF_ARCH) \
+			--src ../cmd/nocordhf \
+			--icon $(CURDIR)/docs/icon.png \
+			--app-id com.nocordhf.app --name NocordHF \
+			--app-version $(NOCORDHF_VERSION) --release
+	mv ./build/NocordHF.tar.xz ./build/NocordHF-$(NOCORDHF_VERSION)-linux-$(NOCORDHF_ARCH).tar.xz
+	@echo "==> packaging .deb via nfpm"
+	NOCORDHF_VERSION=$(NOCORDHF_VERSION) NOCORDHF_ARCH=$(NOCORDHF_ARCH) \
+		nfpm pkg --packager deb \
+			--config ./scripts/linux/nfpm.yaml \
+			--target ./build/nocordhf_$(NOCORDHF_VERSION)_$(NOCORDHF_ARCH).deb
+	@echo
+	@echo "release-linux done:"
+	@echo "    ./build/nocordhf-linux-$(NOCORDHF_ARCH)"
+	@echo "    ./build/NocordHF-$(NOCORDHF_VERSION)-linux-$(NOCORDHF_ARCH).tar.xz"
+	@echo "    ./build/nocordhf_$(NOCORDHF_VERSION)_$(NOCORDHF_ARCH).deb"
 
 clean:
 	rm -rf ./build ./dist

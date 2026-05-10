@@ -1,14 +1,19 @@
 name: release
 
-# Builds, signs, and notarizes the macOS release on every pushed tag
-# matching v*.*.*. Produces a Developer-ID-signed + Apple-notarized +
-# stapled .app and .dmg, uploads both to a draft GitHub Release.
+# Builds the cross-platform NocordHF release on every pushed tag
+# matching v*.*.*. Produces (in parallel jobs):
+#   - macOS:   Developer-ID-signed + Apple-notarized + stapled .app and .dmg
+#   - Windows: native .exe (icon-embedded via fyne package), zipped
+#   - Linux:   bare .tar.xz (any distro) + .deb (Debian/Ubuntu)
+#
+# All artefacts upload to the same draft GitHub Release. Publish from
+# the GitHub UI when satisfied.
 #
 # To cut a release: tag the commit (e.g. `git tag v1.0.1 && git push
-# --tags`). Review the draft Release in the GitHub UI and click
-# Publish.
+# --tags`).
 #
-# Required repository secrets:
+# Required repository secrets (macOS only — other platforms have no
+# code-signing yet, the Linux + Windows binaries ship unsigned):
 #   MACOS_CERTIFICATE       base64-encoded Developer ID Application .p12
 #   MACOS_CERTIFICATE_PWD   export password for the .p12
 #   MACOS_CERTIFICATE_NAME  e.g. "Developer ID Application: Your Name (TEAMID)"
@@ -25,7 +30,7 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  release-mac:
     runs-on: macos-14  # Apple Silicon; native arm64 + cross-build to amd64.
     steps:
       - name: Checkout
@@ -107,5 +112,113 @@ jobs:
           files: |
             build/NocordHF-${{ steps.ver.outputs.version }}.dmg
             build/NocordHF-${{ steps.ver.outputs.version }}.app.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          check-latest: true
+
+      - name: Derive release version from tag
+        id: ver
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Install fyne CLI
+        # `go install` puts binaries in $(go env GOPATH)/bin which the
+        # subsequent shell step needs on PATH. windows-latest already
+        # has gcc via the chocolatey-shipped MinGW so CGo just works.
+        run: go install fyne.io/tools/cmd/fyne@latest
+
+      - name: Build + package .exe
+        # fyne package emits NocordHF.exe with the icon embedded into
+        # the PE resource section so Explorer shows it correctly.
+        env:
+          NOCORDHF_VERSION: ${{ steps.ver.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          cd build
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          GOFLAGS="-ldflags=-X=main.BuildID=v${NOCORDHF_VERSION}" \
+            fyne package --target windows --src ../cmd/nocordhf \
+              --icon "${GITHUB_WORKSPACE}/docs/icon.png" \
+              --app-id com.nocordhf.app --name NocordHF \
+              --app-version "${NOCORDHF_VERSION}" --release
+
+      - name: Zip the .exe for release upload
+        env:
+          NOCORDHF_VERSION: ${{ steps.ver.outputs.version }}
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path build/NocordHF.exe `
+            -DestinationPath "build/NocordHF-${env:NOCORDHF_VERSION}-windows-amd64.zip"
+
+      - name: Upload artefacts to draft GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          draft: true
+          files: |
+            build/NocordHF-${{ steps.ver.outputs.version }}-windows-amd64.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          check-latest: true
+
+      - name: Install build dependencies
+        # Cgo deps for the Fyne GL backend (libgl1-mesa-dev), the X11
+        # input headers (xorg-dev pulls libx11/xcursor/xrandr/xinerama/xi
+        # all at once), and ALSA for malgo's audio capture path.
+        # tinygo.org/x/bluetooth's Linux backend talks to BlueZ over
+        # DBus at runtime — no compile-time bluez-dev needed.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc libgl1-mesa-dev xorg-dev libasound2-dev
+
+      - name: Derive release version from tag
+        id: ver
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Install fyne + nfpm
+        run: |
+          go install fyne.io/tools/cmd/fyne@latest
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+
+      - name: Build .tar.xz + .deb
+        env:
+          NOCORDHF_VERSION: ${{ steps.ver.outputs.version }}
+          NOCORDHF_ARCH: amd64
+        run: |
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          make release-linux
+
+      - name: Upload artefacts to draft GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          draft: true
+          files: |
+            build/NocordHF-${{ steps.ver.outputs.version }}-linux-amd64.tar.xz
+            build/nocordhf_${{ steps.ver.outputs.version }}_amd64.deb
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

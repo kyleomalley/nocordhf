@@ -2393,6 +2393,15 @@ func (g *GUI) rememberHeard(call string, snr float64, isCQ bool, otaType string)
 	if call == "" || strings.HasPrefix(call, "<") {
 		return
 	}
+	// Last-line-of-defence callsign-shape gate: senderFromMessage
+	// already filters CQ modifiers (ASIA / BY / numeric zones / …),
+	// but any future change to that path could leak grid squares,
+	// reports (R-18), or sign-offs (RR73) into the roster. Require
+	// at least one letter + one digit — eliminates the obvious
+	// non-callsign tokens without an exhaustive ITU-prefix table.
+	if !isPlausibleCallsign(call) {
+		return
+	}
 	now := time.Now()
 	g.mu.Lock()
 	if g.heard == nil {
@@ -2470,6 +2479,13 @@ func (g *GUI) heardSnapshot() []heardRow {
 // message "DEST SENDER …" it's the second token. Returns "" when the
 // sender is a hashed placeholder or the message has no recognisable
 // callsign in the sender slot.
+//
+// CQ modifier handling falls back gracefully: when fields[1] isn't
+// in lib/ft8's canonical modifier list AND doesn't look like a
+// callsign (no digit), treat it as an unknown modifier and use
+// fields[2] instead. Catches non-standard CQ targeting like
+// "CQ ASIA KB9LQA EN55" or "CQ BY KC1UBT FN42" — without this,
+// "ASIA" and "BY" leak into the HEARD roster as fake callsigns.
 func senderFromMessage(text string) string {
 	fields := strings.Fields(text)
 	if len(fields) == 0 {
@@ -2477,10 +2493,10 @@ func senderFromMessage(text string) string {
 	}
 	var sender string
 	if strings.EqualFold(fields[0], "CQ") {
-		// "CQ MOD X GRID" or "CQ X GRID" — modifier set lives in
-		// lib/ft8 so this stays aligned with the decoder.
 		switch {
 		case len(fields) >= 3 && ft8.IsCQModifier(fields[1]):
+			sender = fields[2]
+		case len(fields) >= 3 && !isPlausibleCallsign(strings.ToUpper(fields[1])):
 			sender = fields[2]
 		case len(fields) >= 2:
 			sender = fields[1]
@@ -9315,7 +9331,15 @@ func remoteCallFromMessage(text string) string {
 		// "CQ MOD X GRID" or "CQ X GRID". The modifier set (DX, NA,
 		// EU, …, POTA, SOTA, numeric zones, …) is owned by lib/ft8 so
 		// the decoder and this reply-target parser stay in sync.
+		// Fall-through: when fields[1] isn't a known modifier AND
+		// doesn't look like a callsign (e.g. "ASIA", "BY", a long
+		// DXCC region name), treat it as a non-canonical modifier
+		// and use fields[2] — same logic as senderFromMessage so
+		// the two stay symmetric.
 		if len(fields) >= 3 && ft8.IsCQModifier(fields[1]) {
+			return fields[2]
+		}
+		if len(fields) >= 3 && !isPlausibleCallsign(strings.ToUpper(fields[1])) {
 			return fields[2]
 		}
 		if len(fields) >= 2 {

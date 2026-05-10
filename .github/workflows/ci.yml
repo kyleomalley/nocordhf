@@ -1,6 +1,9 @@
 name: ci
 
 # Cheap correctness floor: build + vet + tests on every push and PR.
+# Runs on macOS (the primary target) and Linux (cheaper runner —
+# catches Cgo / X11 / ALSA regressions before a release tag is cut).
+# Windows isn't in CI to keep PR latency down; release.yml covers it.
 
 on:
   push:
@@ -9,7 +12,7 @@ on:
     branches: [main]
 
 jobs:
-  build:
+  build-mac:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -17,6 +20,26 @@ jobs:
         with:
           go-version: "1.26"
           check-latest: true
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test -short ./...
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          check-latest: true
+      - name: Install Cgo deps (Fyne GL + X11 + ALSA)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc libgl1-mesa-dev xorg-dev libasound2-dev
       - name: Build
         run: go build ./...
       - name: Vet

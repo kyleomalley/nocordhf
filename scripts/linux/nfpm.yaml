@@ -1,0 +1,61 @@
+# nfpm config that turns a built nocordhf binary + assets into a .deb
+# suitable for Debian / Ubuntu / Linux Mint / Pop!_OS / etc.
+#
+# Drives: nfpm pkg --packager deb --target build/nocordhf_<ver>_<arch>.deb
+#
+# Version + arch are passed via env vars (NOCORDHF_VERSION, NOCORDHF_ARCH)
+# so a single config file handles every release.
+
+name: nocordhf
+arch: ${NOCORDHF_ARCH}
+platform: linux
+version: ${NOCORDHF_VERSION}
+section: hamradio
+priority: optional
+maintainer: NocordHF <noreply@nocordhf.app>
+description: |
+  Discord-style chat-focused client for amateur radio modes.
+  FT8 with live waterfall, decode chat, HEARD sidebar, DXCC map,
+  ADIF / LoTW logging. MeshCore LoRa mesh chat over USB or BLE.
+homepage: https://github.com/kyleomalley/nocordhf
+license: GPL-3.0
+
+# Runtime libs the Cgo-backed binary dlopens — Fyne's GL backend
+# pulls in libGL via xorg, malgo brings in ALSA. Keeping these as
+# Depends rather than Recommends so apt refuses to install on a
+# system that can't actually run the binary.
+depends:
+  - libc6
+  - libgl1
+  - libx11-6
+  - libxcursor1
+  - libxrandr2
+  - libxinerama1
+  - libxi6
+  - libxxf86vm1
+  - libasound2
+
+contents:
+  # Binary lands at /usr/bin/nocordhf. /usr/local/bin would also
+  # work but /usr/bin is what dpkg expects packaged software to
+  # use; reserves /usr/local for the operator.
+  - src: build/nocordhf-linux-${NOCORDHF_ARCH}
+    dst: /usr/bin/nocordhf
+    file_info:
+      mode: 0755
+
+  # XDG desktop entry so GNOME/KDE/Xfce app menus pick up NocordHF
+  # without a manual `update-desktop-database`. Categories are the
+  # standard freedesktop.org HamRadio + Network combo.
+  - src: scripts/linux/nocordhf.desktop
+    dst: /usr/share/applications/nocordhf.desktop
+    file_info:
+      mode: 0644
+
+  # Icon at the standard hicolor 256x256 path so app menus + window
+  # managers find it via `Icon=nocordhf` in the .desktop file. PNG
+  # is universally supported; we already produce one for macOS.
+  - src: docs/icon.png
+    dst: /usr/share/icons/hicolor/256x256/apps/nocordhf.png
+    file_info:
+      mode: 0644
