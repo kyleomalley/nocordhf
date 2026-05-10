@@ -30,7 +30,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 
 	"fyne.io/fyne/v2/app"
@@ -762,11 +761,7 @@ func chdirIfBundled() {
 	_ = os.Chdir(dataDir)
 }
 
-// redirectStderr points FD 2 (and the Go runtime's panic destination) at
-// the given file. The Go runtime writes panic stacks to FD 2 directly via
-// syscall.Write, bypassing os.Stderr, so we have to dup at the FD level
-// rather than just reassigning os.Stderr. Best-effort — failure means we
-// just don't capture panics, no impact on normal execution.
-func redirectStderr(f *os.File) error {
-	return syscall.Dup2(int(f.Fd()), int(os.Stderr.Fd()))
-}
+// redirectStderr is implemented per-platform: redirect_unix.go uses
+// syscall.Dup2; redirect_windows.go uses windows.SetStdHandle. Both
+// route FD 2 (the destination the Go runtime writes panic stacks to)
+// at the supplied log file so crashes survive in nocordhf-stderr.log.
