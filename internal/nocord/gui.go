@@ -439,7 +439,7 @@ type GUI struct {
 	txActive     bool
 	activeStopCh chan struct{}
 	rxGainFn     func(float32) // called when RX gain slider changes; wired to capturer.SetRXGain
-	rxPeakLevel  float32      // most recent RX audio peak [0,1]; updated by main.go polling goroutine
+	rxPeakLevel  float32       // most recent RX audio peak [0,1]; updated by main.go polling goroutine
 
 	// Magnification popup — two modes:
 	//   - Preview (decodePopupPinned == false): driven by hover.

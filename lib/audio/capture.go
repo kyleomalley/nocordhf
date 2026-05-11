@@ -44,7 +44,7 @@ type Capturer struct {
 	wg         sync.WaitGroup
 	sinkMu     sync.RWMutex
 	sink       SampleSink
-	muted      atomic.Bool  // when true, incoming samples are zeroed (TX mute)
+	muted      atomic.Bool // when true, incoming samples are zeroed (TX mute)
 	dropped    atomic.Int64
 	rxGain     atomic.Uint64 // float64 bits; 0 = unset (treated as 1.0)
 	rxPeak     atomic.Uint32 // float32 bits; peak amplitude of most recent chunk
