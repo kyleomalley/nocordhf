@@ -34,7 +34,7 @@ Approve both when asked. If you skip a prompt you can re-enable
 it later under **System Settings → Privacy & Security**.
 
 
-### Build from source (Windows/Linux, Untested as of v1.1.0)
+### Build from source
 
 ```sh
 git clone https://github.com/kyleomalley/nocordhf
@@ -43,9 +43,27 @@ go build ./cmd/nocordhf
 ./nocordhf
 ```
 
-Requires Go 1.22+. macOS builds need Xcode command-line tools for
-the Fyne GL backend; Linux needs the standard X11 / OpenGL dev
-packages; Windows just needs MSYS / MinGW.
+Requires Go 1.22+ and a C toolchain (Cgo is required for Fyne's
+GL backend, malgo audio, and the BLE driver).
+
+**Per-platform build dependencies**:
+
+- **macOS** — Xcode command-line tools (`xcode-select --install`).
+- **Debian / Ubuntu / derivatives**:
+  ```sh
+  sudo apt-get install -y --no-install-recommends \
+    gcc libgl1-mesa-dev xorg-dev libasound2-dev
+  ```
+  `xorg-dev` brings in libx11 / xcursor / xrandr / xinerama / xi
+  in one go; `libgl1-mesa-dev` is the Fyne GL backend; `libasound2-dev`
+  is malgo's ALSA capture path. BlueZ is talked to over DBus at
+  runtime, no compile-time dev package needed.
+- **Fedora / RHEL**:
+  ```sh
+  sudo dnf install gcc mesa-libGL-devel libX11-devel libXcursor-devel \
+    libXrandr-devel libXinerama-devel libXi-devel alsa-lib-devel
+  ```
+- **Windows** — MSYS2 + MinGW gcc (or any cgo-capable Windows toolchain).
 
 For a proper macOS `.app` bundle (with the microphone +
 Bluetooth permission strings the OS expects), use:
@@ -53,6 +71,16 @@ Bluetooth permission strings the OS expects), use:
 ```sh
 fyne package -os darwin -icon docs/icon.png
 ```
+
+For a Debian `.deb` (icon, .desktop entry, runtime deps declared):
+
+```sh
+make release-linux NOCORDHF_VERSION=1.2.1
+```
+
+Outputs land under `./build/`. Same `release-win` and `release-mac`
+targets exist for the other platforms — see the Makefile for env-var
+prerequisites.
 
 ### First run — pick a mode
 

@@ -3,6 +3,59 @@
 All notable changes to NocordHF are tracked in this file. Version
 numbers follow [Semantic Versioning](https://semver.org/).
 
+## [1.2.1] - 2026-05-10
+
+### Release tooling
+
+- Bring forward the cross-platform pipeline fixes that were
+  authored on `release-1.1.1` but never reached `main` before
+  v1.2.0 was tagged. Net result: Linux + Windows release jobs
+  now succeed instead of failing on the same nfpm + syscall
+  bugs they hit in v1.1.1's first attempt:
+  - Linux: pre-render `nfpm.yaml` with `sed` so the contents.src
+    glob path expands `${NOCORDHF_ARCH}` reliably across nfpm
+    versions (previously failed `glob failed: ... no matching
+    files`).
+  - Windows: split `redirectStderr` into per-OS files
+    (`redirect_unix.go` keeps `syscall.Dup2`, `redirect_windows.go`
+    uses `windows.SetStdHandle`); without this Windows builds
+    failed with `undefined: syscall.Dup2`.
+  - Windows: pre-build the binary as canonical `NocordHF.exe`
+    before handing it to `fyne package --executable`. Fyne's
+    `--name` flag controls install-title metadata only, not the
+    .exe filename.
+- `FyneApp.toml` version bump (was stuck at 1.1.1 — v1.2.0
+  shipped an .app bundle with `CFBundleShortVersionString = 1.1.1`
+  on macOS).
+
+## [1.2.0] - 2026-05-10
+
+### Linux
+
+- Audio capture passes `nil` backend so malgo auto-picks ALSA or
+  PulseAudio at runtime — previously hard-coded to CoreAudio
+  which silently failed on Linux.
+- CAT scanner enumerates `/dev/ttyUSB*` and `/dev/ttyACM*` so
+  Digirig, CP210x, and FTDI cables auto-detect.
+
+### Settings
+
+- Radio tab reorganised into RADIO / CAT / AUDIO sections.
+- Audio device selection: explicit RX and TX dropdowns
+  populated with real device names from the active backend
+  (replaces the single `-audio` flag for runtime selection).
+- CAT **Connect** button turns green (SuccessImportance) when
+  the radio responds, so the operator sees a clear "wired up"
+  signal instead of guessing.
+- RX gain slider (0.5×–4×) with live callback to the capturer;
+  persisted to prefs.
+- RX level meter as a `ProgressBar` updating ~12 Hz from the
+  audio-thread peak — replaces the `canvas.Raster` level bars
+  which were unreliable across themes.
+- TX debug WAV recordings now land in a `recordings/` directory
+  for post-mortem analysis.
+- Settings tips rewritten as a bullet list for scanability.
+
 ## [1.1.1] - 2026-05-09
 
 ### Release tooling
