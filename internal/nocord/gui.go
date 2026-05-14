@@ -1656,8 +1656,95 @@ func (g *GUI) showMeshcoreSettings() {
 		widget.NewLabel("Manual-add: when checked, the radio stops auto-adding every node it hears. New peers must be added explicitly — useful on busy meshes where the contact table fills up."),
 	)
 
+	// ── Radio tab ────────────────────────────────────────────────
+	// LoRa physical-layer config (frequency, bandwidth, SF, CR,
+	// TX power). Mismatched params cause silent on-air decode
+	// failures — every node on the mesh has to agree on these for
+	// each other to hear them. Region-preset dropdown auto-fills
+	// regulator-correct defaults; the operator can tweak any field
+	// after picking a preset.
+	const presetCustom = "Custom"
+	regionOpts := []string{presetCustom}
+	for _, p := range meshcore.Presets {
+		regionOpts = append(regionOpts, p.Name)
+	}
+	regionSel := widget.NewSelect(regionOpts, nil)
+	freqEntry := widget.NewEntry()
+	freqEntry.SetPlaceHolder("MHz, e.g. 915.000")
+	bwSel := widget.NewSelect([]string{"125", "250", "500"}, nil)
+	bwSel.PlaceHolder = "kHz"
+	sfSel := widget.NewSelect([]string{"7", "8", "9", "10", "11", "12"}, nil)
+	sfSel.PlaceHolder = "spreading factor"
+	crSel := widget.NewSelect([]string{"5 (4/5)", "6 (4/6)", "7 (4/7)", "8 (4/8)"}, nil)
+	crSel.PlaceHolder = "coding rate"
+	txPowerEntry := widget.NewEntry()
+	txPowerEntry.SetPlaceHolder("dBm, 0–22")
+	radioStatus := canvas.NewText("", color.RGBA{160, 165, 175, 255})
+	radioStatus.TextStyle = fyne.TextStyle{Monospace: true}
+	radioStatus.TextSize = 11
+	// Hydrate from prefs. If nothing's saved yet the entries stay
+	// blank with placeholder text — the operator picks a preset to
+	// populate them.
+	if v := prefs.IntWithFallback(mcPrefRadioFreqHz, 0); v > 0 {
+		freqEntry.SetText(strconv.FormatFloat(float64(v)/1e6, 'f', 3, 64))
+	}
+	if v := prefs.IntWithFallback(mcPrefRadioBwHz, 0); v > 0 {
+		bwSel.SetSelected(strconv.Itoa(v / 1000))
+	}
+	if v := prefs.IntWithFallback(mcPrefRadioSF, 0); v >= 7 && v <= 12 {
+		sfSel.SetSelected(strconv.Itoa(v))
+	}
+	if v := prefs.IntWithFallback(mcPrefRadioCR, 0); v >= 5 && v <= 8 {
+		// Match the option labels; map int back to "N (4/N)" form.
+		for _, opt := range crSel.Options {
+			if strings.HasPrefix(opt, strconv.Itoa(v)+" ") {
+				crSel.SetSelected(opt)
+				break
+			}
+		}
+	}
+	if v := prefs.IntWithFallback(mcPrefRadioTxDbm, 0); v > 0 {
+		txPowerEntry.SetText(strconv.Itoa(v))
+	}
+	regionSel.OnChanged = func(name string) {
+		preset, ok := meshcore.PresetByName(name)
+		if !ok {
+			return // "Custom" — leave fields as-is
+		}
+		freqEntry.SetText(strconv.FormatFloat(float64(preset.FreqHz)/1e6, 'f', 3, 64))
+		bwSel.SetSelected(strconv.Itoa(int(preset.BwHz / 1000)))
+		sfSel.SetSelected(strconv.Itoa(int(preset.SF)))
+		for _, opt := range crSel.Options {
+			if strings.HasPrefix(opt, strconv.Itoa(int(preset.CR))+" ") {
+				crSel.SetSelected(opt)
+				break
+			}
+		}
+		txPowerEntry.SetText(strconv.Itoa(int(preset.TxPower)))
+		radioStatus.Text = "preset: " + preset.Note
+		radioStatus.Refresh()
+	}
+	// Default to Custom so loaded prefs aren't clobbered if the
+	// operator just opens the dialog and clicks Save.
+	regionSel.SetSelected(presetCustom)
+
+	radioForm := widget.NewForm(
+		widget.NewFormItem("Region preset", regionSel),
+		widget.NewFormItem("Frequency", freqEntry),
+		widget.NewFormItem("Bandwidth (kHz)", bwSel),
+		widget.NewFormItem("Spreading factor", sfSel),
+		widget.NewFormItem("Coding rate", crSel),
+		widget.NewFormItem("TX power (dBm)", txPowerEntry),
+	)
+	radioTab := container.NewVBox(
+		radioForm,
+		radioStatus,
+		widget.NewLabel("Radio settings push to the connected device on Save. Every node on the mesh must use matching frequency, bandwidth, SF, and CR — mismatches cause silent decode failures. Pick a regional preset first; tweak only if you know your repeater uses a non-standard config."),
+	)
+
 	tabs := container.NewAppTabs(
 		container.NewTabItem("Device", deviceTab),
+		container.NewTabItem("Radio", radioTab),
 		container.NewTabItem("Profile", profileTab),
 	)
 	d := dialog.NewCustomConfirm(
@@ -1700,6 +1787,40 @@ func (g *GUI) showMeshcoreSettings() {
 			prefs.SetFloat(mcPrefProfileLon, lonF)
 			manualAdd := manualAddCheck.Checked
 			prefs.SetBool(mcPrefProfileManualAdd, manualAdd)
+			// Radio tab persistence + push. Parsing is forgiving:
+			// blank or unparseable fields skip the corresponding
+			// SetRadioParams / SetTxPower call so the operator can
+			// save partial config without clobbering the radio.
+			freqMHz, _ := strconv.ParseFloat(strings.TrimSpace(freqEntry.Text), 64)
+			freqHz := uint32(freqMHz * 1e6)
+			bwKHz, _ := strconv.Atoi(strings.TrimSpace(bwSel.Selected))
+			bwHz := uint32(bwKHz * 1000)
+			sfVal, _ := strconv.Atoi(strings.TrimSpace(sfSel.Selected))
+			crVal := 0
+			if crSel.Selected != "" {
+				// "5 (4/5)" → 5
+				if i := strings.IndexByte(crSel.Selected, ' '); i > 0 {
+					crVal, _ = strconv.Atoi(crSel.Selected[:i])
+				} else {
+					crVal, _ = strconv.Atoi(crSel.Selected)
+				}
+			}
+			txDbm, _ := strconv.Atoi(strings.TrimSpace(txPowerEntry.Text))
+			if freqHz > 0 {
+				prefs.SetInt(mcPrefRadioFreqHz, int(freqHz))
+			}
+			if bwHz > 0 {
+				prefs.SetInt(mcPrefRadioBwHz, int(bwHz))
+			}
+			if sfVal >= 7 && sfVal <= 12 {
+				prefs.SetInt(mcPrefRadioSF, sfVal)
+			}
+			if crVal >= 5 && crVal <= 8 {
+				prefs.SetInt(mcPrefRadioCR, crVal)
+			}
+			if txDbm > 0 && txDbm <= 30 {
+				prefs.SetInt(mcPrefRadioTxDbm, txDbm)
+			}
 			g.mcMu.Lock()
 			client := g.mcClient
 			g.mcMu.Unlock()
@@ -1718,6 +1839,25 @@ func (g *GUI) showMeshcoreSettings() {
 					}
 					if err := client.SetManualAddContacts(manualAdd); err != nil {
 						g.mcAppendSystem("SetManualAddContacts: " + err.Error())
+					}
+					// Radio params are an all-or-nothing push: the
+					// firmware's CmdSetRadioParams takes all four
+					// (freq/bw/sf/cr) in one frame, so we only fire
+					// when every value is valid. TX power is a
+					// separate call and pushes independently.
+					if freqHz > 0 && bwHz > 0 && sfVal >= 7 && sfVal <= 12 && crVal >= 5 && crVal <= 8 {
+						if err := client.SetRadioParams(freqHz, bwHz, uint8(sfVal), uint8(crVal)); err != nil {
+							g.mcAppendSystem("SetRadioParams: " + err.Error())
+						} else {
+							g.mcAppendSystem(fmt.Sprintf("radio params: %.3f MHz / %d kHz / SF%d / CR4-%d", float64(freqHz)/1e6, bwHz/1000, sfVal, crVal))
+						}
+					}
+					if txDbm > 0 && txDbm <= 30 {
+						if err := client.SetTxPower(uint8(txDbm)); err != nil {
+							g.mcAppendSystem("SetTxPower: " + err.Error())
+						} else {
+							g.mcAppendSystem(fmt.Sprintf("TX power: %d dBm", txDbm))
+						}
 					}
 				}()
 			}
@@ -5760,6 +5900,16 @@ const (
 	mcPrefProfileLat       = "meshcore.profile.lat"
 	mcPrefProfileLon       = "meshcore.profile.lon"
 	mcPrefProfileManualAdd = "meshcore.profile.manual_add"
+	// Radio tab — LoRa physical layer. Stored in wire-native units
+	// (Hz for freq + bw, raw integers for SF/CR/dBm) so the values
+	// hand straight to Client.SetRadioParams / SetTxPower without
+	// per-launch conversion. The GUI converts to MHz / kHz at
+	// display time so the operator sees natural units.
+	mcPrefRadioFreqHz = "meshcore.radio.freq_hz"
+	mcPrefRadioBwHz   = "meshcore.radio.bw_hz"
+	mcPrefRadioSF     = "meshcore.radio.sf"
+	mcPrefRadioCR     = "meshcore.radio.cr"
+	mcPrefRadioTxDbm  = "meshcore.radio.tx_power_dbm"
 	// Auto-reconnect interval in MINUTES. 0 disables. Default 5 min
 	// is a battery-conscious choice for BLE-attached trackers like
 	// the T1000-E — aggressive reconnect would keep the radio's

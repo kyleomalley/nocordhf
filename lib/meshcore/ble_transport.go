@@ -176,10 +176,10 @@ func newBLETransport(address string, connectTimeout time.Duration) (t *bleTransp
 	// Calling DiscoverServices on the zero value then panics inside
 	// tinygo. Detect via the all-zero address — a real peripheral
 	// always has a non-zero CoreBluetooth UUID.
-	// bluetooth.UUID is a comparable struct (id [4]uint32), so the
-	// zero check is a plain ==. A real macOS peripheral always has
-	// a non-zero CoreBluetooth UUID populated by Connect.
-	if device.Address.UUID == (bluetooth.UUID{}) {
+	// Per-platform zero-Device check. The "Connect returned a zero
+	// Device" failure mode is darwin-specific (see bleDeviceLooksZero
+	// in ble_zero_darwin.go); other platforms report failures via err.
+	if bleDeviceLooksZero(device) {
 		return nil, fmt.Errorf("meshcore: BLE connect %s: peer handle is zero (driver returned no error but no peripheral)", address)
 	}
 	svcUUID, _ := bluetooth.ParseUUID(BLEServiceUUID)
