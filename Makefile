@@ -85,12 +85,20 @@ release-mac:
 		fyne package --target darwin --executable ./nocordhf --src ../cmd/nocordhf --icon $(CURDIR)/docs/icon.png --app-id com.nocordhf.app --name NocordHF --app-version $(NOCORDHF_VERSION) --release
 	cp ./build/nocordhf.universal ./build/NocordHF.app/Contents/MacOS/nocordhf
 	rm ./build/nocordhf ./build/nocordhf.universal
-	@echo "==> patching Info.plist (NSMicrophoneUsageDescription, LSMinimumSystemVersion)"
+	@echo "==> patching Info.plist (usage descriptions, LSMinimumSystemVersion)"
 	# fyne package silently drops the FyneApp.toml [macOS] section, so
-	# without these keys the app gets a silent CoreAudio denial under
-	# the hardened runtime and FT8 RX decodes nothing.
+	# without these keys we get silent OS denials under the hardened
+	# runtime: CoreAudio refuses mic capture (FT8 RX decodes nothing),
+	# CoreBluetooth refuses GATT scans (MeshCore BLE never connects).
+	# LSMinimumSystemVersion = 13.0 keeps macOS 26 (Tahoe) on the
+	# modern AppKit init path — declaring an older minimum (11.0)
+	# routes Finder-launched processes through a legacy paste-
+	# telemetry XPC call that watchdog-aborts during +[NSApplication
+	# initialize], crashing the app on Finder double-click while
+	# Terminal launches still work.
 	plutil -insert NSMicrophoneUsageDescription -string "NocordHF captures audio from your radio's USB CODEC interface to decode FT8 transmissions." ./build/NocordHF.app/Contents/Info.plist
-	plutil -replace LSMinimumSystemVersion -string "11.0" ./build/NocordHF.app/Contents/Info.plist
+	plutil -insert NSBluetoothAlwaysUsageDescription -string "NocordHF connects to MeshCore companion-firmware LoRa radios over Bluetooth Low Energy." ./build/NocordHF.app/Contents/Info.plist
+	plutil -replace LSMinimumSystemVersion -string "13.0" ./build/NocordHF.app/Contents/Info.plist
 	@echo "==> codesigning .app with hardened runtime + audio-input entitlement"
 	codesign --force --deep --options runtime --timestamp \
 		--entitlements ./scripts/macos/entitlements.plist \
