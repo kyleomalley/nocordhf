@@ -783,23 +783,29 @@ func (c *Client) ResetPath(pub PubKey) error {
 }
 
 // SetRadioParams configures the LoRa physical layer:
-//   - freqHz: carrier frequency in Hz (e.g. 915000000 for 915 MHz).
-//   - bwHz:   bandwidth in Hz (typical: 125000, 250000, 500000).
-//   - sf:     spreading factor (7-12). Higher = more range, slower.
-//   - cr:     coding rate denominator (5-8 → 4/5..4/8).
+//   - freqKHz: carrier frequency in **kHz** (e.g. 915000 for 915 MHz,
+//     927875 for 927.875 MHz). NOT Hz — the firmware's wire format
+//     and selfInfo readback both use kHz; sending Hz makes the
+//     value 1000× too large and the firmware returns RespErr
+//     (ErrIllegalArg) without any further detail.
+//   - bwHz:    bandwidth in **Hz** (e.g. 125000, 250000, 500000).
+//     This one IS Hz on the wire — the asymmetry is upstream's,
+//     not ours; verified against meshcore-web's SettingsPage.vue.
+//   - sf:      spreading factor (7-12). Higher = more range, slower.
+//   - cr:      coding rate denominator (5-8 → 4/5..4/8).
 //
 // Mirrors meshcore.js sendCommandSetRadioParams. Wire format is
-// cmd byte + uint32LE freq + uint32LE bw + byte sf + byte cr.
+// cmd byte + uint32LE freq(kHz) + uint32LE bw(Hz) + byte sf + byte cr.
 // Returns error on RespErr or transport failure.
 //
 // Mismatched radio params cause silent on-air decode failures —
 // every node on the mesh must agree on freq/bw/sf/cr to hear
 // each other. Region presets in regions.go encode the common
 // configurations the MeshCore community uses.
-func (c *Client) SetRadioParams(freqHz, bwHz uint32, sf, cr uint8) error {
+func (c *Client) SetRadioParams(freqKHz, bwHz uint32, sf, cr uint8) error {
 	payload := make([]byte, 0, 1+4+4+1+1)
 	payload = append(payload, byte(CmdSetRadioParams))
-	payload = appendUint32LE(payload, freqHz)
+	payload = appendUint32LE(payload, freqKHz)
 	payload = appendUint32LE(payload, bwHz)
 	payload = append(payload, sf, cr)
 	return c.callWithTimeout(payload, awaitOk)

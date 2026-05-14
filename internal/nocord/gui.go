@@ -1693,8 +1693,10 @@ func (g *GUI) showMeshcoreSettings() {
 	// Hydrate from prefs. If nothing's saved yet the entries stay
 	// blank with placeholder text — the operator picks a preset to
 	// populate them.
-	if v := prefs.IntWithFallback(mcPrefRadioFreqHz, 0); v > 0 {
-		freqEntry.SetText(strconv.FormatFloat(float64(v)/1e6, 'f', 3, 64))
+	if v := prefs.IntWithFallback(mcPrefRadioFreqKHz, 0); v > 0 {
+		// Pref stores kHz; display as MHz with 3 decimal places
+		// (sub-kHz tuning isn't a thing on these LoRa radios).
+		freqEntry.SetText(strconv.FormatFloat(float64(v)/1000.0, 'f', 3, 64))
 	}
 	if v := prefs.IntWithFallback(mcPrefRadioBwHz, 0); v > 0 {
 		// %g strips trailing zeros: 62500 → "62.5", 125000 → "125".
@@ -1722,7 +1724,7 @@ func (g *GUI) showMeshcoreSettings() {
 		if !ok {
 			return // "Custom" — leave fields as-is
 		}
-		freqEntry.SetText(strconv.FormatFloat(float64(preset.FreqHz)/1e6, 'f', 3, 64))
+		freqEntry.SetText(strconv.FormatFloat(float64(preset.FreqKHz)/1000.0, 'f', 3, 64))
 		bwSel.SetSelected(fmt.Sprintf("%g", float64(preset.BwHz)/1000.0))
 		sfSel.SetSelected(strconv.Itoa(int(preset.SF)))
 		for _, opt := range crSel.Options {
@@ -1803,7 +1805,10 @@ func (g *GUI) showMeshcoreSettings() {
 			// SetRadioParams / SetTxPower call so the operator can
 			// save partial config without clobbering the radio.
 			freqMHz, _ := strconv.ParseFloat(strings.TrimSpace(freqEntry.Text), 64)
-			freqHz := uint32(freqMHz * 1e6)
+			// SetRadioParams expects kHz on the wire, not Hz.
+			// Sending Hz makes the value 1000× too large and the
+			// firmware returns RespErr (ErrIllegalArg).
+			freqKHz := uint32(freqMHz * 1000)
 			bwKHz, _ := strconv.ParseFloat(strings.TrimSpace(bwSel.Selected), 64)
 			bwHz := uint32(bwKHz * 1000)
 			sfVal, _ := strconv.Atoi(strings.TrimSpace(sfSel.Selected))
@@ -1817,8 +1822,8 @@ func (g *GUI) showMeshcoreSettings() {
 				}
 			}
 			txDbm, _ := strconv.Atoi(strings.TrimSpace(txPowerEntry.Text))
-			if freqHz > 0 {
-				prefs.SetInt(mcPrefRadioFreqHz, int(freqHz))
+			if freqKHz > 0 {
+				prefs.SetInt(mcPrefRadioFreqKHz, int(freqKHz))
 			}
 			if bwHz > 0 {
 				prefs.SetInt(mcPrefRadioBwHz, int(bwHz))
@@ -1856,11 +1861,12 @@ func (g *GUI) showMeshcoreSettings() {
 					// (freq/bw/sf/cr) in one frame, so we only fire
 					// when every value is valid. TX power is a
 					// separate call and pushes independently.
-					if freqHz > 0 && bwHz > 0 && sfVal >= 7 && sfVal <= 12 && crVal >= 5 && crVal <= 8 {
-						if err := client.SetRadioParams(freqHz, bwHz, uint8(sfVal), uint8(crVal)); err != nil {
+					if freqKHz > 0 && bwHz > 0 && sfVal >= 7 && sfVal <= 12 && crVal >= 5 && crVal <= 8 {
+						if err := client.SetRadioParams(freqKHz, bwHz, uint8(sfVal), uint8(crVal)); err != nil {
 							g.mcAppendSystem("SetRadioParams: " + err.Error())
 						} else {
-							g.mcAppendSystem(fmt.Sprintf("radio params: %.3f MHz / %d kHz / SF%d / CR4-%d", float64(freqHz)/1e6, bwHz/1000, sfVal, crVal))
+							// Display freq as MHz with 3 decimals to match the Settings input.
+							g.mcAppendSystem(fmt.Sprintf("radio params: %.3f MHz / %g kHz / SF%d / CR4-%d", float64(freqKHz)/1000.0, float64(bwHz)/1000.0, sfVal, crVal))
 						}
 					}
 					if txDbm > 0 && txDbm <= 30 {
@@ -5916,11 +5922,17 @@ const (
 	// hand straight to Client.SetRadioParams / SetTxPower without
 	// per-launch conversion. The GUI converts to MHz / kHz at
 	// display time so the operator sees natural units.
-	mcPrefRadioFreqHz = "meshcore.radio.freq_hz"
-	mcPrefRadioBwHz   = "meshcore.radio.bw_hz"
-	mcPrefRadioSF     = "meshcore.radio.sf"
-	mcPrefRadioCR     = "meshcore.radio.cr"
-	mcPrefRadioTxDbm  = "meshcore.radio.tx_power_dbm"
+	// Frequency stored in kHz (wire-native unit for SetRadioParams,
+	// even though bandwidth on the same command is in Hz — that's
+	// upstream's asymmetry, not ours). Pref key renamed from
+	// `freq_hz` to force-discard any pre-fix saved values that were
+	// stored as Hz and would otherwise be interpreted 1000× too
+	// large after the unit fix.
+	mcPrefRadioFreqKHz = "meshcore.radio.freq_khz"
+	mcPrefRadioBwHz    = "meshcore.radio.bw_hz"
+	mcPrefRadioSF      = "meshcore.radio.sf"
+	mcPrefRadioCR      = "meshcore.radio.cr"
+	mcPrefRadioTxDbm   = "meshcore.radio.tx_power_dbm"
 	// Auto-reconnect interval in MINUTES. 0 disables. Default 5 min
 	// is a battery-conscious choice for BLE-attached trackers like
 	// the T1000-E — aggressive reconnect would keep the radio's

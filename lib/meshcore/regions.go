@@ -22,8 +22,8 @@ package meshcore
 // licence-exempt LoRa operation.
 type RadioPreset struct {
 	Name    string
-	FreqHz  uint32
-	BwHz    uint32
+	FreqKHz uint32 // wire-native unit for SetRadioParams (915.000 MHz = 915000).
+	BwHz    uint32 // wire-native unit for SetRadioParams (125 kHz = 125000).
 	SF      uint8
 	CR      uint8
 	TxPower uint8 // dBm
@@ -39,7 +39,7 @@ type RadioPreset struct {
 var Presets = []RadioPreset{
 	{
 		Name:    "US 915 MHz",
-		FreqHz:  915000000,
+		FreqKHz: 915000,
 		BwHz:    250000,
 		SF:      11,
 		CR:      5,
@@ -48,7 +48,7 @@ var Presets = []RadioPreset{
 	},
 	{
 		Name:    "EU 868 MHz",
-		FreqHz:  869525000,
+		FreqKHz: 869525,
 		BwHz:    250000,
 		SF:      11,
 		CR:      5,
@@ -57,7 +57,7 @@ var Presets = []RadioPreset{
 	},
 	{
 		Name:    "AU 915 MHz",
-		FreqHz:  915000000,
+		FreqKHz: 915000,
 		BwHz:    250000,
 		SF:      11,
 		CR:      5,
@@ -66,7 +66,7 @@ var Presets = []RadioPreset{
 	},
 	{
 		Name:    "JP 920 MHz",
-		FreqHz:  921000000,
+		FreqKHz: 921000,
 		BwHz:    125000,
 		SF:      11,
 		CR:      5,
@@ -81,7 +81,7 @@ var Presets = []RadioPreset{
 	// antennas can dial down per local repeater operator guidance.
 	{
 		Name:    "SoCal",
-		FreqHz:  927875000,
+		FreqKHz: 927875,
 		BwHz:    62500,
 		SF:      7,
 		CR:      5,
@@ -90,7 +90,7 @@ var Presets = []RadioPreset{
 	},
 	{
 		Name:    "San Francisco",
-		FreqHz:  910525000,
+		FreqKHz: 910525,
 		BwHz:    62500,
 		SF:      7,
 		CR:      5,
@@ -99,7 +99,7 @@ var Presets = []RadioPreset{
 	},
 	{
 		Name:    "Sacramento",
-		FreqHz:  909875000,
+		FreqKHz: 909875,
 		BwHz:    62500,
 		SF:      9,
 		CR:      5,
@@ -108,7 +108,7 @@ var Presets = []RadioPreset{
 	},
 	{
 		Name:    "Pacific No. West",
-		FreqHz:  910525000,
+		FreqKHz: 910525,
 		BwHz:    62500,
 		SF:      7,
 		CR:      5,
