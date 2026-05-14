@@ -911,7 +911,7 @@ func parseSelfInfo(b []byte) (SelfInfo, error) {
 	if info.ManualAddContacts, err = r.byte_(); err != nil {
 		return info, err
 	}
-	if info.RadioFreqHz, err = r.uint32LE(); err != nil {
+	if info.RadioFreqKHz, err = r.uint32LE(); err != nil {
 		return info, err
 	}
 	if info.RadioBwHz, err = r.uint32LE(); err != nil {

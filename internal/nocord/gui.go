@@ -1690,34 +1690,58 @@ func (g *GUI) showMeshcoreSettings() {
 	radioStatus := canvas.NewText("", color.RGBA{160, 165, 175, 255})
 	radioStatus.TextStyle = fyne.TextStyle{Monospace: true}
 	radioStatus.TextSize = 11
-	// Hydrate from prefs. If nothing's saved yet the entries stay
-	// blank with placeholder text — the operator picks a preset to
-	// populate them.
-	if v := prefs.IntWithFallback(mcPrefRadioFreqKHz, 0); v > 0 {
-		// Pref stores kHz; display as MHz with 3 decimal places
-		// (sub-kHz tuning isn't a thing on these LoRa radios).
-		freqEntry.SetText(strconv.FormatFloat(float64(v)/1000.0, 'f', 3, 64))
+	// Hydrate. Source-of-truth priority is:
+	//   1) Live SelfInfo from the connected radio (what's actually
+	//      programmed right now — beats whatever we last saved if
+	//      e.g. another tool tuned the radio between sessions).
+	//   2) Prefs (last-saved values, used when disconnected).
+	// Empty values fall through to placeholder text and the
+	// operator picks a preset to populate them.
+	g.mcMu.Lock()
+	liveInfo := g.mcSelfInfo
+	liveConnected := g.mcClient != nil
+	g.mcMu.Unlock()
+	freqKHzInit := uint32(0)
+	bwHzInit := uint32(0)
+	sfInit := 0
+	crInit := 0
+	txInit := 0
+	if liveConnected && liveInfo.RadioFreqKHz > 0 {
+		freqKHzInit = liveInfo.RadioFreqKHz
+		bwHzInit = liveInfo.RadioBwHz
+		sfInit = int(liveInfo.RadioSF)
+		crInit = int(liveInfo.RadioCR)
+		txInit = int(liveInfo.TxPower)
+	} else {
+		freqKHzInit = uint32(prefs.IntWithFallback(mcPrefRadioFreqKHz, 0))
+		bwHzInit = uint32(prefs.IntWithFallback(mcPrefRadioBwHz, 0))
+		sfInit = prefs.IntWithFallback(mcPrefRadioSF, 0)
+		crInit = prefs.IntWithFallback(mcPrefRadioCR, 0)
+		txInit = prefs.IntWithFallback(mcPrefRadioTxDbm, 0)
 	}
-	if v := prefs.IntWithFallback(mcPrefRadioBwHz, 0); v > 0 {
+	if freqKHzInit > 0 {
+		freqEntry.SetText(strconv.FormatFloat(float64(freqKHzInit)/1000.0, 'f', 3, 64))
+	}
+	if bwHzInit > 0 {
 		// %g strips trailing zeros: 62500 → "62.5", 125000 → "125".
 		// Matches the dropdown options exactly so SetSelected hits
 		// rather than no-op'ing on a missing entry.
-		bwSel.SetSelected(fmt.Sprintf("%g", float64(v)/1000.0))
+		bwSel.SetSelected(fmt.Sprintf("%g", float64(bwHzInit)/1000.0))
 	}
-	if v := prefs.IntWithFallback(mcPrefRadioSF, 0); v >= 7 && v <= 12 {
-		sfSel.SetSelected(strconv.Itoa(v))
+	if sfInit >= 7 && sfInit <= 12 {
+		sfSel.SetSelected(strconv.Itoa(sfInit))
 	}
-	if v := prefs.IntWithFallback(mcPrefRadioCR, 0); v >= 5 && v <= 8 {
+	if crInit >= 5 && crInit <= 8 {
 		// Match the option labels; map int back to "N (4/N)" form.
 		for _, opt := range crSel.Options {
-			if strings.HasPrefix(opt, strconv.Itoa(v)+" ") {
+			if strings.HasPrefix(opt, strconv.Itoa(crInit)+" ") {
 				crSel.SetSelected(opt)
 				break
 			}
 		}
 	}
-	if v := prefs.IntWithFallback(mcPrefRadioTxDbm, 0); v > 0 {
-		txPowerEntry.SetText(strconv.Itoa(v))
+	if txInit > 0 {
+		txPowerEntry.SetText(strconv.Itoa(txInit))
 	}
 	regionSel.OnChanged = func(name string) {
 		preset, ok := meshcore.PresetByName(name)
@@ -1867,6 +1891,15 @@ func (g *GUI) showMeshcoreSettings() {
 						} else {
 							// Display freq as MHz with 3 decimals to match the Settings input.
 							g.mcAppendSystem(fmt.Sprintf("radio params: %.3f MHz / %g kHz / SF%d / CR4-%d", float64(freqKHz)/1000.0, float64(bwHz)/1000.0, sfVal, crVal))
+							// Mirror into mcSelfInfo so the next Settings
+							// open shows the just-applied values rather
+							// than the stale snapshot from AppStart.
+							g.mcMu.Lock()
+							g.mcSelfInfo.RadioFreqKHz = freqKHz
+							g.mcSelfInfo.RadioBwHz = bwHz
+							g.mcSelfInfo.RadioSF = uint8(sfVal)
+							g.mcSelfInfo.RadioCR = uint8(crVal)
+							g.mcMu.Unlock()
 						}
 					}
 					if txDbm > 0 && txDbm <= 30 {
@@ -1874,6 +1907,9 @@ func (g *GUI) showMeshcoreSettings() {
 							g.mcAppendSystem("SetTxPower: " + err.Error())
 						} else {
 							g.mcAppendSystem(fmt.Sprintf("TX power: %d dBm", txDbm))
+							g.mcMu.Lock()
+							g.mcSelfInfo.TxPower = uint8(txDbm)
+							g.mcMu.Unlock()
 						}
 					}
 				}()

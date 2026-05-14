@@ -98,11 +98,15 @@ type SelfInfo struct {
 	AdvLatE6          int32
 	AdvLonE6          int32
 	ManualAddContacts byte
-	RadioFreqHz       uint32
-	RadioBwHz         uint32
-	RadioSF           byte
-	RadioCR           byte
-	Name              string
+	// RadioFreqKHz is the carrier frequency in **kHz** (not Hz). The
+	// firmware's selfInfo packet and SetRadioParams wire format both
+	// use kHz for frequency; only BW is in Hz. Verified against
+	// meshcore-web's SettingsPage.vue (radioFreq / 1000 → MHz).
+	RadioFreqKHz uint32
+	RadioBwHz    uint32
+	RadioSF      byte
+	RadioCR      byte
+	Name         string
 }
 
 // SentResult is the radio's synchronous acknowledgement of a Send*
