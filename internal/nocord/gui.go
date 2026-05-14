@@ -9005,6 +9005,16 @@ func (g *GUI) connectMeshcore() {
 					g.mcFavorites = favs
 				}
 				g.mcMu.Unlock()
+				// One-shot purge of legacy slot-keyed channel
+				// buckets ("channel:0", "channel:1", …) left
+				// behind by the slot-to-secret keying change.
+				// Idempotent — re-runs are no-ops once the
+				// orphans are gone.
+				if n, err := store.PurgeLegacyChannelBuckets(); err != nil {
+					g.mcAppendSystem("legacy channel cleanup: " + err.Error())
+				} else if n > 0 {
+					g.mcAppendSystem(fmt.Sprintf("cleaned up %d orphaned channel history bucket(s) from before the secret-keying fix", n))
+				}
 				if all, err := store.LoadAll(maxRows); err == nil && len(all) > 0 {
 					g.mcMu.Lock()
 					if g.mcThreadHistory == nil {

@@ -129,6 +129,16 @@ const (
 	ErrIllegalArg     ErrCode = 6
 )
 
+// StatsType selects which slice of GetStats output the firmware
+// returns. Mirrors meshcore.js Constants.StatsTypes.
+type StatsType byte
+
+const (
+	StatsTypeCore    StatsType = 0
+	StatsTypeRadio   StatsType = 1
+	StatsTypePackets StatsType = 2
+)
+
 // AdvType is the contact / advertisement type carried in an advert
 // app-data flags byte (low 4 bits).
 type AdvType byte

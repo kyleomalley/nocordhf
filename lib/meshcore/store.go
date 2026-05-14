@@ -181,6 +181,70 @@ func nanosKey(t time.Time) []byte {
 // a single OpenStore call hydrates everything.
 var favoritesBucket = []byte("__favorites")
 
+// PurgeLegacyChannelBuckets deletes channel chat-history buckets
+// keyed by the firmware's slot index ("channel:0", "channel:1",
+// …). The current keying is "channel:<16-hex-secret-id>" so any
+// bucket whose name matches the legacy `channel:<digits>` shape is
+// orphaned — it can never be re-attached to a live channel because
+// the lookup path no longer produces that key shape. Returns the
+// number of buckets deleted; safe to call repeatedly (no-op once
+// the legacy buckets are gone).
+//
+// Worth doing because legacy buckets are silently displayed by
+// Store.LoadAll, which seeds in-memory chat history on connect —
+// without the purge, an operator who reuses a slot would see the
+// previous occupant's messages bleed in until the bucket grew
+// past whatever max-rows window the GUI applies.
+func (s *Store) PurgeLegacyChannelBuckets() (int, error) {
+	if s == nil || s.db == nil {
+		return 0, nil
+	}
+	deleted := 0
+	err := s.db.Update(func(tx *bbolt.Tx) error {
+		var stale [][]byte
+		err := tx.ForEach(func(name []byte, _ *bbolt.Bucket) error {
+			if isLegacyChannelBucketName(name) {
+				stale = append(stale, append([]byte(nil), name...))
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		for _, name := range stale {
+			if err := tx.DeleteBucket(name); err != nil {
+				return err
+			}
+			deleted++
+		}
+		return nil
+	})
+	return deleted, err
+}
+
+// isLegacyChannelBucketName matches "channel:<one-or-more-digits>"
+// — the pre-secret-keying thread ID format. The new format is
+// "channel:<16 hex chars>", so the digit-only suffix can't collide
+// with a current key (16 hex chars is always longer than 3 digits
+// for any plausible slot index, and contains a-f for any non-zero
+// channel given a SHA-256 prefix).
+func isLegacyChannelBucketName(name []byte) bool {
+	const prefix = "channel:"
+	if len(name) <= len(prefix) {
+		return false
+	}
+	if string(name[:len(prefix)]) != prefix {
+		return false
+	}
+	suffix := name[len(prefix):]
+	for _, b := range suffix {
+		if b < '0' || b > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // SetFavorite marks (on=true) or unmarks (on=false) a contact as
 // favourite. Persisted across launches so the operator's pinned
 // peers survive a relaunch + bbolt re-open.

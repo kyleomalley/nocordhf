@@ -820,6 +820,193 @@ func (c *Client) SetTxPower(dBm uint8) error {
 	return c.callWithTimeout(payload, awaitOk)
 }
 
+// GetBatteryVoltage returns the radio's current battery voltage in
+// millivolts. Wire format: cmd byte → uint16LE millivolts.
+// Returns 0 + nil error on radios that don't expose a battery
+// (mains-powered repeaters), since the firmware still answers
+// the request with a zeroed payload.
+func (c *Client) GetBatteryVoltage() (uint16, error) {
+	payload := []byte{byte(CmdGetBatteryVoltage)}
+	var mv uint16
+	err := c.callWithTimeout(payload, func(frame Frame) (bool, error) {
+		if e := errFromFrame(frame); e != nil {
+			return true, e
+		}
+		if ResponseCode(frame.Payload[0]) != RespBatteryVoltage {
+			return false, nil
+		}
+		r := newBufReader(frame.Payload[1:])
+		v, err := r.uint16LE()
+		if err != nil {
+			return true, err
+		}
+		mv = v
+		return true, nil
+	})
+	return mv, err
+}
+
+// DeviceQuery returns firmware identity (version, build date, model
+// string) as DeviceInfo. appTargetVer is the protocol version we're
+// asking the firmware to format its response for — pass
+// SupportedCompanionProtocolVersion for current behaviour.
+//
+// Wire format:
+//
+//	cmd  : [CmdDeviceQuery][appTargetVer:1]
+//	resp : [int8 firmwareVer][6B reserved][12B cstring buildDate][remaining = model]
+func (c *Client) DeviceQuery(appTargetVer byte) (DeviceInfo, error) {
+	payload := []byte{byte(CmdDeviceQuery), appTargetVer}
+	var info DeviceInfo
+	err := c.callWithTimeout(payload, func(frame Frame) (bool, error) {
+		if e := errFromFrame(frame); e != nil {
+			return true, e
+		}
+		if ResponseCode(frame.Payload[0]) != RespDeviceInfo {
+			return false, nil
+		}
+		r := newBufReader(frame.Payload[1:])
+		fwv, err := r.int8()
+		if err != nil {
+			return true, err
+		}
+		info.FirmwareVersion = fwv
+		if _, err := r.bytes(6); err != nil {
+			return true, err
+		}
+		bd, err := r.cstring(12)
+		if err != nil {
+			return true, err
+		}
+		info.FirmwareBuildDate = bd
+		info.ManufacturerModel = r.remainingString()
+		return true, nil
+	})
+	return info, err
+}
+
+// GetCoreStats returns battery + uptime + queue from
+// GetStats(Core). The firmware answers in 7 bytes:
+//
+//	uint16LE batteryMilliVolts
+//	uint32LE uptimeSecs
+//	uint8    queueLen (pending TX packets)
+func (c *Client) GetCoreStats() (CoreStats, error) {
+	var s CoreStats
+	err := c.getStats(StatsTypeCore, func(r *bufReader) error {
+		mv, err := r.uint16LE()
+		if err != nil {
+			return err
+		}
+		s.BatteryMilliVolts = mv
+		up, err := r.uint32LE()
+		if err != nil {
+			return err
+		}
+		s.UptimeSecs = up
+		q, err := r.byte_()
+		if err != nil {
+			return err
+		}
+		s.QueueLen = q
+		return nil
+	})
+	return s, err
+}
+
+// GetRadioStats returns noise/RSSI/SNR + air-seconds from
+// GetStats(Radio). The firmware reports lastSnr as int8 quarter-dB;
+// we divide by 4 to dB before exposing.
+func (c *Client) GetRadioStats() (RadioStats, error) {
+	var s RadioStats
+	err := c.getStats(StatsTypeRadio, func(r *bufReader) error {
+		nf, err := r.int16LE()
+		if err != nil {
+			return err
+		}
+		s.NoiseFloor = nf
+		rssi, err := r.int8()
+		if err != nil {
+			return err
+		}
+		s.LastRSSI = rssi
+		snr, err := r.int8()
+		if err != nil {
+			return err
+		}
+		s.LastSNR = float64(snr) / 4
+		tx, err := r.uint32LE()
+		if err != nil {
+			return err
+		}
+		s.TxAirSecs = tx
+		rx, err := r.uint32LE()
+		if err != nil {
+			return err
+		}
+		s.RxAirSecs = rx
+		return nil
+	})
+	return s, err
+}
+
+// GetPacketStats returns the cumulative-since-boot packet counters
+// from GetStats(Packets). NRecvErrors is optional in older firmware
+// — HasRecvErrs distinguishes "zero errors" from "field not present".
+func (c *Client) GetPacketStats() (PacketStats, error) {
+	var s PacketStats
+	err := c.getStats(StatsTypePackets, func(r *bufReader) error {
+		fields := []*uint32{
+			&s.Recv, &s.Sent,
+			&s.NSentFlood, &s.NSentDirect,
+			&s.NRecvFlood, &s.NRecvDirect,
+		}
+		for _, f := range fields {
+			v, err := r.uint32LE()
+			if err != nil {
+				return err
+			}
+			*f = v
+		}
+		// Optional trailing field — present in newer firmware.
+		if r.i+4 <= len(r.b) {
+			v, err := r.uint32LE()
+			if err == nil {
+				s.NRecvErrors = v
+				s.HasRecvErrs = true
+			}
+		}
+		return nil
+	})
+	return s, err
+}
+
+// getStats is the shared call/parse skeleton for GetStatsCore /
+// Radio / Packets — the type byte echoes back as the first byte of
+// the response and the variable parser handles the rest.
+func (c *Client) getStats(t StatsType, parse func(*bufReader) error) error {
+	payload := []byte{byte(CmdGetStats), byte(t)}
+	return c.callWithTimeout(payload, func(frame Frame) (bool, error) {
+		if e := errFromFrame(frame); e != nil {
+			return true, e
+		}
+		if ResponseCode(frame.Payload[0]) != RespStats {
+			return false, nil
+		}
+		r := newBufReader(frame.Payload[1:])
+		gotType, err := r.byte_()
+		if err != nil {
+			return true, err
+		}
+		// Multiple GetStats may be in flight; ignore responses for
+		// other types so the caller's match is precise.
+		if StatsType(gotType) != t {
+			return false, nil
+		}
+		return true, parse(r)
+	})
+}
+
 // SetManualAddContacts toggles the firmware's auto-add-contacts
 // behaviour. When false (default), every advert the radio hears
 // gets added to the contacts table — fine for sparse meshes, but
@@ -1144,6 +1331,16 @@ func (r *bufReader) uint32LE() (uint32, error) {
 func (r *bufReader) int32LE() (int32, error) {
 	v, err := r.uint32LE()
 	return int32(v), err
+}
+
+func (r *bufReader) int16LE() (int16, error) {
+	v, err := r.uint16LE()
+	return int16(v), err
+}
+
+func (r *bufReader) int8() (int8, error) {
+	v, err := r.byte_()
+	return int8(v), err
 }
 
 // cstring reads a null-terminated string laid out in a fixed-size

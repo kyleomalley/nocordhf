@@ -109,6 +109,50 @@ type SelfInfo struct {
 	Name         string
 }
 
+// DeviceInfo is the radio's response to CmdDeviceQuery — firmware
+// build identity for display in a Status / About panel. None of
+// these fields gate behaviour; they're informational only.
+type DeviceInfo struct {
+	FirmwareVersion   int8   // protocol-version-aligned integer (1, 2, 3, …)
+	FirmwareBuildDate string // 12-byte cstring like "19 Feb 2025"
+	ManufacturerModel string // remainder of frame, e.g. "RAK4631"
+}
+
+// CoreStats is the radio's response to GetStats(StatsTypeCore).
+// Lightweight battery + uptime + queue snapshot; cheap enough to
+// poll on a Status tab without bothering the firmware.
+type CoreStats struct {
+	BatteryMilliVolts uint16
+	UptimeSecs        uint32
+	QueueLen          uint8 // pending outbound packets in the firmware's TX queue
+}
+
+// RadioStats is the radio's response to GetStats(StatsTypeRadio).
+// Air-time accounting + last-packet link quality. Useful for
+// diagnosing "why are sends slow" (high TX/RX air seconds = busy
+// channel) and "why is range bad" (noiseFloor + lastSnr).
+type RadioStats struct {
+	NoiseFloor int16   // dBm
+	LastRSSI   int8    // dBm of the most recently decoded packet
+	LastSNR    float64 // dB; firmware reports int8 quarter-dB, divided by 4
+	TxAirSecs  uint32
+	RxAirSecs  uint32
+}
+
+// PacketStats is the radio's response to GetStats(StatsTypePackets).
+// Cumulative since boot; flood vs direct breakdown helps spot a
+// repeater that's chewing through everyone's airtime.
+type PacketStats struct {
+	Recv        uint32
+	Sent        uint32
+	NSentFlood  uint32
+	NSentDirect uint32
+	NRecvFlood  uint32
+	NRecvDirect uint32
+	NRecvErrors uint32 // optional in older firmwares; 0 when absent
+	HasRecvErrs bool   // false when the trailing field was missing
+}
+
 // SentResult is the radio's synchronous acknowledgement of a Send*
 // command — Result < 0 indicates a queue / radio error; the ack and
 // timeout fields let us correlate the eventual SendConfirmed push.
