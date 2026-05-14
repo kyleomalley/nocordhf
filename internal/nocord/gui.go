@@ -6038,7 +6038,9 @@ const maxMcRxLog = 200
 
 // mcThreadID returns the map key for a per-conversation chat buffer.
 // kind is "contact" or "channel"; id is the lowercase hex pubkey
-// prefix for contacts or the decimal channel index for channels.
+// prefix for contacts or the secret-derived ChannelIdentity for
+// channels. See mcChannelThreadID for why channels are keyed by
+// secret hash and not slot index.
 func mcThreadID(kind, id string) string { return kind + ":" + id }
 
 // mcContactThreadID is the convenience version for a Contact —
@@ -6064,8 +6066,16 @@ func mcContactIcon(t meshcore.AdvType) fyne.Resource {
 }
 
 // mcChannelThreadID is the convenience version for a Channel.
+//
+// The id is the channel's stable secret-derived identity, NOT the
+// firmware slot index. Slot indices are reusable: wipe NVRAM and
+// the next channel the operator adds lands in slot 0, which would
+// otherwise inherit slot 0's previous chat history. Keying by the
+// secret hash instead means the same channel (anywhere on the
+// mesh, in any slot) shares one history bucket, and a new channel
+// dropped into a recycled slot starts clean.
 func mcChannelThreadID(c meshcore.Channel) string {
-	return mcThreadID("channel", fmt.Sprintf("%d", c.Index))
+	return mcThreadID("channel", meshcore.ChannelIdentity(c.Secret))
 }
 
 // mcChannelLabel returns the display label for a channel + a flag
