@@ -1671,7 +1671,15 @@ func (g *GUI) showMeshcoreSettings() {
 	regionSel := widget.NewSelect(regionOpts, nil)
 	freqEntry := widget.NewEntry()
 	freqEntry.SetPlaceHolder("MHz, e.g. 915.000")
-	bwSel := widget.NewSelect([]string{"125", "250", "500"}, nil)
+	// BW dropdown — matches upstream meshcore-web's SettingsPage.vue
+	// option list verbatim (10 LoRa physical bandwidths the SX1276/
+	// SX1262 chips support, expressed in kHz). Fractional values are
+	// real BW choices, not display rounding, so the parser below is
+	// a float not an int. Stored to prefs as Hz (BwHz * 1000).
+	bwSel := widget.NewSelect([]string{
+		"7.8", "10.4", "15.6", "20.8", "31.25", "41.7",
+		"62.5", "125", "250", "500",
+	}, nil)
 	bwSel.PlaceHolder = "kHz"
 	sfSel := widget.NewSelect([]string{"7", "8", "9", "10", "11", "12"}, nil)
 	sfSel.PlaceHolder = "spreading factor"
@@ -1689,7 +1697,10 @@ func (g *GUI) showMeshcoreSettings() {
 		freqEntry.SetText(strconv.FormatFloat(float64(v)/1e6, 'f', 3, 64))
 	}
 	if v := prefs.IntWithFallback(mcPrefRadioBwHz, 0); v > 0 {
-		bwSel.SetSelected(strconv.Itoa(v / 1000))
+		// %g strips trailing zeros: 62500 → "62.5", 125000 → "125".
+		// Matches the dropdown options exactly so SetSelected hits
+		// rather than no-op'ing on a missing entry.
+		bwSel.SetSelected(fmt.Sprintf("%g", float64(v)/1000.0))
 	}
 	if v := prefs.IntWithFallback(mcPrefRadioSF, 0); v >= 7 && v <= 12 {
 		sfSel.SetSelected(strconv.Itoa(v))
@@ -1712,7 +1723,7 @@ func (g *GUI) showMeshcoreSettings() {
 			return // "Custom" — leave fields as-is
 		}
 		freqEntry.SetText(strconv.FormatFloat(float64(preset.FreqHz)/1e6, 'f', 3, 64))
-		bwSel.SetSelected(strconv.Itoa(int(preset.BwHz / 1000)))
+		bwSel.SetSelected(fmt.Sprintf("%g", float64(preset.BwHz)/1000.0))
 		sfSel.SetSelected(strconv.Itoa(int(preset.SF)))
 		for _, opt := range crSel.Options {
 			if strings.HasPrefix(opt, strconv.Itoa(int(preset.CR))+" ") {
@@ -1793,7 +1804,7 @@ func (g *GUI) showMeshcoreSettings() {
 			// save partial config without clobbering the radio.
 			freqMHz, _ := strconv.ParseFloat(strings.TrimSpace(freqEntry.Text), 64)
 			freqHz := uint32(freqMHz * 1e6)
-			bwKHz, _ := strconv.Atoi(strings.TrimSpace(bwSel.Selected))
+			bwKHz, _ := strconv.ParseFloat(strings.TrimSpace(bwSel.Selected), 64)
 			bwHz := uint32(bwKHz * 1000)
 			sfVal, _ := strconv.Atoi(strings.TrimSpace(sfSel.Selected))
 			crVal := 0

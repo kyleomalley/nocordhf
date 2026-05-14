@@ -30,9 +30,12 @@ type RadioPreset struct {
 	Note    string
 }
 
-// Presets is the canonical preset list. Order matches the
-// dropdown — most-used regions first, then "Custom" so the
-// operator can roll their own from current values.
+// Presets is the canonical preset list. Order: regional regulator
+// defaults first (US 915 / EU 868 / AU 915 / JP 920), then known
+// MeshCore community subnet configs (regional repeater networks
+// pick a non-default freq/SF combo to carve out their own
+// channel). Operators outside any of these can leave the dropdown
+// at "Custom" and dial values in directly.
 var Presets = []RadioPreset{
 	{
 		Name:    "US 915 MHz",
@@ -69,6 +72,48 @@ var Presets = []RadioPreset{
 		CR:      5,
 		TxPower: 13,
 		Note:    "ARIB STD-T108 sub-GHz. 125 kHz BW is the maximum allowed; 13 dBm conducted.",
+	},
+	// US regional MeshCore community subnets. Narrow 62.5 kHz BW +
+	// SF 7-9 trades range for higher per-message data rate vs the
+	// default 250 kHz / SF 11; lets the busier metro meshes carry
+	// more traffic without choking on slow flood retransmissions.
+	// TX power left at the FCC 22 dBm cap; operators with low-gain
+	// antennas can dial down per local repeater operator guidance.
+	{
+		Name:    "SoCal",
+		FreqHz:  927875000,
+		BwHz:    62500,
+		SF:      7,
+		CR:      5,
+		TxPower: 22,
+		Note:    "Southern California regional MeshCore subnet (Los Angeles / OC / SD repeater chain).",
+	},
+	{
+		Name:    "San Francisco",
+		FreqHz:  910525000,
+		BwHz:    62500,
+		SF:      7,
+		CR:      5,
+		TxPower: 22,
+		Note:    "San Francisco Bay Area MeshCore subnet.",
+	},
+	{
+		Name:    "Sacramento",
+		FreqHz:  909875000,
+		BwHz:    62500,
+		SF:      9,
+		CR:      5,
+		TxPower: 22,
+		Note:    "Sacramento Valley MeshCore subnet. SF 9 trades a little throughput for extra range over SoCal/SF defaults.",
+	},
+	{
+		Name:    "Pacific No. West",
+		FreqHz:  910525000,
+		BwHz:    62500,
+		SF:      7,
+		CR:      5,
+		TxPower: 22,
+		Note:    "Pacific Northwest (Oregon / Washington) MeshCore subnet.",
 	},
 }
 
