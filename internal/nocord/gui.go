@@ -8733,6 +8733,22 @@ func (g *GUI) connectMeshcore() {
 	}
 	g.mcSetStatus("connecting on " + plan.label + "…")
 	go func() {
+		// Last-line-of-defence panic recovery for the connect path.
+		// The transport-level Open* functions already have their own
+		// recovers (see lib/meshcore/ble_transport.go), but tinygo's
+		// CoreBluetooth driver has shipped enough nil-deref bugs over
+		// minor versions that catching here too keeps an
+		// unsuspected driver crash from killing the whole GUI process.
+		defer func() {
+			if r := recover(); r != nil {
+				msg := fmt.Sprintf("connect crashed: %v", r)
+				g.mcSetStatus(msg)
+				g.mcAppendSystem(msg)
+				if mcLog := g.meshcoreLogger(); mcLog != nil {
+					mcLog.Errorw("connect goroutine panicked", "transport", transport, "label", plan.label, "panic", r)
+				}
+			}
+		}()
 		client, err := plan.open()
 		if err != nil {
 			g.mcSetStatus("open failed: " + err.Error())

@@ -143,7 +143,19 @@ type bleTransport struct {
 // Connect call itself blocks until the host BLE stack returns, so we
 // can't hard-cancel it without restarting the adapter. Pass 0 to use
 // DefaultBLEScanDuration as the find-the-peripheral budget.
-func newBLETransport(address string, connectTimeout time.Duration) (*bleTransport, error) {
+func newBLETransport(address string, connectTimeout time.Duration) (t *bleTransport, err error) {
+	// tinygo's macOS BLE backend has nil-pointer panics when called
+	// against a zero-valued Device (gattc_darwin.go:38 dereferences
+	// the inner CBPeripheral wrapper). Convert any such panic from
+	// the discover/notify path into a regular error so the GUI sees
+	// "BLE open failed: …" instead of the whole process aborting
+	// with a SIGSEGV stack.
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("meshcore: BLE driver panic during connect %s: %v", address, r)
+			t = nil
+		}
+	}()
 	if err := enableBLEAdapter(); err != nil {
 		return nil, fmt.Errorf("meshcore: enable BLE: %w", err)
 	}
@@ -157,6 +169,18 @@ func newBLETransport(address string, connectTimeout time.Duration) (*bleTranspor
 	device, err := bluetooth.DefaultAdapter.Connect(addr, bluetooth.ConnectionParams{})
 	if err != nil {
 		return nil, fmt.Errorf("meshcore: BLE connect %s: %w", address, err)
+	}
+	// Connect can occasionally return (zero Device, nil error) on
+	// macOS when the OS-side connection completes for the scan
+	// callback but the per-peripheral handle never resolves.
+	// Calling DiscoverServices on the zero value then panics inside
+	// tinygo. Detect via the all-zero address — a real peripheral
+	// always has a non-zero CoreBluetooth UUID.
+	// bluetooth.UUID is a comparable struct (id [4]uint32), so the
+	// zero check is a plain ==. A real macOS peripheral always has
+	// a non-zero CoreBluetooth UUID populated by Connect.
+	if device.Address.UUID == (bluetooth.UUID{}) {
+		return nil, fmt.Errorf("meshcore: BLE connect %s: peer handle is zero (driver returned no error but no peripheral)", address)
 	}
 	svcUUID, _ := bluetooth.ParseUUID(BLEServiceUUID)
 	rxUUID, _ := bluetooth.ParseUUID(BLECharRxUUID)
@@ -184,7 +208,7 @@ func newBLETransport(address string, connectTimeout time.Duration) (*bleTranspor
 		_ = device.Disconnect()
 		return nil, errors.New("meshcore: missing RX or TX characteristic")
 	}
-	t := &bleTransport{
+	t = &bleTransport{
 		device:  &device,
 		rx:      rxChar,
 		tx:      txChar,
