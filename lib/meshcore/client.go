@@ -222,9 +222,20 @@ func (c *Client) handlePush(code PushCode, payload []byte) {
 			c.emit(ev)
 		}
 	case PushNewAdvert:
+		// Same wire shape as a Contact record without the trailing
+		// LastMod field — parseContact stops at AdvLat/Lon so feed it
+		// directly. On older firmwares that drop fields the parse
+		// fails; we still emit the bare-pubkey form so the GUI knows
+		// something showed up.
 		if len(payload) >= 32 {
 			ev := EventAdvert{Manual: true}
 			copy(ev.PublicKey[:], payload[:32])
+			if pending, err := parsePushNewAdvert(payload); err == nil {
+				ev.Pending = &pending
+			} else {
+				c.logger().Debugw("meshcore PushNewAdvert parse failed",
+					"err", err, "len", len(payload))
+			}
 			c.emit(ev)
 		}
 	case PushPathUpdated:
@@ -771,6 +782,38 @@ func (c *Client) RemoveContact(pub PubKey) error {
 	return c.callWithTimeout(payload, awaitOk)
 }
 
+// AddUpdateContact admits a contact into the radio's persistent
+// contacts table — used to promote a pending advert (received
+// while manual-add mode was on) into a real contact the operator
+// can DM. The Contact record's fields are written verbatim:
+// caller usually populates from a previously-cached EventAdvert
+// pending payload, so type / flags / outPath / advName / lat /
+// lon / lastAdvert all survive promotion.
+//
+// Wire format mirrors meshcore.js sendCommandAddUpdateContact:
+//
+//	[cmd][32B pubkey][type:1][flags:1][outPathLen:int8]
+//	[outPath:64][advName:cstring32][lastAdvert:u32LE]
+//	[advLat:i32LE][advLon:i32LE]
+//
+// LastMod is NOT sent — the firmware stamps that itself on insert.
+func (c *Client) AddUpdateContact(ct Contact) error {
+	payload := make([]byte, 0, 1+32+1+1+1+64+32+4+4+4)
+	payload = append(payload, byte(CmdAddUpdateContact))
+	payload = append(payload, ct.PubKey[:]...)
+	payload = append(payload, byte(ct.Type))
+	payload = append(payload, ct.Flags)
+	payload = append(payload, byte(ct.OutPathLen))
+	payload = append(payload, ct.OutPath[:]...)
+	var nameBuf [32]byte
+	copy(nameBuf[:], ct.AdvName)
+	payload = append(payload, nameBuf[:]...)
+	payload = appendUint32LE(payload, uint32(ct.LastAdvert.Unix()))
+	payload = appendInt32LE(payload, ct.AdvLatE6)
+	payload = appendInt32LE(payload, ct.AdvLonE6)
+	return c.callWithTimeout(payload, awaitOk)
+}
+
 // ResetPath clears the radio's stored next-hop route for a contact.
 // DMs to that contact then re-discover the path via FLOOD on the
 // next send — useful when the cached route has gone stale (a relay
@@ -1162,6 +1205,17 @@ func parseContact(b []byte) (Contact, error) {
 	}
 	ct.LastMod = epochSecs(lastMod)
 	return ct, nil
+}
+
+// parsePushNewAdvert reads a PushNewAdvert payload — same layout as
+// a Contact record (pubkey, type, flags, outPath, name, lastAdvert,
+// lat, lon, lastMod). Mirrors meshcore.js onNewAdvertPush. Reused
+// here for the manual-mode "I saw an advert but didn't admit it"
+// flow so the GUI gets the rich Contact-shaped record without
+// having to re-fetch the contacts table (which doesn't include
+// pending entries by definition).
+func parsePushNewAdvert(b []byte) (Contact, error) {
+	return parseContact(b)
 }
 
 func parseChannelInfo(b []byte) (Channel, error) {

@@ -173,9 +173,17 @@ type Event interface{ isMeshcoreEvent() }
 // because the radio's "auto add contacts" mode is on (PushAdvert) or
 // pending operator approval when manual mode is on (PushNewAdvert,
 // indicated by Manual=true).
+//
+// Pending is non-nil only when Manual=true: PushNewAdvert delivers a
+// full Contact-shaped record (name, type, lat/lon, last-advert
+// timestamp), so callers can surface the advert without admitting it
+// to the firmware's contacts table. PushAdvert ships only the pubkey
+// — the firmware has already persisted it, so the rich data is
+// available via GetContacts.
 type EventAdvert struct {
 	PublicKey PubKey
 	Manual    bool // true if delivered as PushNewAdvert (operator must approve)
+	Pending   *Contact
 }
 
 func (EventAdvert) isMeshcoreEvent() {}

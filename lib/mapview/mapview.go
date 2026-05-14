@@ -196,12 +196,20 @@ type MessagePathNode struct {
 // is an integer that mirrors meshcore.AdvType (1=Chat, 2=Repeater,
 // 3=Room, 4=Sensor); we store it as int here to avoid an import
 // cycle from mapview to lib/meshcore.
+//
+// Pending=true means this node was seen via PushNewAdvert while
+// the radio's auto-add-contacts mode was off — the host knows
+// about it but the firmware hasn't admitted it to its contacts
+// table. Rendered as a hollow ring instead of a filled dot so the
+// operator can tell at a glance which markers correspond to
+// promotable adverts vs real contacts.
 type MeshNode struct {
-	Name   string
-	PubKey [32]byte
-	Lat    float64
-	Lon    float64
-	Type   int
+	Name    string
+	PubKey  [32]byte
+	Lat     float64
+	Lon     float64
+	Type    int
+	Pending bool
 }
 
 // MeshNode type identifiers — kept in sync with lib/meshcore.AdvType.
@@ -1873,7 +1881,14 @@ func (m *MapWidget) draw(w, h int) image.Image {
 			default:
 				c = color.RGBA{80, 150, 240, 255}
 			}
-			mapDrawDot(img, x, y, 5, c)
+			if n.Pending {
+				// Hollow ring at a slightly larger radius so it
+				// still reads at a glance even when a real contact
+				// nearly overlaps the same coordinates.
+				mapDrawRing(img, x, y, 6, c)
+			} else {
+				mapDrawDot(img, x, y, 5, c)
+			}
 			if n.Name != "" {
 				mapDrawTinyTextOutlined(img, n.Name, x+8, y+4, labelCol)
 			}
@@ -2287,6 +2302,27 @@ func mapDrawDot(img *image.RGBA, cx, cy, r int, c color.RGBA) {
 	for dy := -r; dy <= r; dy++ {
 		for dx := -r; dx <= r; dx++ {
 			if dx*dx+dy*dy <= r*r {
+				x, y := cx+dx, cy+dy
+				if x >= b.Min.X && x < b.Max.X && y >= b.Min.Y && y < b.Max.Y {
+					img.SetRGBA(x, y, c)
+				}
+			}
+		}
+	}
+}
+
+// mapDrawRing draws a hollow circle of outer radius r with a 1-px
+// stroke. Used to mark pending mesh adverts (vs filled dots for
+// admitted contacts) so the operator can distinguish promotable
+// nodes at a glance without consulting a legend.
+func mapDrawRing(img *image.RGBA, cx, cy, r int, c color.RGBA) {
+	b := img.Bounds()
+	rOut := r * r
+	rIn := (r - 1) * (r - 1)
+	for dy := -r; dy <= r; dy++ {
+		for dx := -r; dx <= r; dx++ {
+			d := dx*dx + dy*dy
+			if d <= rOut && d >= rIn {
 				x, y := cx+dx, cy+dy
 				if x >= b.Min.X && x < b.Max.X && y >= b.Min.Y && y < b.Max.Y {
 					img.SetRGBA(x, y, c)

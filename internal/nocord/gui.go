@@ -400,6 +400,13 @@ type GUI struct {
 	// from the bbolt store on connect; toggled via the contact
 	// context menu's Favorite / Unfavorite item.
 	mcFavorites map[meshcore.PubKey]bool
+	// mcPendingAdverts holds adverts the radio surfaced via
+	// PushNewAdvert (auto-add-contacts off) but never persisted.
+	// Keyed by full pubkey; the GUI overlays them onto the map
+	// without admitting them to the firmware's contacts table.
+	// Promoting to a real contact (right-click → Add as Contact)
+	// calls AddUpdateContact and removes the entry from this map.
+	mcPendingAdverts map[meshcore.PubKey]meshcore.StoredPendingAdvert
 	// mcPendingByAck maps SentResult.ExpectedAckCRC to the
 	// (thread, row index) of the chat row awaiting delivery
 	// confirmation. PushSendConfirmed look-up flips the row to
@@ -6724,6 +6731,58 @@ func (g *GUI) mcToggleFavorite(pub meshcore.PubKey) {
 	g.mcRefreshLists()
 }
 
+// mcRecordPendingAdvert upserts a pending-advert record into the
+// in-memory map and the bbolt pending bucket. Called from the
+// EventAdvert handler when Manual=true (auto-add-contacts is off
+// on the radio so the firmware never persisted this advert).
+// Skips entries that already match an admitted contact — promoting
+// to a real contact removes the pending entry, but a still-loaded
+// pending entry should NOT shadow a fresh contact import.
+func (g *GUI) mcRecordPendingAdvert(c meshcore.Contact) {
+	g.mcMu.Lock()
+	for _, existing := range g.mcContacts {
+		if existing.PubKey == c.PubKey {
+			g.mcMu.Unlock()
+			return
+		}
+	}
+	if g.mcPendingAdverts == nil {
+		g.mcPendingAdverts = map[meshcore.PubKey]meshcore.StoredPendingAdvert{}
+	}
+	now := time.Now().UTC()
+	prev, hadPrev := g.mcPendingAdverts[c.PubKey]
+	rec := meshcore.StoredPendingAdvert{
+		PubKey:     c.PubKey,
+		Type:       c.Type,
+		Flags:      c.Flags,
+		OutPathLen: c.OutPathLen,
+		AdvName:    c.AdvName,
+		AdvLatE6:   c.AdvLatE6,
+		AdvLonE6:   c.AdvLonE6,
+		LastAdvert: c.LastAdvert,
+		LastSeen:   now,
+	}
+	// OutPath is fixed-width 64 bytes; persist only the meaningful
+	// prefix indicated by OutPathLen so JSON stays compact.
+	if c.OutPathLen > 0 && int(c.OutPathLen) <= len(c.OutPath) {
+		rec.OutPath = append(rec.OutPath, c.OutPath[:c.OutPathLen]...)
+	}
+	if hadPrev && !prev.FirstSeen.IsZero() {
+		rec.FirstSeen = prev.FirstSeen
+	} else {
+		rec.FirstSeen = now
+	}
+	g.mcPendingAdverts[c.PubKey] = rec
+	store := g.mcStore
+	g.mcMu.Unlock()
+	if store != nil {
+		if err := store.SavePendingAdvert(rec); err != nil {
+			g.mcAppendSystem("save pending advert: " + err.Error())
+		}
+	}
+	g.mcSyncContactsToMap()
+}
+
 // distanceMiles is a great-circle distance via the haversine
 // formula. Returns (miles, true) when both endpoints have a
 // non-zero broadcast position; (0, false) when the contact's
@@ -6826,8 +6885,12 @@ func (g *GUI) showMcMapNodeContextMenu(pub meshcore.PubKey, absPos fyne.Position
 			break
 		}
 	}
+	pending, isPending := g.mcPendingAdverts[pub]
 	g.mcMu.Unlock()
 	if !found {
+		if isPending {
+			g.showMcPendingAdvertContextMenu(pending, absPos)
+		}
 		return
 	}
 	favLabel := "Favorite"
@@ -6873,6 +6936,77 @@ func (g *GUI) showMcMapNodeContextMenu(pub meshcore.PubKey, absPos fyne.Position
 		fyne.NewMenuItem("Reset path", func() { g.confirmResetMcPath(ct) }),
 	)
 	widget.ShowPopUpMenuAtPosition(menu, g.window.Canvas(), absPos)
+}
+
+// showMcPendingAdvertContextMenu opens the right-click menu for a
+// map ring (pending advert that hasn't been promoted to a real
+// contact). Offers Promote (calls AddUpdateContact + clears the
+// pending entry on success) and Discard (drops the entry locally
+// without ever telling the firmware).
+func (g *GUI) showMcPendingAdvertContextMenu(p meshcore.StoredPendingAdvert, absPos fyne.Position) {
+	name := p.AdvName
+	if name == "" {
+		name = fmt.Sprintf("%x", p.PubKey[:4])
+	}
+	menu := fyne.NewMenu("",
+		fyne.NewMenuItem("Pending advert: "+name, func() {}),
+		fyne.NewMenuItem("Add as Contact", func() { g.promoteMcPendingAdvert(p) }),
+		fyne.NewMenuItem("Discard", func() { g.discardMcPendingAdvert(p.PubKey) }),
+	)
+	widget.ShowPopUpMenuAtPosition(menu, g.window.Canvas(), absPos)
+}
+
+// promoteMcPendingAdvert sends AddUpdateContact to the radio with
+// the pending advert's record. On success, removes the pending
+// entry locally + from the bbolt store and triggers a contacts
+// refresh so the new contact appears in the sidebar / map. On
+// failure, leaves the pending entry in place so the operator can
+// try again (the radio's contacts table may be full).
+func (g *GUI) promoteMcPendingAdvert(p meshcore.StoredPendingAdvert) {
+	g.mcMu.Lock()
+	client := g.mcClient
+	g.mcMu.Unlock()
+	if client == nil {
+		g.mcAppendSystem("promote: not connected")
+		return
+	}
+	go func() {
+		if err := client.AddUpdateContact(p.AsContact()); err != nil {
+			g.mcAppendSystem("promote " + p.AdvName + ": " + err.Error())
+			return
+		}
+		g.mcMu.Lock()
+		delete(g.mcPendingAdverts, p.PubKey)
+		store := g.mcStore
+		g.mcMu.Unlock()
+		if store != nil {
+			_ = store.DeletePendingAdvert(p.PubKey)
+		}
+		name := p.AdvName
+		if name == "" {
+			name = fmt.Sprintf("%x", p.PubKey[:4])
+		}
+		g.mcAppendSystem("added contact: " + name)
+		g.scheduleMcContactsRefresh(client)
+		g.mcSyncContactsToMap()
+	}()
+}
+
+// discardMcPendingAdvert drops a pending advert locally. The
+// firmware never knew about it, so there's nothing to tell the
+// radio. Useful for spam / known-bad nodes the operator wants to
+// stop seeing on the map until they advertise again (at which
+// point the entry comes back unless auto-add was meanwhile
+// turned on, which would admit them as contacts directly).
+func (g *GUI) discardMcPendingAdvert(pub meshcore.PubKey) {
+	g.mcMu.Lock()
+	delete(g.mcPendingAdverts, pub)
+	store := g.mcStore
+	g.mcMu.Unlock()
+	if store != nil {
+		_ = store.DeletePendingAdvert(pub)
+	}
+	g.mcSyncContactsToMap()
 }
 
 // mcAttachHashLinks rebuilds the inline-flow container from text,
@@ -8041,6 +8175,13 @@ func mcTextMentionsSelf(text, selfName string) bool {
 // from the current contact roster. Filters contacts that haven't
 // broadcast a position. Safe from any goroutine; UI-side Refresh
 // is dispatched by the map widget.
+//
+// Pending adverts (received via PushNewAdvert when auto-add was
+// off) are merged in as Pending=true nodes so they render as
+// hollow rings instead of filled dots — the operator can see
+// what's out there without admitting them to the contacts table.
+// Adverts that match an existing contact's pubkey are skipped:
+// the contact entry is the source of truth for an admitted node.
 func (g *GUI) mcSyncContactsToMap() {
 	mw := g.scopeMapWidget()
 	if mw == nil {
@@ -8048,8 +8189,19 @@ func (g *GUI) mcSyncContactsToMap() {
 	}
 	g.mcMu.Lock()
 	contacts := append([]meshcore.Contact(nil), g.mcContacts...)
+	pending := make([]meshcore.StoredPendingAdvert, 0, len(g.mcPendingAdverts))
+	contactKeys := map[meshcore.PubKey]bool{}
+	for _, c := range contacts {
+		contactKeys[c.PubKey] = true
+	}
+	for pk, p := range g.mcPendingAdverts {
+		if contactKeys[pk] {
+			continue
+		}
+		pending = append(pending, p)
+	}
 	g.mcMu.Unlock()
-	nodes := make([]mapview.MeshNode, 0, len(contacts))
+	nodes := make([]mapview.MeshNode, 0, len(contacts)+len(pending))
 	for _, c := range contacts {
 		if c.AdvLatE6 == 0 && c.AdvLonE6 == 0 {
 			continue
@@ -8060,6 +8212,19 @@ func (g *GUI) mcSyncContactsToMap() {
 			Lat:    c.LatDegrees(),
 			Lon:    c.LonDegrees(),
 			Type:   int(c.Type),
+		})
+	}
+	for _, p := range pending {
+		if p.AdvLatE6 == 0 && p.AdvLonE6 == 0 {
+			continue
+		}
+		nodes = append(nodes, mapview.MeshNode{
+			Name:    p.AdvName,
+			PubKey:  [32]byte(p.PubKey),
+			Lat:     float64(p.AdvLatE6) / 1e6,
+			Lon:     float64(p.AdvLonE6) / 1e6,
+			Type:    int(p.Type),
+			Pending: true,
 		})
 	}
 	mw.SetMeshNodes(nodes)
@@ -9004,6 +9169,9 @@ func (g *GUI) connectMeshcore() {
 				if favs, ferr := store.LoadFavorites(); ferr == nil {
 					g.mcFavorites = favs
 				}
+				if pend, perr := store.LoadPendingAdverts(); perr == nil {
+					g.mcPendingAdverts = pend
+				}
 				g.mcMu.Unlock()
 				// One-shot purge of legacy slot-keyed channel
 				// buckets ("channel:0", "channel:1", …) left
@@ -9316,6 +9484,16 @@ func (g *GUI) runMeshcoreEvents(client *meshcore.Client) {
 			// Coalesce adverts within the debounce window into a
 			// single GetContactsSince(lastMod) that returns just
 			// the changed records.
+			//
+			// PushNewAdvert (Manual=true) carries a full
+			// Contact-shaped record because the firmware DIDN'T
+			// add it to its contacts table — auto-add was off, so
+			// a refresh would surface nothing. Persist it locally
+			// so the operator can see the node on the map and
+			// optionally promote it to a real contact later.
+			if e.Manual && e.Pending != nil {
+				g.mcRecordPendingAdvert(*e.Pending)
+			}
 			g.scheduleMcContactsRefresh(client)
 		case meshcore.EventDisconnected:
 			g.mcMu.Lock()

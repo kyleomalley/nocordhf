@@ -264,6 +264,130 @@ func (s *Store) SetFavorite(pub PubKey, on bool) error {
 	})
 }
 
+// pendingAdvertsBucket holds adverts seen while the radio's
+// auto-add-contacts mode was off — the firmware delivered them as
+// PushNewAdvert (rich Contact-shaped record) but never persisted
+// them. We hang on to them locally so the operator can see them
+// on the map without admitting them to the radio's contacts table.
+// Keyed by 32-byte pubkey, value = JSON-encoded StoredPendingAdvert.
+var pendingAdvertsBucket = []byte("__pending_adverts")
+
+// StoredPendingAdvert is the serialised form of a pending advert.
+// FirstSeen lets the GUI surface "discovered N hours ago"; LastSeen
+// gets bumped every time the same pubkey re-advertises.
+type StoredPendingAdvert struct {
+	PubKey     PubKey    `json:"pk"`
+	Type       AdvType   `json:"type"`
+	Flags      byte      `json:"flags,omitempty"`
+	OutPathLen int8      `json:"plen,omitempty"`
+	OutPath    []byte    `json:"path,omitempty"` // first OutPathLen bytes only
+	AdvName    string    `json:"name"`
+	AdvLatE6   int32     `json:"lat,omitempty"`
+	AdvLonE6   int32     `json:"lon,omitempty"`
+	LastAdvert time.Time `json:"last_adv"`
+	FirstSeen  time.Time `json:"first_seen"`
+	LastSeen   time.Time `json:"last_seen"`
+}
+
+// AsContact converts back to the Contact shape AddUpdateContact
+// expects when promoting to a real contact.
+func (p StoredPendingAdvert) AsContact() Contact {
+	var c Contact
+	c.PubKey = p.PubKey
+	c.Type = p.Type
+	c.Flags = p.Flags
+	c.OutPathLen = p.OutPathLen
+	copy(c.OutPath[:], p.OutPath)
+	c.AdvName = p.AdvName
+	c.AdvLatE6 = p.AdvLatE6
+	c.AdvLonE6 = p.AdvLonE6
+	c.LastAdvert = p.LastAdvert
+	return c
+}
+
+// SavePendingAdvert upserts a pending-advert record. If the pubkey
+// is already present, FirstSeen is preserved and LastSeen is
+// refreshed; the rest of the fields are overwritten with the new
+// values from this advert (name / lat / lon may have changed since
+// last time we saw this node).
+func (s *Store) SavePendingAdvert(p StoredPendingAdvert) error {
+	if s == nil || s.db == nil {
+		return errors.New("meshcore: store closed")
+	}
+	now := time.Now().UTC()
+	if p.LastSeen.IsZero() {
+		p.LastSeen = now
+	}
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		b, err := tx.CreateBucketIfNotExists(pendingAdvertsBucket)
+		if err != nil {
+			return err
+		}
+		// Preserve FirstSeen across re-advertisements.
+		if existing := b.Get(p.PubKey[:]); existing != nil {
+			var prev StoredPendingAdvert
+			if err := json.Unmarshal(existing, &prev); err == nil && !prev.FirstSeen.IsZero() {
+				p.FirstSeen = prev.FirstSeen
+			}
+		}
+		if p.FirstSeen.IsZero() {
+			p.FirstSeen = now
+		}
+		val, err := json.Marshal(p)
+		if err != nil {
+			return err
+		}
+		return b.Put(p.PubKey[:], val)
+	})
+}
+
+// LoadPendingAdverts returns every pending advert in the store,
+// keyed by pubkey. Used on connect to seed the in-memory map so
+// adverts persist across launches even though the radio doesn't
+// know about them.
+func (s *Store) LoadPendingAdverts() (map[PubKey]StoredPendingAdvert, error) {
+	out := map[PubKey]StoredPendingAdvert{}
+	if s == nil || s.db == nil {
+		return out, nil
+	}
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(pendingAdvertsBucket)
+		if b == nil {
+			return nil
+		}
+		return b.ForEach(func(k, v []byte) error {
+			if len(k) != 32 {
+				return nil
+			}
+			var p StoredPendingAdvert
+			if err := json.Unmarshal(v, &p); err != nil {
+				return nil // skip malformed entries rather than fail the whole load
+			}
+			var pk PubKey
+			copy(pk[:], k)
+			out[pk] = p
+			return nil
+		})
+	})
+	return out, err
+}
+
+// DeletePendingAdvert removes a pending-advert record. Called after
+// a successful AddUpdateContact promotion so the same node doesn't
+// show up in both the contacts list and the pending overlay.
+func (s *Store) DeletePendingAdvert(pub PubKey) error {
+	if s == nil || s.db == nil {
+		return errors.New("meshcore: store closed")
+	}
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(pendingAdvertsBucket)
+		if b == nil {
+			return nil
+		}
+		return b.Delete(pub[:])
+	})
+}
+
 // LoadFavorites returns the set of pubkeys currently marked as
 // favourite. Used on connect to seed the in-memory mcFavorites map.
 func (s *Store) LoadFavorites() (map[PubKey]bool, error) {
