@@ -407,6 +407,12 @@ type GUI struct {
 	// Promoting to a real contact (right-click → Add as Contact)
 	// calls AddUpdateContact and removes the entry from this map.
 	mcPendingAdverts map[meshcore.PubKey]meshcore.StoredPendingAdvert
+	// mcBlockedAdverts is the operator's permanent ignore-list:
+	// PushNewAdvert events for these pubkeys are dropped before
+	// they reach mcPendingAdverts, so the map / sidebar stay
+	// quiet even on chatty spammers. Backed by the bbolt
+	// __blocked_adverts bucket so it survives relaunch.
+	mcBlockedAdverts map[meshcore.PubKey]bool
 	// mcPendingByAck maps SentResult.ExpectedAckCRC to the
 	// (thread, row index) of the chat row awaiting delivery
 	// confirmation. PushSendConfirmed look-up flips the row to
@@ -6740,6 +6746,10 @@ func (g *GUI) mcToggleFavorite(pub meshcore.PubKey) {
 // pending entry should NOT shadow a fresh contact import.
 func (g *GUI) mcRecordPendingAdvert(c meshcore.Contact) {
 	g.mcMu.Lock()
+	if g.mcBlockedAdverts[c.PubKey] {
+		g.mcMu.Unlock()
+		return
+	}
 	for _, existing := range g.mcContacts {
 		if existing.PubKey == c.PubKey {
 			g.mcMu.Unlock()
@@ -6952,8 +6962,38 @@ func (g *GUI) showMcPendingAdvertContextMenu(p meshcore.StoredPendingAdvert, abs
 		fyne.NewMenuItem("Pending advert: "+name, func() {}),
 		fyne.NewMenuItem("Add as Contact", func() { g.promoteMcPendingAdvert(p) }),
 		fyne.NewMenuItem("Discard", func() { g.discardMcPendingAdvert(p.PubKey) }),
+		fyne.NewMenuItem("Block (permanent)", func() { g.blockMcPendingAdvert(p) }),
 	)
 	widget.ShowPopUpMenuAtPosition(menu, g.window.Canvas(), absPos)
+}
+
+// blockMcPendingAdvert silences a pubkey permanently — drops the
+// current pending entry AND adds the pubkey to the persistent
+// block list so future re-advertisements get filtered before
+// reaching the in-memory map. Use to stop spam without having to
+// hit Discard every time the node re-advertises (which on busy
+// meshes is constant).
+func (g *GUI) blockMcPendingAdvert(p meshcore.StoredPendingAdvert) {
+	g.mcMu.Lock()
+	if g.mcBlockedAdverts == nil {
+		g.mcBlockedAdverts = map[meshcore.PubKey]bool{}
+	}
+	g.mcBlockedAdverts[p.PubKey] = true
+	delete(g.mcPendingAdverts, p.PubKey)
+	store := g.mcStore
+	g.mcMu.Unlock()
+	if store != nil {
+		if err := store.BlockAdvert(p.PubKey); err != nil {
+			g.mcAppendSystem("block save: " + err.Error())
+		}
+		_ = store.DeletePendingAdvert(p.PubKey)
+	}
+	name := p.AdvName
+	if name == "" {
+		name = fmt.Sprintf("%x", p.PubKey[:4])
+	}
+	g.mcAppendSystem("blocked advert: " + name + " (will not reappear)")
+	g.mcSyncContactsToMap()
 }
 
 // promoteMcPendingAdvert sends AddUpdateContact to the radio with
@@ -9171,6 +9211,9 @@ func (g *GUI) connectMeshcore() {
 				}
 				if pend, perr := store.LoadPendingAdverts(); perr == nil {
 					g.mcPendingAdverts = pend
+				}
+				if blocked, berr := store.LoadBlockedAdverts(); berr == nil {
+					g.mcBlockedAdverts = blocked
 				}
 				g.mcMu.Unlock()
 				// One-shot purge of legacy slot-keyed channel

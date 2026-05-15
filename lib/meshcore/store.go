@@ -372,6 +372,71 @@ func (s *Store) LoadPendingAdverts() (map[PubKey]StoredPendingAdvert, error) {
 	return out, err
 }
 
+// blockedAdvertsBucket persists pubkeys the operator has chosen to
+// permanently silence. Without this, "Discard" on a pending advert
+// only drops the record until the next periodic re-advertisement
+// (which on a busy mesh is constant), so spammy nodes keep
+// reappearing on the map. Block makes the silence durable.
+var blockedAdvertsBucket = []byte("__blocked_adverts")
+
+// BlockAdvert marks a pubkey as permanently blocked. Future
+// PushNewAdvert events for this pubkey are dropped at the GUI
+// layer before they reach the pending-advert store. Idempotent.
+func (s *Store) BlockAdvert(pub PubKey) error {
+	if s == nil || s.db == nil {
+		return errors.New("meshcore: store closed")
+	}
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		b, err := tx.CreateBucketIfNotExists(blockedAdvertsBucket)
+		if err != nil {
+			return err
+		}
+		return b.Put(pub[:], nil)
+	})
+}
+
+// UnblockAdvert removes a pubkey from the block list. The next
+// advert from this node will be admitted into the pending store
+// as usual.
+func (s *Store) UnblockAdvert(pub PubKey) error {
+	if s == nil || s.db == nil {
+		return errors.New("meshcore: store closed")
+	}
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(blockedAdvertsBucket)
+		if b == nil {
+			return nil
+		}
+		return b.Delete(pub[:])
+	})
+}
+
+// LoadBlockedAdverts returns the set of pubkeys the operator has
+// blocked. Hydrated on connect so the in-memory filter survives
+// relaunch.
+func (s *Store) LoadBlockedAdverts() (map[PubKey]bool, error) {
+	out := map[PubKey]bool{}
+	if s == nil || s.db == nil {
+		return out, nil
+	}
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(blockedAdvertsBucket)
+		if b == nil {
+			return nil
+		}
+		return b.ForEach(func(k, _ []byte) error {
+			if len(k) != 32 {
+				return nil
+			}
+			var pk PubKey
+			copy(pk[:], k)
+			out[pk] = true
+			return nil
+		})
+	})
+	return out, err
+}
+
 // DeletePendingAdvert removes a pending-advert record. Called after
 // a successful AddUpdateContact promotion so the same node doesn't
 // show up in both the contacts list and the pending overlay.
