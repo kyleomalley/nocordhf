@@ -491,6 +491,31 @@ func (m *MapWidget) SetMeshNodes(nodes []MeshNode) {
 // Called on FT8-mode return so the FT8 view stays uncluttered.
 func (m *MapWidget) ClearMeshNodes() { m.SetMeshNodes(nil) }
 
+// PanTo centres the map on the given lat/lon without changing
+// zoom. Latitude is clamped to the Web Mercator pole limits to
+// avoid divide-by-zero in the projection. Out-of-range or zero
+// inputs are treated as a no-op so callers don't have to validate
+// the "node has no broadcast position" case.
+func (m *MapWidget) PanTo(lat, lon float64) {
+	if lat == 0 && lon == 0 {
+		return
+	}
+	if lat < -90 || lat > 90 || lon < -180 || lon > 180 {
+		return
+	}
+	m.mu.Lock()
+	if lat > 85.0511 {
+		lat = 85.0511
+	}
+	if lat < -85.0511 {
+		lat = -85.0511
+	}
+	m.centerLat = lat
+	m.centerLon = lon
+	m.mu.Unlock()
+	m.refresh()
+}
+
 // Animation timings for message-path overlays. mcPathRevealTotal is
 // the FIXED wall-clock budget the entire path's reveal animation
 // uses, regardless of hop count — a 2-hop path and an 8-hop path

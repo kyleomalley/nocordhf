@@ -361,9 +361,17 @@ type GUI struct {
 	mcChannelsList   *widget.List
 	mcContactsHeader *canvas.Text
 	mcChannelsHeader *canvas.Text
-	mcStatusText     *canvas.Text
-	mcCurrentThread  string
-	mcThreadHistory  map[string][]chatRow
+	mcPendingHeader  *canvas.Text
+	mcPendingList    *widget.List
+	// mcPendingOrder is the deterministic display order for the
+	// PENDING ADVERTS list — sorted alphabetically by AdvName at
+	// refresh time so the UI doesn't jitter as new adverts come in.
+	// Stored separately from the unordered mcPendingAdverts map to
+	// avoid re-sorting per row binding.
+	mcPendingOrder  []meshcore.PubKey
+	mcStatusText    *canvas.Text
+	mcCurrentThread string
+	mcThreadHistory map[string][]chatRow
 	// mcContactsSortBy is the sidebar sort mode chosen via the
 	// CONTACTS header menu (Recent / Name / Type). Persists in
 	// memory only — defaults to Recent on every launch.
@@ -6154,6 +6162,9 @@ func (g *GUI) buildMeshcoreSidebar() *fyne.Container {
 	g.mcChannelsHeader = canvas.NewText("CHANNELS  (0)", color.RGBA{140, 140, 145, 255})
 	g.mcChannelsHeader.TextSize = 11
 	g.mcChannelsHeader.TextStyle = fyne.TextStyle{Bold: true}
+	g.mcPendingHeader = canvas.NewText("PENDING  (0)", color.RGBA{140, 140, 145, 255})
+	g.mcPendingHeader.TextSize = 11
+	g.mcPendingHeader.TextStyle = fyne.TextStyle{Bold: true}
 
 	g.mcContactsList = widget.NewList(
 		func() int {
@@ -6370,6 +6381,95 @@ func (g *GUI) buildMeshcoreSidebar() *fyne.Container {
 		}
 	}
 
+	// Pending adverts list — populated when the radio runs in
+	// manual-add-contacts mode. Each row is one advert the
+	// firmware delivered via PushNewAdvert but didn't persist;
+	// right-click opens the same Add / Discard / Block menu as
+	// the map ring. Single-tap pans the map to the advert
+	// location (when one was broadcast) so the operator can see
+	// where the unknown peer is before deciding.
+	g.mcPendingList = widget.NewList(
+		func() int {
+			g.mcMu.Lock()
+			defer g.mcMu.Unlock()
+			return len(g.mcPendingOrder)
+		},
+		func() fyne.CanvasObject {
+			icon := canvas.NewImageFromResource(theme.AccountIcon())
+			icon.FillMode = canvas.ImageFillContain
+			icon.SetMinSize(fyne.NewSize(16, 16))
+			iconSlot := container.New(&fixedWidthLayout{width: 20}, icon)
+			t := canvas.NewText("", color.RGBA{200, 200, 210, 255})
+			t.TextStyle = fyne.TextStyle{Monospace: true}
+			t.TextSize = 13
+			row := newHoverRow(container.NewPadded(container.NewBorder(nil, nil, iconSlot, nil, t)))
+			row.onSecondary = func(absPos fyne.Position) {
+				g.mcMu.Lock()
+				if row.listIdx >= len(g.mcPendingOrder) {
+					g.mcMu.Unlock()
+					return
+				}
+				pk := g.mcPendingOrder[row.listIdx]
+				p, ok := g.mcPendingAdverts[pk]
+				g.mcMu.Unlock()
+				if !ok {
+					return
+				}
+				g.showMcPendingAdvertContextMenu(p, absPos)
+			}
+			row.onTap = func() {
+				g.mcMu.Lock()
+				if row.listIdx >= len(g.mcPendingOrder) {
+					g.mcMu.Unlock()
+					return
+				}
+				pk := g.mcPendingOrder[row.listIdx]
+				p, ok := g.mcPendingAdverts[pk]
+				g.mcMu.Unlock()
+				if !ok {
+					return
+				}
+				if p.AdvLatE6 == 0 && p.AdvLonE6 == 0 {
+					return
+				}
+				if mw := g.scopeMapWidget(); mw != nil {
+					mw.PanTo(float64(p.AdvLatE6)/1e6, float64(p.AdvLonE6)/1e6)
+				}
+			}
+			return row
+		},
+		func(id widget.ListItemID, obj fyne.CanvasObject) {
+			row := obj.(*hoverRow)
+			padded := row.inner.(*fyne.Container)
+			border := padded.Objects[0].(*fyne.Container)
+			iconSlot := border.Objects[1].(*fyne.Container)
+			icon := iconSlot.Objects[0].(*canvas.Image)
+			t := border.Objects[0].(*canvas.Text)
+			row.listIdx = id
+			g.mcMu.Lock()
+			if id >= len(g.mcPendingOrder) {
+				g.mcMu.Unlock()
+				return
+			}
+			pk := g.mcPendingOrder[id]
+			p := g.mcPendingAdverts[pk]
+			g.mcMu.Unlock()
+			label := p.AdvName
+			if label == "" {
+				label = fmt.Sprintf("(unnamed %x)", pk[:4])
+			}
+			// Tag with location indicator so the operator knows
+			// at a glance which entries have a position to map.
+			if p.AdvLatE6 != 0 || p.AdvLonE6 != 0 {
+				label += "  ◯" // hollow ring matches the map glyph
+			}
+			t.Text = label
+			icon.Resource = mcContactIcon(p.Type)
+			icon.Refresh()
+			t.Refresh()
+		},
+	)
+
 	g.mcStatusText = canvas.NewText("", color.RGBA{160, 165, 175, 255})
 	g.mcStatusText.TextStyle = fyne.TextStyle{Italic: true}
 	g.mcStatusText.TextSize = 10
@@ -6425,16 +6525,29 @@ func (g *GUI) buildMeshcoreSidebar() *fyne.Container {
 		contactsMenuBtn, nil,
 	)
 
-	// Two scrollable lists stacked vertically with proportional weight
-	// — contacts get the top half, channels the bottom. fixedHeight
-	// won't work here because Fyne lists need a parent that reports a
-	// real height. NewVSplit with a 0.6 default keeps both lists usable
-	// at typical sidebar widths.
+	pendingHeader := container.NewBorder(
+		nil, nil,
+		container.NewPadded(g.mcPendingHeader),
+		nil, nil,
+	)
+
+	// Three scrollable lists stacked vertically — contacts at the
+	// top, channels in the middle, pending adverts at the bottom.
+	// Pending exists primarily for manual-add-contacts mode; the
+	// header is always visible (with a (0) count) so the feature
+	// is discoverable even before any adverts arrive. Fyne VSplit
+	// only takes two children, so we nest: top half = contacts,
+	// bottom half = nested split of channels + pending.
+	channelsAndPending := container.NewVSplit(
+		container.NewBorder(channelsHeader, nil, nil, nil, g.mcChannelsList),
+		container.NewBorder(pendingHeader, nil, nil, nil, g.mcPendingList),
+	)
+	channelsAndPending.SetOffset(0.7)
 	listsSplit := container.NewVSplit(
 		container.NewBorder(contactsHeader, nil, nil, nil, g.mcContactsList),
-		container.NewBorder(channelsHeader, nil, nil, nil, g.mcChannelsList),
+		channelsAndPending,
 	)
-	listsSplit.SetOffset(0.6)
+	listsSplit.SetOffset(0.5)
 
 	g.mcSidebar = container.NewBorder(
 		nil,
@@ -6445,9 +6558,11 @@ func (g *GUI) buildMeshcoreSidebar() *fyne.Container {
 	return g.mcSidebar
 }
 
-// mcRefreshLists repaints the contacts/channels lists + their header
-// counts. Safe from any goroutine; UI mutations are dispatched via
-// fyne.Do.
+// mcRefreshLists repaints the contacts/channels/pending lists +
+// their header counts. Rebuilds mcPendingOrder under the lock so
+// the list widget's index → pubkey lookup stays stable across
+// repaint. Safe from any goroutine; UI mutations are dispatched
+// via fyne.Do.
 func (g *GUI) mcRefreshLists() {
 	if g.mcContactsList == nil || g.mcChannelsList == nil {
 		return
@@ -6455,6 +6570,27 @@ func (g *GUI) mcRefreshLists() {
 	g.mcMu.Lock()
 	nc := len(g.mcContacts)
 	nch := len(g.mcChannels)
+	// Rebuild the pending order — alphabetised by AdvName so the
+	// list doesn't shuffle as new entries arrive. Empty names sort
+	// to the end so unnamed nodes stay visible without dominating
+	// the top of the list.
+	order := make([]meshcore.PubKey, 0, len(g.mcPendingAdverts))
+	for pk := range g.mcPendingAdverts {
+		order = append(order, pk)
+	}
+	sort.Slice(order, func(i, j int) bool {
+		ai := g.mcPendingAdverts[order[i]].AdvName
+		aj := g.mcPendingAdverts[order[j]].AdvName
+		switch {
+		case ai == "" && aj != "":
+			return false
+		case ai != "" && aj == "":
+			return true
+		}
+		return strings.ToLower(ai) < strings.ToLower(aj)
+	})
+	g.mcPendingOrder = order
+	np := len(order)
 	g.mcMu.Unlock()
 	fyne.Do(func() {
 		if g.mcContactsHeader != nil {
@@ -6465,8 +6601,15 @@ func (g *GUI) mcRefreshLists() {
 			g.mcChannelsHeader.Text = fmt.Sprintf("CHANNELS  (%d)", nch)
 			g.mcChannelsHeader.Refresh()
 		}
+		if g.mcPendingHeader != nil {
+			g.mcPendingHeader.Text = fmt.Sprintf("PENDING  (%d)", np)
+			g.mcPendingHeader.Refresh()
+		}
 		g.mcContactsList.Refresh()
 		g.mcChannelsList.Refresh()
+		if g.mcPendingList != nil {
+			g.mcPendingList.Refresh()
+		}
 	})
 }
 
@@ -6791,6 +6934,7 @@ func (g *GUI) mcRecordPendingAdvert(c meshcore.Contact) {
 		}
 	}
 	g.mcSyncContactsToMap()
+	g.mcRefreshLists()
 }
 
 // distanceMiles is a great-circle distance via the haversine
@@ -6994,6 +7138,7 @@ func (g *GUI) blockMcPendingAdvert(p meshcore.StoredPendingAdvert) {
 	}
 	g.mcAppendSystem("blocked advert: " + name + " (will not reappear)")
 	g.mcSyncContactsToMap()
+	g.mcRefreshLists()
 }
 
 // promoteMcPendingAdvert sends AddUpdateContact to the radio with
@@ -7047,6 +7192,7 @@ func (g *GUI) discardMcPendingAdvert(pub meshcore.PubKey) {
 		_ = store.DeletePendingAdvert(pub)
 	}
 	g.mcSyncContactsToMap()
+	g.mcRefreshLists()
 }
 
 // mcAttachHashLinks rebuilds the inline-flow container from text,
@@ -8325,6 +8471,7 @@ func (g *GUI) doMcContactsRefresh(client *meshcore.Client) {
 	g.mcMu.Unlock()
 	g.mcRefreshLists()
 	g.mcSyncContactsToMap()
+	g.mcRefreshLists()
 }
 
 // buildMeshcoreRxLog lazily constructs the RxLog viewer pane that
