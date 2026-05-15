@@ -1,6 +1,51 @@
 package nocord
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
+
+// Regression: lat/long pairs in chat (e.g. "34.14289, -118.03159"
+// posted in #wardriving) should render as Google Maps links. Pins
+// the regex against false-positives ("1, 2", message-id pairs)
+// and out-of-range values that look superficially valid.
+func TestMcParseChatSegmentsGeo(t *testing.T) {
+	cases := []struct {
+		in       string
+		wantHref string // empty when no geo segment is expected
+	}{
+		// Canonical positive case from the user's report.
+		{"see this 34.14289, -118.03159 great spot", "https://www.google.com/maps?q=34.14289,-118.03159"},
+		// Both negative (Sydney).
+		{"-33.86882, 151.20929", "https://www.google.com/maps?q=-33.86882,151.20929"},
+		// Comma without space.
+		{"40.7128,-74.0060", "https://www.google.com/maps?q=40.7128,-74.0060"},
+		// Sentence-trailing punctuation must not pollute the href.
+		{"meet at 51.5074, -0.1278.", "https://www.google.com/maps?q=51.5074,-0.1278"},
+		// Out-of-range latitude → not a geo link.
+		{"id pair 91.5, 12.3", ""},
+		// Out-of-range longitude.
+		{"id pair 12.3, 200.0", ""},
+		// Integer-only commas should NOT match (would false-positive
+		// on enumerations like "1, 2, 3").
+		{"items 1, 2, 3 in stock", ""},
+		// No comma → no match.
+		{"34.14289 -118.03159", ""},
+	}
+	for _, c := range cases {
+		got := mcParseChatSegments(c.in, nil, "")
+		var href string
+		for _, s := range got {
+			if s.url != "" && strings.HasPrefix(s.url, "https://www.google.com/maps?q=") {
+				href = s.url
+				break
+			}
+		}
+		if href != c.wantHref {
+			t.Errorf("geo parse %q → %q, want %q", c.in, href, c.wantHref)
+		}
+	}
+}
 
 // Regression: "CQ NA BH4ECL" was returning "NA" because the inline modifier
 // list here had drifted from lib/ft8.IsCQModifier and only knew about DX /

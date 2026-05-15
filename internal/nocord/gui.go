@@ -10314,6 +10314,40 @@ const mcURLTrimTrailing = ".,;:!?)]\"'>"
 // or punctuated handles (rare on MeshCore but possible) survive.
 var mcMentionRe = regexp.MustCompile(`@\[([^\]]+)\]`)
 
+// mcGeoRe matches "lat, lon" decimal-degree pairs that frequently
+// show up in #wardriving and similar location-share channels —
+// e.g. "34.14289, -118.03159" or "-33.86, 151.21". Both numbers
+// MUST have a decimal point so we don't false-positive on ordinary
+// "1, 2" enumerations or message-id pairs. Range validity (lat in
+// [-90,90], lon in [-180,180]) is enforced by mcParseGeoLink after
+// the regex match — the regex itself is permissive on digit count
+// to avoid having to encode the bounds in regex form.
+var mcGeoRe = regexp.MustCompile(`(?:^|[\s(\[])(-?\d{1,3}\.\d+)\s*,\s*(-?\d{1,3}\.\d+)(?:[\s).,;:!?\]]|$)`)
+
+// mcParseGeoLink validates a regex match against the lat/lon
+// bounds. Returns the visible text (without the leading/trailing
+// boundary character the regex captured) and a Google Maps URL
+// when the values are within range. Returns "", "" otherwise so
+// the caller leaves the run as plain text.
+func mcParseGeoLink(match []int, text string) (visible, href string, start, end int) {
+	// Group 1 = lat, group 2 = lon. The full match (group 0)
+	// includes the boundary chars on either side; we only want
+	// the lat,lon span to be the visible link text.
+	latStr := text[match[2]:match[3]]
+	lonStr := text[match[4]:match[5]]
+	lat, errLat := strconv.ParseFloat(latStr, 64)
+	lon, errLon := strconv.ParseFloat(lonStr, 64)
+	if errLat != nil || errLon != nil {
+		return "", "", 0, 0
+	}
+	if lat < -90 || lat > 90 || lon < -180 || lon > 180 {
+		return "", "", 0, 0
+	}
+	visible = text[match[2]:match[5]]
+	href = fmt.Sprintf("https://www.google.com/maps?q=%s,%s", latStr, lonStr)
+	return visible, href, match[2], match[5]
+}
+
 // mcHashSeriesRe matches a comma-separated SERIES of 2/4/6 hex
 // digits — at least two tokens. The series form is the only one we
 // auto-link, because a single 2-hex token ("be", "78", "ad") is
@@ -10349,8 +10383,10 @@ func mcParseChatSegments(text string, contacts []meshcore.Contact, selfName stri
 	}
 	urlLocs := mcURLRe.FindAllStringIndex(text, -1)
 	mentionLocs := mcMentionRe.FindAllStringSubmatchIndex(text, -1)
-	if len(urlLocs) == 0 && len(mentionLocs) == 0 {
-		// No URLs / mentions — fall through to hash-only parsing.
+	geoLocs := mcGeoRe.FindAllStringSubmatchIndex(text, -1)
+	if len(urlLocs) == 0 && len(mentionLocs) == 0 && len(geoLocs) == 0 {
+		// No URLs / mentions / geo coords — fall through to
+		// hash-only parsing.
 		return mcParseHashLinks(text, contacts)
 	}
 	var out []mcHashSegment
@@ -10360,13 +10396,14 @@ func mcParseChatSegments(text string, contacts []meshcore.Contact, selfName stri
 	// hash-link parsing. Used for the gaps BETWEEN URL matches so
 	// URLs are the outermost frames and mentions / hash series
 	// don't accidentally swallow URL characters.
-	emitMentionsAndPlain := func(s string) {
+	// emitMentionsHashesPlain handles a slice that we've already
+	// stripped URLs and geo coordinates from. Splits remaining
+	// content by mentions, then by hash links, then plain.
+	emitMentionsHashesPlain := func(s string) {
 		if s == "" {
 			return
 		}
 		if len(mentionLocs) == 0 {
-			// No mentions in the original text — go straight to
-			// hash-link parsing for this slice.
 			if hashSegs := mcParseHashLinks(s, contacts); hashSegs != nil {
 				out = append(out, hashSegs...)
 			} else {
@@ -10374,8 +10411,6 @@ func mcParseChatSegments(text string, contacts []meshcore.Contact, selfName stri
 			}
 			return
 		}
-		// Mentions exist somewhere in the original text; rescan
-		// just this slice for them so the offsets stay local.
 		subMentions := mcMentionRe.FindAllStringSubmatchIndex(s, -1)
 		if len(subMentions) == 0 {
 			if hashSegs := mcParseHashLinks(s, contacts); hashSegs != nil {
@@ -10416,6 +10451,39 @@ func mcParseChatSegments(text string, contacts []meshcore.Contact, selfName stri
 		}
 		if subCursor < len(s) {
 			emitPlainHashes(s[subCursor:])
+		}
+	}
+	// emitMentionsAndPlain extracts geo coordinate pairs (rendered
+	// as Google Maps URL segments) before falling through to the
+	// mention / hash extraction path. Geos are outermost-after-URL
+	// so a "lat, lon" pair beats both mentions and hash series for
+	// the same span (geos can't legally contain mentions or hex
+	// series anyway).
+	emitMentionsAndPlain := func(s string) {
+		if s == "" {
+			return
+		}
+		geoMatches := mcGeoRe.FindAllStringSubmatchIndex(s, -1)
+		if len(geoMatches) == 0 {
+			emitMentionsHashesPlain(s)
+			return
+		}
+		geoCursor := 0
+		for _, gm := range geoMatches {
+			visible, href, start, end := mcParseGeoLink(gm, s)
+			if href == "" {
+				// Out-of-range pair — treat as plain text so
+				// "1024.5, 99.9" doesn't become a broken link.
+				continue
+			}
+			if start > geoCursor {
+				emitMentionsHashesPlain(s[geoCursor:start])
+			}
+			out = append(out, mcHashSegment{text: visible, url: href})
+			geoCursor = end
+		}
+		if geoCursor < len(s) {
+			emitMentionsHashesPlain(s[geoCursor:])
 		}
 	}
 	// Walk URL matches as outermost frames. Plain text between
