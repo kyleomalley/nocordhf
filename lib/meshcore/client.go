@@ -782,6 +782,24 @@ func (c *Client) RemoveContact(pub PubKey) error {
 	return c.callWithTimeout(payload, awaitOk)
 }
 
+// Reboot asks the firmware to reset itself. The cmd byte is
+// followed by the literal ASCII string "reboot" — a magic-word
+// guard that prevents an accidental short payload from triggering
+// a reset. The radio doesn't acknowledge before rebooting, so
+// this returns as soon as the bytes are on the wire; an
+// EventDisconnected typically follows within a couple of seconds
+// as the BLE/serial link tears down. Caller is responsible for
+// triggering reconnect after the radio comes back.
+func (c *Client) Reboot() error {
+	payload := append([]byte{byte(CmdReboot)}, []byte("reboot")...)
+	c.logger().Debugw("meshcore tx", "cmd", fmt.Sprintf("0x%02x", byte(CmdReboot)), "len", len(payload))
+	if err := c.transport.Send(payload); err != nil {
+		_ = c.transport.Close()
+		return fmt.Errorf("meshcore: reboot write: %w", err)
+	}
+	return nil
+}
+
 // AddUpdateContact admits a contact into the radio's persistent
 // contacts table — used to promote a pending advert (received
 // while manual-add mode was on) into a real contact the operator

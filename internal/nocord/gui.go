@@ -368,7 +368,21 @@ type GUI struct {
 	// refresh time so the UI doesn't jitter as new adverts come in.
 	// Stored separately from the unordered mcPendingAdverts map to
 	// avoid re-sorting per row binding.
-	mcPendingOrder  []meshcore.PubKey
+	mcPendingOrder []meshcore.PubKey
+	// mcContactsFilter is the case-insensitive substring filter
+	// applied to the Contacts sidebar — populated by the search
+	// entry above the list. Empty means show everything. Stored
+	// here (not in the widget) so mcRebuildContactsViewLocked
+	// can re-filter on every roster change without re-reading
+	// the entry text from the UI thread.
+	mcContactsFilter      string
+	mcContactsFilterEntry *widget.Entry
+	// mcContactsView is the filtered + sorted slice the contacts
+	// list widget actually iterates. Rebuilt under mcMu in
+	// mcRebuildContactsViewLocked from mcContacts + mcContactsFilter
+	// so list count / bind / OnSelected callbacks stay O(1) and
+	// indexing is stable across a single repaint cycle.
+	mcContactsView  []meshcore.Contact
 	mcStatusText    *canvas.Text
 	mcCurrentThread string
 	mcThreadHistory map[string][]chatRow
@@ -1815,15 +1829,42 @@ func (g *GUI) showMeshcoreSettings() {
 		container.NewTabItem("Profile", profileTab),
 		container.NewTabItem("Status", statusTab),
 	)
-	tabs.OnSelected = func(t *container.TabItem) {
-		if t.Text == "Status" {
-			refreshStatusTab()
+	// Status tab gets a background refresh ticker — values like
+	// queue length and packet counters change continuously so a
+	// one-shot pull goes stale within seconds. Ticker only runs
+	// while the Status tab is the active tab; switching away
+	// stops it so we don't keep the radio busy answering stat
+	// queries the operator can't see.
+	var statusTicker *time.Ticker
+	stopStatusTicker := func() {
+		if statusTicker != nil {
+			statusTicker.Stop()
+			statusTicker = nil
 		}
+	}
+	tabs.OnSelected = func(t *container.TabItem) {
+		stopStatusTicker()
+		if t.Text != "Status" {
+			return
+		}
+		refreshStatusTab()
+		statusTicker = time.NewTicker(30 * time.Second)
+		ticker := statusTicker
+		go func() {
+			for range ticker.C {
+				refreshStatusTab()
+			}
+		}()
 	}
 	d := dialog.NewCustomConfirm(
 		"MeshCore settings", "Save", "Cancel",
 		tabs,
 		func(ok bool) {
+			// Stop the Status-tab auto-refresh ticker either way:
+			// dialog dismissal means there's nobody to read the
+			// values, so keeping the ticker alive would just leak
+			// goroutines and waste radio cycles.
+			stopStatusTicker()
 			if !ok {
 				return
 			}
@@ -2079,9 +2120,36 @@ func (g *GUI) buildMeshcoreStatusTab() (fyne.CanvasObject, func()) {
 	}
 
 	refreshBtn := widget.NewButtonWithIcon("Refresh", theme.ViewRefreshIcon(), refresh)
+	rebootBtn := widget.NewButtonWithIcon("Reboot device", theme.WarningIcon(), func() {
+		dialog.ShowConfirm(
+			"Reboot MeshCore device?",
+			"The radio will restart and reconnect after a few seconds. Any in-flight messages will be dropped.",
+			func(ok bool) {
+				if !ok {
+					return
+				}
+				g.mcMu.Lock()
+				client := g.mcClient
+				g.mcMu.Unlock()
+				if client == nil {
+					g.mcAppendSystem("reboot: not connected")
+					return
+				}
+				go func() {
+					if err := client.Reboot(); err != nil {
+						g.mcAppendSystem("reboot: " + err.Error())
+						return
+					}
+					g.mcAppendSystem("reboot command sent — reconnecting shortly")
+				}()
+			},
+			g.window,
+		)
+	})
+	rebootBtn.Importance = widget.LowImportance
 	body := container.NewVBox(
 		form,
-		container.NewHBox(refreshBtn, statusFooter),
+		container.NewHBox(refreshBtn, rebootBtn, statusFooter),
 		widget.NewLabel("Snapshot of what the radio reports about itself. Cumulative counters reset on radio reboot. Battery readings on mains-powered repeaters typically read 0 mV."),
 	)
 	return body, refresh
@@ -6367,7 +6435,7 @@ func (g *GUI) buildMeshcoreSidebar() *fyne.Container {
 		func() int {
 			g.mcMu.Lock()
 			defer g.mcMu.Unlock()
-			return len(g.mcContacts)
+			return len(g.mcContactsView)
 		},
 		func() fyne.CanvasObject {
 			// Row template: [star][icon-slot][name]. Star is a
@@ -6411,11 +6479,11 @@ func (g *GUI) buildMeshcoreSidebar() *fyne.Container {
 			t := border.Objects[0].(*canvas.Text)
 			row.listIdx = id
 			g.mcMu.Lock()
-			if id >= len(g.mcContacts) {
+			if id >= len(g.mcContactsView) {
 				g.mcMu.Unlock()
 				return
 			}
-			ct := g.mcContacts[id]
+			ct := g.mcContactsView[id]
 			active := mcContactThreadID(ct) == g.mcCurrentThread
 			g.mcMu.Unlock()
 			name := ct.AdvName
@@ -6468,11 +6536,11 @@ func (g *GUI) buildMeshcoreSidebar() *fyne.Container {
 	)
 	g.mcContactsList.OnSelected = func(id widget.ListItemID) {
 		g.mcMu.Lock()
-		if id >= len(g.mcContacts) {
+		if id >= len(g.mcContactsView) {
 			g.mcMu.Unlock()
 			return
 		}
-		ct := g.mcContacts[id]
+		ct := g.mcContactsView[id]
 		g.mcMu.Unlock()
 		g.mcSwitchThread(mcContactThreadID(ct))
 		if g.mcChannelsList != nil {
@@ -6712,15 +6780,26 @@ func (g *GUI) buildMeshcoreSidebar() *fyne.Container {
 			fyne.NewMenuItem("Sort by Type", func() { g.mcSetContactsSortBy(mcContactsSortType) }),
 			fyne.NewMenuItem("Sort by Distance", func() { g.mcSetContactsSortBy(mcContactsSortDistance) }),
 			fyne.NewMenuItemSeparator(),
+			fyne.NewMenuItem("Mark all as read", func() { g.mcClearAllUnread() }),
+			fyne.NewMenuItemSeparator(),
 			fyne.NewMenuItem("Bulk delete…", func() { g.showMcBulkDeleteDialog() }),
 		)
 		widget.ShowPopUpMenuAtPosition(menu, g.window.Canvas(), pos)
 	}
-	contactsHeader := container.NewBorder(
+	contactsTitle := container.NewBorder(
 		nil, nil,
 		container.NewPadded(g.mcContactsHeader),
 		contactsMenuBtn, nil,
 	)
+	g.mcContactsFilterEntry = widget.NewEntry()
+	g.mcContactsFilterEntry.SetPlaceHolder("Filter contacts…")
+	g.mcContactsFilterEntry.OnChanged = func(s string) {
+		g.mcMu.Lock()
+		g.mcContactsFilter = s
+		g.mcMu.Unlock()
+		g.mcRefreshLists()
+	}
+	contactsHeader := container.NewVBox(contactsTitle, g.mcContactsFilterEntry)
 
 	pendingHeader := container.NewBorder(
 		nil, nil,
@@ -6755,17 +6834,45 @@ func (g *GUI) buildMeshcoreSidebar() *fyne.Container {
 	return g.mcSidebar
 }
 
+// mcRebuildContactsViewLocked refreshes mcContactsView from
+// mcContacts under the current mcContactsFilter. Caller must hold
+// mcMu. Empty filter copies the full roster verbatim; non-empty
+// filter does a case-insensitive substring match against AdvName
+// AND against the lowercase-hex pubkey prefix so an operator
+// searching by hash fragment still finds the right node.
+func (g *GUI) mcRebuildContactsViewLocked() {
+	q := strings.ToLower(strings.TrimSpace(g.mcContactsFilter))
+	if q == "" {
+		g.mcContactsView = append(g.mcContactsView[:0], g.mcContacts...)
+		return
+	}
+	out := g.mcContactsView[:0]
+	for _, c := range g.mcContacts {
+		if strings.Contains(strings.ToLower(c.AdvName), q) {
+			out = append(out, c)
+			continue
+		}
+		hex := fmt.Sprintf("%x", c.PubKey[:6])
+		if strings.Contains(hex, q) {
+			out = append(out, c)
+		}
+	}
+	g.mcContactsView = out
+}
+
 // mcRefreshLists repaints the contacts/channels/pending lists +
-// their header counts. Rebuilds mcPendingOrder under the lock so
-// the list widget's index → pubkey lookup stays stable across
-// repaint. Safe from any goroutine; UI mutations are dispatched
-// via fyne.Do.
+// their header counts. Rebuilds mcContactsView (filter applied)
+// and mcPendingOrder under the lock so list widget index lookups
+// stay stable across repaint. Safe from any goroutine; UI
+// mutations are dispatched via fyne.Do.
 func (g *GUI) mcRefreshLists() {
 	if g.mcContactsList == nil || g.mcChannelsList == nil {
 		return
 	}
 	g.mcMu.Lock()
+	g.mcRebuildContactsViewLocked()
 	nc := len(g.mcContacts)
+	nv := len(g.mcContactsView)
 	nch := len(g.mcChannels)
 	// Rebuild the pending order — alphabetised by AdvName so the
 	// list doesn't shuffle as new entries arrive. Empty names sort
@@ -6791,7 +6898,13 @@ func (g *GUI) mcRefreshLists() {
 	g.mcMu.Unlock()
 	fyne.Do(func() {
 		if g.mcContactsHeader != nil {
-			g.mcContactsHeader.Text = fmt.Sprintf("CONTACTS  (%d)", nc)
+			// Show "(filtered/total)" when a filter is active so the
+			// operator knows how many entries are hidden.
+			if nv != nc {
+				g.mcContactsHeader.Text = fmt.Sprintf("CONTACTS  (%d/%d)", nv, nc)
+			} else {
+				g.mcContactsHeader.Text = fmt.Sprintf("CONTACTS  (%d)", nc)
+			}
 			g.mcContactsHeader.Refresh()
 		}
 		if g.mcChannelsHeader != nil {
@@ -7159,11 +7272,11 @@ func distanceMiles(lat1, lon1, lat2, lon2 float64, contactLatE6, contactLonE6 in
 // roster).
 func (g *GUI) showMcContactContextMenu(visibleIdx int, absPos fyne.Position) {
 	g.mcMu.Lock()
-	if visibleIdx < 0 || visibleIdx >= len(g.mcContacts) {
+	if visibleIdx < 0 || visibleIdx >= len(g.mcContactsView) {
 		g.mcMu.Unlock()
 		return
 	}
-	ct := g.mcContacts[visibleIdx]
+	ct := g.mcContactsView[visibleIdx]
 	g.mcMu.Unlock()
 	canvas := g.window.Canvas()
 	favLabel := "Favorite"
@@ -8498,6 +8611,18 @@ func (g *GUI) mcClearUnread(thread string) {
 	g.mcRefreshLists()
 }
 
+// mcClearAllUnread wipes every per-thread unread counter and
+// mention flag in one shot. Bound to the Contacts header menu's
+// "Mark all as read" item — useful after a long absence when
+// "10 unread" badges everywhere aren't actionable.
+func (g *GUI) mcClearAllUnread() {
+	g.mu.Lock()
+	g.mcUnread = nil
+	g.mcMentioned = nil
+	g.mu.Unlock()
+	g.mcRefreshLists()
+}
+
 // mcUnreadCount reads the current unread count for a thread.
 // Locked-callers can pass true via g.mu being already held — but
 // it's cheap enough to just take the lock.
@@ -9676,7 +9801,61 @@ func (g *GUI) connectMeshcore() {
 		g.mcSetStatus(fmt.Sprintf("connected — %s", info.Name))
 		g.mcAppendSystem(fmt.Sprintf("connected: %s (%d contacts, %d channels)", info.Name, len(contacts), len(channels)))
 		go g.runMeshcoreEvents(client)
+		go g.runMeshcoreBatteryWatch(client)
 	}()
+}
+
+// MeshCore battery-warning thresholds — Li-ion 1S pack reference.
+// Warn at 3500 mV (~10% remaining); rearm at 3700 mV (~30%) to
+// avoid rapid retrigger when voltage hovers around the threshold
+// (battery voltage often dips under load and recovers seconds
+// later). 0 mV is treated as "mains powered / unsupported" and
+// skipped.
+const (
+	mcBatteryWarnMillivolts  = 3500
+	mcBatteryRearmMillivolts = 3700
+	mcBatteryPollInterval    = 5 * time.Minute
+)
+
+// runMeshcoreBatteryWatch polls the radio's CoreStats every few
+// minutes looking for the battery voltage crossing below the
+// warn threshold. Fires exactly one system message per dip — the
+// "armed" flag rearms only after voltage rises past the rearm
+// threshold (hysteresis). Exits when the client argument is no
+// longer the live mcClient (i.e. after disconnect / reconnect)
+// so a fresh connect spawns a fresh watcher without overlap.
+func (g *GUI) runMeshcoreBatteryWatch(client *meshcore.Client) {
+	armed := true
+	t := time.NewTicker(mcBatteryPollInterval)
+	defer t.Stop()
+	check := func() bool {
+		g.mcMu.Lock()
+		current := g.mcClient
+		g.mcMu.Unlock()
+		if current != client {
+			return false // newer client took over
+		}
+		mv, err := client.GetCoreStats()
+		if err != nil {
+			return true // transient — try again next tick
+		}
+		v := mv.BatteryMilliVolts
+		if v == 0 {
+			return true // mains powered or unsupported
+		}
+		if armed && v <= mcBatteryWarnMillivolts {
+			g.mcAppendSystem(fmt.Sprintf("battery low: %s — consider charging the radio", formatBattery(v)))
+			armed = false
+		} else if !armed && v >= mcBatteryRearmMillivolts {
+			armed = true
+		}
+		return true
+	}
+	for range t.C {
+		if !check() {
+			return
+		}
+	}
 }
 
 // disconnectMeshcore closes the client cleanly. Called from
