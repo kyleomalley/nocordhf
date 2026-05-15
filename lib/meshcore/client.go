@@ -800,6 +800,25 @@ func (c *Client) Reboot() error {
 	return nil
 }
 
+// ShareContact tells the radio to re-broadcast the signed advert
+// packet it cached for the given contact, flooding it over the
+// mesh as if the original sender had just re-advertised. Receivers
+// verify the embedded ed25519 signature against the embedded
+// pubkey, so the signature stays valid even though we're the ones
+// re-flooding — none of the signed fields (pubkey, timestamp,
+// appData) are mutated; only the outPath grows as the packet
+// hops. Useful for "vouching" for a peer to neighbours who
+// haven't heard them directly.
+//
+// Wire format mirrors meshcore.js sendCommandShareContact:
+// [cmd][32-byte pubkey]. Returns RespErr if the pubkey isn't in
+// the radio's contact table (the firmware needs the cached
+// advert bytes to re-broadcast).
+func (c *Client) ShareContact(pub PubKey) error {
+	payload := append([]byte{byte(CmdShareContact)}, pub[:]...)
+	return c.callWithTimeout(payload, awaitOk)
+}
+
 // AddUpdateContact admits a contact into the radio's persistent
 // contacts table — used to promote a pending advert (received
 // while manual-add mode was on) into a real contact the operator

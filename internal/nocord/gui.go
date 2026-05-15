@@ -7442,10 +7442,40 @@ func (g *GUI) showMcContactContextMenu(visibleIdx int, absPos fyne.Position) {
 	menu := fyne.NewMenu("",
 		fyne.NewMenuItem(favLabel, func() { g.mcToggleFavorite(ct.PubKey) }),
 		fyne.NewMenuItem("Info", func() { g.showMcContactInfoDialog(ct) }),
+		fyne.NewMenuItem("Share over mesh", func() { g.shareMcContact(ct) }),
 		fyne.NewMenuItem("Reset path", func() { g.confirmResetMcPath(ct) }),
 		fyne.NewMenuItem("Remove", func() { g.confirmRemoveMcContact(ct) }),
 	)
 	widget.ShowPopUpMenuAtPosition(menu, canvas, absPos)
+}
+
+// shareMcContact tells the radio to re-broadcast the cached
+// signed advert for this contact via FLOOD. Receivers verify the
+// signature against the embedded pubkey, so this works as a
+// trustworthy "vouching" gesture: nobody can forge an advert for
+// someone they don't have the private key for, and the original
+// timestamp is preserved so it can't replay an outdated one
+// either (peers track per-pubkey latest-timestamp and reject
+// older).
+func (g *GUI) shareMcContact(ct meshcore.Contact) {
+	g.mcMu.Lock()
+	client := g.mcClient
+	g.mcMu.Unlock()
+	if client == nil {
+		g.mcAppendSystem("share contact: not connected")
+		return
+	}
+	display := ct.AdvName
+	if display == "" {
+		display = fmt.Sprintf("%x", ct.PubKey[:6])
+	}
+	go func() {
+		if err := client.ShareContact(ct.PubKey); err != nil {
+			g.mcAppendSystem("share contact " + display + ": " + err.Error())
+			return
+		}
+		g.mcAppendSystem("re-flooded advert for " + display + " — neighbours can pick it up if in range")
+	}()
 }
 
 // confirmResetMcPath asks before issuing CmdResetPath. The
@@ -7553,6 +7583,7 @@ func (g *GUI) showMcMapNodeContextMenu(pub meshcore.PubKey, absPos fyne.Position
 			}
 			mw.AppendMessagePath(nodes)
 		}),
+		fyne.NewMenuItem("Share over mesh", func() { g.shareMcContact(ct) }),
 		fyne.NewMenuItem("Reset path", func() { g.confirmResetMcPath(ct) }),
 	)
 	widget.ShowPopUpMenuAtPosition(menu, g.window.Canvas(), absPos)
