@@ -9253,16 +9253,28 @@ func (g *GUI) mcShowPathForRxLog(visibleIdx int) {
 	}
 	nodes := make([]mapview.MessagePathNode, 0, hashCount+1)
 	// Walk the path in transmit order — each hash is the prefix
-	// of a forwarder's pubkey.
+	// of a forwarder's pubkey. resolvePathHopHash disambiguates
+	// 1-byte collisions by preferring repeaters (path hops are
+	// almost always repeater nodes) and, where multiple
+	// repeaters collide, the one closest to the prior hop.
+	prevLat, prevLon := selfLat, selfLon
 	for h := 0; h < hashCount && h*hashSize+hashSize <= len(pkt.Path); h++ {
 		hashBytes := pkt.Path[h*hashSize : h*hashSize+hashSize]
-		var matched *meshcore.Contact
-		for i := range contacts {
-			if matchPathHash(contacts[i].PubKey[:], hashBytes) {
-				c := contacts[i]
-				matched = &c
-				break
-			}
+		matched, nMatches := resolvePathHopHash(contacts, hashBytes, prevLat, prevLon)
+		if nMatches > 1 && g.mcLog != nil {
+			g.mcLog.Debugw("path-hash collision",
+				"hash", fmt.Sprintf("%x", hashBytes),
+				"matches", nMatches,
+				"picked", func() string {
+					if matched != nil {
+						return matched.AdvName
+					}
+					return "(none)"
+				}(),
+			)
+		}
+		if matched != nil && (matched.AdvLatE6 != 0 || matched.AdvLonE6 != 0) {
+			prevLat, prevLon = matched.LatDegrees(), matched.LonDegrees()
 		}
 		if matched != nil && (matched.AdvLatE6 != 0 || matched.AdvLonE6 != 0) {
 			nodes = append(nodes, mapview.MessagePathNode{
@@ -9417,15 +9429,27 @@ func (g *GUI) buildPathFromPacketLocked(pkt meshcore.Packet) []mapview.MessagePa
 	if pkt.PathLen == 0xFF {
 		hashCount = 0
 	}
+	selfLat := float64(g.mcSelfInfo.AdvLatE6) / 1e6
+	selfLon := float64(g.mcSelfInfo.AdvLonE6) / 1e6
 	nodes := make([]mapview.MessagePathNode, 0, hashCount+1)
+	prevLat, prevLon := selfLat, selfLon
 	for h := 0; h < hashCount && h*hashSize+hashSize <= len(pkt.Path); h++ {
 		hashBytes := pkt.Path[h*hashSize : h*hashSize+hashSize]
-		var matched *meshcore.Contact
-		for i := range g.mcContacts {
-			if matchPathHash(g.mcContacts[i].PubKey[:], hashBytes) {
-				matched = &g.mcContacts[i]
-				break
-			}
+		matched, nMatches := resolvePathHopHash(g.mcContacts, hashBytes, prevLat, prevLon)
+		if nMatches > 1 && g.mcLog != nil {
+			g.mcLog.Debugw("path-hash collision",
+				"hash", fmt.Sprintf("%x", hashBytes),
+				"matches", nMatches,
+				"picked", func() string {
+					if matched != nil {
+						return matched.AdvName
+					}
+					return "(none)"
+				}(),
+			)
+		}
+		if matched != nil && (matched.AdvLatE6 != 0 || matched.AdvLonE6 != 0) {
+			prevLat, prevLon = matched.LatDegrees(), matched.LonDegrees()
 		}
 		if matched != nil && (matched.AdvLatE6 != 0 || matched.AdvLonE6 != 0) {
 			nodes = append(nodes, mapview.MessagePathNode{
@@ -9440,8 +9464,6 @@ func (g *GUI) buildPathFromPacketLocked(pkt meshcore.Packet) []mapview.MessagePa
 			})
 		}
 	}
-	selfLat := float64(g.mcSelfInfo.AdvLatE6) / 1e6
-	selfLon := float64(g.mcSelfInfo.AdvLonE6) / 1e6
 	if selfLat != 0 || selfLon != 0 {
 		nodes = append(nodes, mapview.MessagePathNode{
 			Name: g.mcSelfInfo.Name,
@@ -9465,6 +9487,74 @@ func matchPathHash(pubKey, hash []byte) bool {
 		}
 	}
 	return true
+}
+
+// resolvePathHopHash picks the best contact match for one path-hash
+// hop in a packet's path field. Handles the 1-byte-collision case
+// that's frequent on busy meshes: the firmware's default path-hash
+// width is 1 byte (256 distinct values) so two repeaters whose
+// pubkeys share the same leading byte are indistinguishable to a
+// naive first-match scan. Disambiguation rules, in order:
+//
+//  1. Prefer an exact-match repeater (path hops are essentially
+//     always repeaters; matching a Chat contact whose pubkey
+//     happens to share the leading byte is almost always wrong).
+//  2. Among multiple repeaters, prefer one whose advertised
+//     position is closer to the existing path's geographic
+//     trajectory — encoded by neighbour, the previous resolved
+//     hop. Caller passes prevLat/prevLon as the anchor; pass 0,0
+//     when there's no prior position to anchor on.
+//  3. Fall through to the first match of any type so a non-zero
+//     path always renders something rather than collapsing to
+//     placeholders just because no repeater matches.
+//
+// Returns (best, allMatchCount). allMatchCount > 1 indicates a
+// genuine collision the caller may want to log for diagnostics.
+func resolvePathHopHash(contacts []meshcore.Contact, hashBytes []byte, prevLat, prevLon float64) (best *meshcore.Contact, allMatchCount int) {
+	type candidate struct {
+		idx  int
+		dist float64
+		hasD bool
+	}
+	var repeaters, others []candidate
+	for i := range contacts {
+		if !matchPathHash(contacts[i].PubKey[:], hashBytes) {
+			continue
+		}
+		allMatchCount++
+		c := candidate{idx: i}
+		if (prevLat != 0 || prevLon != 0) && (contacts[i].AdvLatE6 != 0 || contacts[i].AdvLonE6 != 0) {
+			d, ok := distanceMiles(prevLat, prevLon,
+				contacts[i].LatDegrees(), contacts[i].LonDegrees(),
+				contacts[i].AdvLatE6, contacts[i].AdvLonE6)
+			c.dist, c.hasD = d, ok
+		}
+		if contacts[i].Type == meshcore.AdvTypeRepeater {
+			repeaters = append(repeaters, c)
+		} else {
+			others = append(others, c)
+		}
+	}
+	pick := func(set []candidate) *meshcore.Contact {
+		if len(set) == 0 {
+			return nil
+		}
+		// Prefer the candidate closest to the path's prior anchor
+		// when distance data is available; fall back to the first.
+		bestIdx := set[0].idx
+		bestDist := set[0].dist
+		bestHas := set[0].hasD
+		for _, c := range set[1:] {
+			if c.hasD && (!bestHas || c.dist < bestDist) {
+				bestIdx, bestDist, bestHas = c.idx, c.dist, c.hasD
+			}
+		}
+		return &contacts[bestIdx]
+	}
+	if r := pick(repeaters); r != nil {
+		return r, allMatchCount
+	}
+	return pick(others), allMatchCount
 }
 
 // mcInterpolatePathPlaceholders fills in lat/lon for placeholder
