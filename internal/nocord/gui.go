@@ -9189,15 +9189,137 @@ func (g *GUI) buildMeshcoreRxLog() *fyne.Container {
 	}
 
 	bg := canvas.NewRectangle(color.RGBA{30, 32, 38, 255})
+	// Top-right (?) button that opens a dialog explaining how the
+	// trace-route animation works, the firmware's path-hash
+	// configuration we observed in recent packets, and the
+	// fundamental 1-byte collision limitation. Placed in the
+	// RxLog header (right corner of the top half of the MeshCore
+	// right column) since that's where the data driving the
+	// trace originates.
+	helpBtn := widget.NewButtonWithIcon("", theme.QuestionIcon(), g.showMcTraceHelpDialog)
+	helpBtn.Importance = widget.LowImportance
+	header := container.NewBorder(
+		nil, nil,
+		container.NewPadded(g.mcRxLogHeader),
+		helpBtn, nil,
+	)
 	g.mcRxLogPane = container.NewStack(
 		bg,
 		container.NewBorder(
-			container.NewPadded(g.mcRxLogHeader),
+			header,
 			nil, nil, nil,
 			g.mcRxLogList,
 		),
 	)
 	return g.mcRxLogPane
+}
+
+// showMcTraceHelpDialog opens a read-only dialog explaining how
+// the lightning trace-route animation on the map works, what the
+// firmware's path-hash configuration looks like in recent
+// traffic, and why 1-byte hashes occasionally pick the "wrong"
+// repeater on dense meshes. Data-driven where possible: hash
+// size + hop distribution are sampled from the live mcRxLog
+// ring so the operator sees what their radio is actually
+// experiencing right now.
+func (g *GUI) showMcTraceHelpDialog() {
+	g.mcMu.Lock()
+	log := append([]mcRxLogEntry(nil), g.mcRxLog...)
+	contacts := append([]meshcore.Contact(nil), g.mcContacts...)
+	g.mcMu.Unlock()
+
+	// Sample observed hash sizes + hop counts from the RxLog
+	// ring. Skip the 0xFF "no path" sentinel since it carries
+	// no hop info.
+	hashSizeHistogram := map[int]int{}
+	hopHistogram := map[int]int{}
+	var sampledPackets int
+	for _, e := range log {
+		if e.packet.PathLen == 0xFF {
+			continue
+		}
+		hashSize := int(e.packet.PathLen>>6) + 1
+		hopCount := int(e.packet.PathLen & 0x3F)
+		hashSizeHistogram[hashSize]++
+		hopHistogram[hopCount]++
+		sampledPackets++
+	}
+
+	// Count current potential collisions: how many of our
+	// contacts share a 1-byte leading-byte prefix with another
+	// contact? Quick O(N) histogram of first bytes.
+	firstByteCount := map[byte]int{}
+	for _, c := range contacts {
+		firstByteCount[c.PubKey[0]]++
+	}
+	collidingFirstBytes := 0
+	collidingContacts := 0
+	for _, n := range firstByteCount {
+		if n > 1 {
+			collidingFirstBytes++
+			collidingContacts += n
+		}
+	}
+
+	var hashSizeLine string
+	if sampledPackets == 0 {
+		hashSizeLine = "(no recent packets sampled yet — connect and listen for a minute)"
+	} else {
+		parts := make([]string, 0, len(hashSizeHistogram))
+		for sz := 1; sz <= 4; sz++ {
+			if n, ok := hashSizeHistogram[sz]; ok {
+				parts = append(parts, fmt.Sprintf("%dB ×%d", sz, n))
+			}
+		}
+		hashSizeLine = strings.Join(parts, ",  ") + fmt.Sprintf("   (from %d packets)", sampledPackets)
+	}
+
+	hopParts := make([]string, 0)
+	for hops := 0; hops <= 8; hops++ {
+		if n, ok := hopHistogram[hops]; ok {
+			hopParts = append(hopParts, fmt.Sprintf("%dh×%d", hops, n))
+		}
+	}
+	hopLine := strings.Join(hopParts, ", ")
+	if hopLine == "" {
+		hopLine = "(no packets with path data sampled yet)"
+	}
+
+	body := container.NewVBox(
+		wrappedLabel("HOW IT WORKS"),
+		wrappedLabel(
+			"When the radio receives a mesh packet, the packet's `path` field carries one short hash per repeater hop — the leading bytes of each forwarder's pubkey. NocordHF walks that path and animates each hop on the map, matching each hash against your contacts roster to plot named nodes (and interpolating positions for hops you don't know yet)."),
+		wrappedLabel("WIRE FORMAT"),
+		wrappedLabel(
+			"The packet's PathLen byte encodes two things: top 2 bits = hash size per hop (1, 2, 3, or 4 bytes), bottom 6 bits = hop count (0-63). 0xFF is the \"direct, no path captured\" sentinel."),
+		wrappedLabel("OBSERVED IN YOUR TRAFFIC"),
+		wrappedLabel("  Hash size distribution:  "+hashSizeLine),
+		wrappedLabel("  Hop count distribution:   "+hopLine),
+		wrappedLabel("LIMITATION: 1-BYTE COLLISIONS"),
+		wrappedLabel(
+			"The firmware default is 1 byte per hash — 256 possible values. With dozens of repeaters in earshot, two repeaters whose pubkeys share the same leading byte are indistinguishable from the path field alone. The protocol supports up to 4-byte hashes but firmware mostly uses 1."),
+		wrappedLabel(fmt.Sprintf(
+			"  Right now you have %d contacts; %d distinct leading bytes collide across %d contacts (~%d%% chance a hop hash is ambiguous).",
+			len(contacts), collidingFirstBytes, collidingContacts, percentInt(collidingContacts, len(contacts)))),
+		wrappedLabel("HOW NOCORDHF DISAMBIGUATES"),
+		wrappedLabel(
+			"When a hash matches multiple contacts, NocordHF prefers (1) the Repeater type (path hops are almost always repeaters), then (2) the repeater geographically closest to the previously-resolved hop. Failing both, it falls back to any match so a path still renders rather than collapsing to placeholders. Collisions are logged at debug level in nocordhf.log as `path-hash collision`."),
+		wrappedLabel("WHAT WE CAN'T FIX HOST-SIDE"),
+		wrappedLabel(
+			"The hash size is chosen by the SENDER's firmware when it builds the packet; we can only work with what's on the wire. Until the MeshCore firmware default changes to wider hashes, occasional misattribution on dense meshes is fundamental — the disambiguation rules above are a best-effort heuristic."),
+	)
+	scroll := container.NewVScroll(body)
+	scroll.SetMinSize(fyne.NewSize(560, 460))
+	dialog.ShowCustom("About trace routing", "Close", scroll, g.window)
+}
+
+// percentInt returns an integer percentage of n/total, guarded
+// against divide-by-zero for empty contact rosters.
+func percentInt(n, total int) int {
+	if total == 0 {
+		return 0
+	}
+	return n * 100 / total
 }
 
 // showRxLogContextMenu pops up a right-click menu on a row in the
