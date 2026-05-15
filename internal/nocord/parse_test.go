@@ -3,12 +3,69 @@ package nocord
 import (
 	"strings"
 	"testing"
+
+	"github.com/kyleomalley/nocordhf/lib/meshcore"
 )
 
 // Regression: lat/long pairs in chat (e.g. "34.14289, -118.03159"
 // posted in #wardriving) should render as Google Maps links. Pins
 // the regex against false-positives ("1, 2", message-id pairs)
 // and out-of-range values that look superficially valid.
+// Regression: mc://contact/<base64> URLs in chat must be detected
+// as contact-card segments (with a decoded card payload), not
+// confused with regular http(s) URLs by the URL regex.
+func TestMcParseChatSegmentsContactCard(t *testing.T) {
+	card := meshcore.ContactCard{
+		Type:     meshcore.AdvTypeChat,
+		AdvLatE6: 33023292,
+		AdvLonE6: -117078028,
+		Name:     "Kohaku",
+	}
+	for i := range card.PubKey {
+		card.PubKey[i] = byte(i ^ 0x5a)
+	}
+	cardURL := meshcore.EncodeContactCard(card)
+	cases := []struct {
+		name        string
+		in          string
+		wantPubName string // expected card.Name when a card is found, "" when not
+	}{
+		{
+			"bare card",
+			cardURL,
+			card.Name,
+		},
+		{
+			"card with surrounding chat",
+			"check this out: " + cardURL + " — KO9OXR you nearby?",
+			card.Name,
+		},
+		{
+			"plain http URL is not a card",
+			"https://example.com/page",
+			"",
+		},
+		{
+			"malformed card decodes to nothing",
+			"mc://contact/!!!",
+			"",
+		},
+	}
+	for _, c := range cases {
+		segs := mcParseChatSegments(c.in, nil, "")
+		var foundName string
+		for _, s := range segs {
+			if s.card != nil {
+				foundName = s.card.Name
+				break
+			}
+		}
+		if foundName != c.wantPubName {
+			t.Errorf("%s: got card name %q, want %q", c.name, foundName, c.wantPubName)
+		}
+	}
+}
+
 func TestMcParseChatSegmentsGeo(t *testing.T) {
 	cases := []struct {
 		in       string

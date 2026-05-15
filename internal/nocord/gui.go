@@ -7443,10 +7443,141 @@ func (g *GUI) showMcContactContextMenu(visibleIdx int, absPos fyne.Position) {
 		fyne.NewMenuItem(favLabel, func() { g.mcToggleFavorite(ct.PubKey) }),
 		fyne.NewMenuItem("Info", func() { g.showMcContactInfoDialog(ct) }),
 		fyne.NewMenuItem("Share over mesh", func() { g.shareMcContact(ct) }),
+		fyne.NewMenuItem("Share in channel…", func() { g.showMcShareInChannelDialog(ct) }),
 		fyne.NewMenuItem("Reset path", func() { g.confirmResetMcPath(ct) }),
 		fyne.NewMenuItem("Remove", func() { g.confirmRemoveMcContact(ct) }),
 	)
 	widget.ShowPopUpMenuAtPosition(menu, canvas, absPos)
+}
+
+// showMcShareInChannelDialog opens a dialog with a channel
+// picker for sharing a contact card. Used when no convenient
+// anchor widget is available (sidebar / map context menus open
+// from a popup, so we use a modal instead of a popup-anchored
+// submenu).
+func (g *GUI) showMcShareInChannelDialog(ct meshcore.Contact) {
+	g.mcMu.Lock()
+	channels := append([]meshcore.Channel(nil), g.mcChannels...)
+	g.mcMu.Unlock()
+	if len(channels) == 0 {
+		g.mcAppendSystem("share in channel: no channels configured — add one in the sidebar first")
+		return
+	}
+	options := make([]string, 0, len(channels))
+	byLabel := map[string]meshcore.Channel{}
+	for _, ch := range channels {
+		label, _ := mcChannelLabel(ch)
+		options = append(options, label)
+		byLabel[label] = ch
+	}
+	sel := widget.NewSelect(options, nil)
+	sel.SetSelected(options[0])
+	display := ct.AdvName
+	if display == "" {
+		display = fmt.Sprintf("%x", ct.PubKey[:6])
+	}
+	body := container.NewVBox(
+		wrappedLabel(fmt.Sprintf("Share %s as a contact card in:", display)),
+		sel,
+		wrappedLabel("The recipient sees a clickable [Add contact] pill in chat. The card is short — pubkey + name + lat/lon — but does NOT include a signature, so trust the channel members accordingly."),
+	)
+	dialog.ShowCustomConfirm("Share contact in channel", "Send", "Cancel", body, func(ok bool) {
+		if !ok {
+			return
+		}
+		ch, found := byLabel[sel.Selected]
+		if !found {
+			return
+		}
+		g.sendMcContactCardToChannel(ct, ch)
+	}, g.window)
+}
+
+// sendMcContactCardToChannel encodes ct as an mc://contact/<b64>
+// URL and sends it as a channel chat message. Errors surface in
+// the system log; the message is short enough that the 140-byte
+// LoRa cap can never be hit (EncodeContactCard caps name at 32B,
+// guaranteeing total ≤ ~115 bytes).
+func (g *GUI) sendMcContactCardToChannel(ct meshcore.Contact, ch meshcore.Channel) {
+	g.mcMu.Lock()
+	client := g.mcClient
+	g.mcMu.Unlock()
+	if client == nil {
+		g.mcAppendSystem("share in channel: not connected")
+		return
+	}
+	card := meshcore.ContactCard{
+		PubKey:   ct.PubKey,
+		Type:     ct.Type,
+		AdvLatE6: ct.AdvLatE6,
+		AdvLonE6: ct.AdvLonE6,
+		Name:     ct.AdvName,
+	}
+	url := meshcore.EncodeContactCard(card)
+	chLabel, _ := mcChannelLabel(ch)
+	display := ct.AdvName
+	if display == "" {
+		display = fmt.Sprintf("%x", ct.PubKey[:6])
+	}
+	go func() {
+		if _, err := client.SendChannelMessage(ch.Index, time.Now().UTC(), url); err != nil {
+			g.mcAppendSystem(fmt.Sprintf("share %s in %s: %s", display, chLabel, err.Error()))
+			return
+		}
+		g.mcAppendSystem(fmt.Sprintf("shared contact %s in %s", display, chLabel))
+	}()
+}
+
+// showMcImportContactCardDialog handles a click on a chat-pill
+// representing a received contact card. Asks the operator to
+// confirm before adding the pubkey to their radio's contact
+// table — the card has no embedded signature so trust is on
+// the channel sender, not the firmware's signature verifier.
+// Once admitted, the radio's normal advert-verification kicks
+// in on the next on-air advert from this pubkey.
+func (g *GUI) showMcImportContactCardDialog(card meshcore.ContactCard) {
+	// If the contact is already in the local table, skip the
+	// dialog and just say so — adding twice would no-op on the
+	// radio but waste a wire round-trip.
+	g.mcMu.Lock()
+	for _, c := range g.mcContacts {
+		if c.PubKey == card.PubKey {
+			g.mcMu.Unlock()
+			g.mcAppendSystem("contact " + card.Name + " is already in your roster")
+			return
+		}
+	}
+	g.mcMu.Unlock()
+	display := card.Name
+	if display == "" {
+		display = fmt.Sprintf("%x", card.PubKey[:6])
+	}
+	body := fmt.Sprintf(
+		"Add %s (%s) to your contacts?\n\nPubkey: %x...\n\nThe card was shared in a channel — trust the sender accordingly. The radio will verify signatures against this pubkey on the next on-air advert.",
+		display,
+		strings.ToLower(card.Type.String()),
+		card.PubKey[:6],
+	)
+	dialog.ShowConfirm("Add shared contact?", body, func(ok bool) {
+		if !ok {
+			return
+		}
+		g.mcMu.Lock()
+		client := g.mcClient
+		g.mcMu.Unlock()
+		if client == nil {
+			g.mcAppendSystem("import contact: not connected")
+			return
+		}
+		go func() {
+			if err := client.AddUpdateContact(card.AsContact()); err != nil {
+				g.mcAppendSystem("import " + display + ": " + err.Error())
+				return
+			}
+			g.mcAppendSystem("added contact (from channel share): " + display)
+			g.scheduleMcContactsRefresh(client)
+		}()
+	}, g.window)
 }
 
 // shareMcContact tells the radio to re-broadcast the cached
@@ -7584,6 +7715,7 @@ func (g *GUI) showMcMapNodeContextMenu(pub meshcore.PubKey, absPos fyne.Position
 			mw.AppendMessagePath(nodes)
 		}),
 		fyne.NewMenuItem("Share over mesh", func() { g.shareMcContact(ct) }),
+		fyne.NewMenuItem("Share in channel…", func() { g.showMcShareInChannelDialog(ct) }),
 		fyne.NewMenuItem("Reset path", func() { g.confirmResetMcPath(ct) }),
 	)
 	widget.ShowPopUpMenuAtPosition(menu, g.window.Canvas(), absPos)
@@ -7712,6 +7844,14 @@ func (g *GUI) mcAttachHashLinks(msgSegments *fyne.Container, text string, plainC
 	msgSegments.RemoveAll()
 	for _, s := range segs {
 		switch {
+		case s.card != nil:
+			card := *s.card
+			label := fmt.Sprintf("[Add contact: %s (%s)]", card.Name, strings.ToLower(card.Type.String()))
+			link := newMcHashLink(label,
+				func() { g.showMcImportContactCardDialog(card) },
+				nil,
+			)
+			msgSegments.Add(link)
 		case s.url != "":
 			href := s.url
 			link := newMcHashLink(s.text,
@@ -11055,6 +11195,11 @@ type mcHashSegment struct {
 	mentionSelf bool            // true when the mention targets the operator's own advert name
 	url         string          // populated for http(s) URL spans — render as clickable link
 	pub         meshcore.PubKey // populated when link == true OR mention resolved to a contact
+	// card is non-nil when this segment represents a decoded
+	// mc://contact/<base64> contact-share. Renderer shows it as
+	// a clickable pill (name + type icon + "Add contact") instead
+	// of the URL string.
+	card *meshcore.ContactCard
 }
 
 // mcURLRe matches http:// and https:// URLs. The character class
@@ -11063,6 +11208,13 @@ type mcHashSegment struct {
 // it after matching to keep the link targeting the actual page,
 // not page-plus-period.
 var mcURLRe = regexp.MustCompile(`https?://\S+`)
+
+// mcContactCardRe matches the in-channel contact-share URL form
+// — mc://contact/<base64-url-safe-no-padding>. Detected as an
+// outermost frame in the chat-segment parser so it renders as a
+// chat pill (name + add-contact button) rather than as a raw URL.
+// Allows base64url alphabet plus the closing whitespace boundary.
+var mcContactCardRe = regexp.MustCompile(`mc://contact/[A-Za-z0-9_-]+`)
 
 // mcURLTrimTrailing is the set of punctuation characters peeled
 // off the right end of a URL match before the link is rendered.
@@ -11140,13 +11292,38 @@ func mcParseChatSegments(text string, contacts []meshcore.Contact, selfName stri
 	if text == "" {
 		return nil
 	}
+	cardLocs := mcContactCardRe.FindAllStringIndex(text, -1)
 	urlLocs := mcURLRe.FindAllStringIndex(text, -1)
 	mentionLocs := mcMentionRe.FindAllStringSubmatchIndex(text, -1)
 	geoLocs := mcGeoRe.FindAllStringSubmatchIndex(text, -1)
-	if len(urlLocs) == 0 && len(mentionLocs) == 0 && len(geoLocs) == 0 {
-		// No URLs / mentions / geo coords — fall through to
-		// hash-only parsing.
+	if len(cardLocs) == 0 && len(urlLocs) == 0 && len(mentionLocs) == 0 && len(geoLocs) == 0 {
+		// No URLs / mentions / geo coords / cards — fall through
+		// to hash-only parsing.
 		return mcParseHashLinks(text, contacts)
+	}
+	// Splice contact-card spans into urlLocs as outermost frames.
+	// Cards have priority over URL detection because mc:// would
+	// otherwise be skipped by mcURLRe (which only matches https?://).
+	// Decoded card data lives in the per-segment `card` field;
+	// the visible text stays the original mc://contact/<...> URL
+	// so non-NocordHF clients see something they recognise as
+	// shareable.
+	cardSegments := make(map[int]meshcore.ContactCard, len(cardLocs))
+	if len(cardLocs) > 0 {
+		merged := make([][]int, 0, len(urlLocs)+len(cardLocs))
+		merged = append(merged, urlLocs...)
+		for _, c := range cardLocs {
+			urlText := text[c[0]:c[1]]
+			if card, err := meshcore.DecodeContactCard(urlText); err == nil {
+				cardSegments[c[0]] = card
+				merged = append(merged, c)
+			}
+		}
+		// Sort by start offset so the outer URL loop stays
+		// monotonic. Two URL spans never overlap because the
+		// regexes are greedy on non-whitespace.
+		sort.Slice(merged, func(i, j int) bool { return merged[i][0] < merged[j][0] })
+		urlLocs = merged
 	}
 	var out []mcHashSegment
 	cursor := 0
@@ -11245,13 +11422,22 @@ func mcParseChatSegments(text string, contacts []meshcore.Contact, selfName stri
 			emitMentionsHashesPlain(s[geoCursor:])
 		}
 	}
-	// Walk URL matches as outermost frames. Plain text between
-	// URLs goes through mention + hash extraction.
+	// Walk URL matches (URLs + contact-card URLs merged) as
+	// outermost frames. Plain text between them goes through
+	// mention + hash extraction.
 	for _, u := range urlLocs {
 		if u[0] > cursor {
 			emitMentionsAndPlain(text[cursor:u[0]])
 		}
 		raw := text[u[0]:u[1]]
+		// Contact-card span — emit as a card segment, not a URL,
+		// so the renderer draws a pill instead of underlined text.
+		if card, ok := cardSegments[u[0]]; ok {
+			c := card
+			out = append(out, mcHashSegment{text: raw, url: raw, card: &c})
+			cursor = u[1]
+			continue
+		}
 		// Peel trailing punctuation that's almost certainly part
 		// of the surrounding prose, not the URL.
 		trim := strings.TrimRight(raw, mcURLTrimTrailing)
