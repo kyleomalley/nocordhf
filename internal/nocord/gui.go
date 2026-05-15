@@ -8468,23 +8468,42 @@ func (g *GUI) showMcChatRowInfo(r chatRow) {
 }
 
 // showMcChatRowMapTrace animates the route a chat-row message took
-// across the mesh. Prefers the path snapshot persisted on the row
-// (captured at incoming-append time and reloaded from bbolt across
-// relaunches) and falls back to live RxLog correlation for rows
-// that predate the persisted-path schema or that arrived without a
-// matching frame in the ring. No-op with a friendly system line
-// when neither source has a path.
+// across the mesh. Three sources of path data, tried in order:
+//
+//  1. Row's persisted mcPathLen/mcPath snapshot — set at incoming-
+//     append time from the matching RxLog frame, and reloaded
+//     from bbolt across relaunches.
+//  2. Live RxLog correlation — for inbound rows that predate the
+//     persisted-path schema or whose original RxLog entry hasn't
+//     yet rolled out of the 200-entry ring.
+//  3. Destination contact's cached OutPath — for OUTBOUND DM rows
+//     (which have no inbound packet to correlate against). The
+//     firmware stores the route it used to send to each contact
+//     in Contact.OutPath; rendering that path is exactly the
+//     trace the operator wants for a "what route did my DM
+//     take?" question.
+//
+// Outbound channel messages and TX rows with no destination context
+// (no active DM thread) fall through to a friendly system line.
 func (g *GUI) showMcChatRowMapTrace(r chatRow) {
 	var pkt meshcore.Packet
-	if r.mcPathLen != 0 || len(r.mcPath) > 0 {
+	switch {
+	case r.mcPathLen != 0 || len(r.mcPath) > 0:
 		pkt = meshcore.Packet{PathLen: r.mcPathLen, Path: r.mcPath}
-	} else {
+	case !r.tx:
+		// Inbound row without a persisted path — try the live
+		// RxLog ring.
 		var ok bool
 		pkt, ok = g.findMcRxLogPacketForRow(r)
 		if !ok {
 			g.mcAppendSystem("no captured path for this message — try a more recent one")
 			return
 		}
+	default:
+		// Outbound row — pull the cached path from the
+		// destination contact (only meaningful for DMs).
+		g.showMcOutboundChatRowMapTrace(r)
+		return
 	}
 	g.mcMu.Lock()
 	nodes := g.buildPathFromPacketLocked(pkt)
@@ -8494,6 +8513,132 @@ func (g *GUI) showMcChatRowMapTrace(r chatRow) {
 		return
 	}
 	mw.AppendMessagePath(nodes)
+}
+
+// showMcOutboundChatRowMapTrace renders the route an outbound DM
+// took, sourced from the destination contact's firmware-cached
+// OutPath. Outbound channel messages have no single destination
+// (FLOOD to everyone) so this only fires for contact threads.
+//
+// Node order is [self, hop1, …, hopN, destination] — the reverse
+// of the inbound case, since the packet leaves us and arrives at
+// the contact. If OutPathLen <= 0, the firmware has no cached
+// path and the next send will FLOOD; tell the operator so they
+// know there's no specific route to draw.
+func (g *GUI) showMcOutboundChatRowMapTrace(r chatRow) {
+	g.mcMu.Lock()
+	thread := g.mcCurrentThread
+	contacts := append([]meshcore.Contact(nil), g.mcContacts...)
+	selfLat := float64(g.mcSelfInfo.AdvLatE6) / 1e6
+	selfLon := float64(g.mcSelfInfo.AdvLonE6) / 1e6
+	selfName := g.mcSelfInfo.Name
+	g.mcMu.Unlock()
+	if !strings.HasPrefix(thread, "contact:") {
+		g.mcAppendSystem("trace path only available for DMs — channel messages flood to all listeners")
+		return
+	}
+	prefixHex := thread[len("contact:"):]
+	prefix, err := hex.DecodeString(prefixHex)
+	if err != nil {
+		g.mcAppendSystem("trace path: malformed thread id " + thread)
+		return
+	}
+	var dest *meshcore.Contact
+	for i := range contacts {
+		if len(prefix) <= len(contacts[i].PubKey) &&
+			bytesPrefixEqual(contacts[i].PubKey[:], prefix) {
+			dest = &contacts[i]
+			break
+		}
+	}
+	if dest == nil {
+		g.mcAppendSystem("trace path: destination contact not found in roster")
+		return
+	}
+	display := dest.AdvName
+	if display == "" {
+		display = fmt.Sprintf("%x", dest.PubKey[:6])
+	}
+	if dest.OutPathLen <= 0 {
+		g.mcAppendSystem(fmt.Sprintf("no cached path to %s — your radio will FLOOD on next send (right-click contact → Reset path to force re-discovery)", display))
+		return
+	}
+	pathBytes := dest.OutPath[:dest.OutPathLen]
+	// Build the node sequence walking from us outward. Each byte
+	// of OutPath is a 1-byte path-hash hop. resolvePathHopHash
+	// disambiguates 1-byte collisions using the prior hop's
+	// geography as anchor; self is the initial anchor.
+	nodes := make([]mapview.MessagePathNode, 0, int(dest.OutPathLen)+2)
+	if selfLat != 0 || selfLon != 0 {
+		nodes = append(nodes, mapview.MessagePathNode{
+			Name: selfName,
+			Lat:  selfLat,
+			Lon:  selfLon,
+		})
+	}
+	prevLat, prevLon := selfLat, selfLon
+	for h := 0; h < len(pathBytes); h++ {
+		hashBytes := pathBytes[h : h+1]
+		matched, _ := resolvePathHopHash(contacts, hashBytes, prevLat, prevLon)
+		if matched != nil && (matched.AdvLatE6 != 0 || matched.AdvLonE6 != 0) {
+			nodes = append(nodes, mapview.MessagePathNode{
+				Name: matched.AdvName,
+				Lat:  matched.LatDegrees(),
+				Lon:  matched.LonDegrees(),
+			})
+			prevLat, prevLon = matched.LatDegrees(), matched.LonDegrees()
+		} else {
+			nodes = append(nodes, mapview.MessagePathNode{
+				Name:        fmt.Sprintf("%x?", hashBytes),
+				Placeholder: true,
+			})
+		}
+	}
+	// Destination at the end — known position (or placeholder if
+	// the contact never broadcast lat/lon).
+	if dest.AdvLatE6 != 0 || dest.AdvLonE6 != 0 {
+		nodes = append(nodes, mapview.MessagePathNode{
+			Name: dest.AdvName,
+			Lat:  dest.LatDegrees(),
+			Lon:  dest.LonDegrees(),
+		})
+	} else {
+		nodes = append(nodes, mapview.MessagePathNode{
+			Name:        dest.AdvName,
+			Placeholder: true,
+		})
+	}
+	mcInterpolatePathPlaceholders(nodes)
+	mw := g.scopeMapWidget()
+	if mw == nil || len(nodes) < 2 {
+		return
+	}
+	mw.AppendMessagePath(nodes)
+	g.mcAppendSystem(fmt.Sprintf("traced outbound DM path to %s (%d hop%s)", display, dest.OutPathLen, plural(int(dest.OutPathLen))))
+}
+
+// bytesPrefixEqual returns true when prefix matches the leading
+// bytes of full. Used in contact lookup by 6-byte thread-id
+// prefix (the standard MeshCore addressing handle for DMs).
+func bytesPrefixEqual(full, prefix []byte) bool {
+	if len(prefix) > len(full) {
+		return false
+	}
+	for i := range prefix {
+		if full[i] != prefix[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// plural returns "s" when n != 1 — small grammar helper to avoid
+// "1 hops" / "2 hop" awkwardness in the system message.
+func plural(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
 }
 
 // mcCapturePathFromRxLog stamps the row with the route bytes from
