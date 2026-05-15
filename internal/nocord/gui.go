@@ -382,7 +382,14 @@ type GUI struct {
 	// mcRebuildContactsViewLocked from mcContacts + mcContactsFilter
 	// so list count / bind / OnSelected callbacks stay O(1) and
 	// indexing is stable across a single repaint cycle.
-	mcContactsView  []meshcore.Contact
+	mcContactsView []meshcore.Contact
+	// mcAutoAddByType is the in-memory copy of the per-type
+	// auto-add prefs (Chat / Room / Repeater / Sensor). Consulted
+	// by mcRecordPendingAdvert to decide whether to promote a
+	// freshly-arrived advert into the contacts table immediately
+	// or stash it in the pending sidebar. Hydrated on connect;
+	// updated when the operator saves Settings.
+	mcAutoAddByType map[meshcore.AdvType]bool
 	mcStatusText    *canvas.Text
 	mcCurrentThread string
 	mcThreadHistory map[string][]chatRow
@@ -1653,8 +1660,19 @@ func (g *GUI) showMeshcoreSettings() {
 			})
 		}()
 	})
-	manualAddCheck := widget.NewCheck("", nil)
-	manualAddCheck.SetChecked(prefs.BoolWithFallback(mcPrefProfileManualAdd, false))
+	// Per-type auto-add checkboxes — replace the legacy single
+	// "Manual-add" toggle. The radio is always kept in manual
+	// mode (so we get rich PushNewAdvert events); these
+	// checkboxes filter on the host side.
+	autoChat, autoRoom, autoRepeater, autoSensor := g.mcLoadAutoAddPrefs(prefs)
+	autoChatCheck := widget.NewCheck("Chat (people)", nil)
+	autoChatCheck.SetChecked(autoChat)
+	autoRoomCheck := widget.NewCheck("Room (group endpoints)", nil)
+	autoRoomCheck.SetChecked(autoRoom)
+	autoRepeaterCheck := widget.NewCheck("Repeater (infrastructure)", nil)
+	autoRepeaterCheck.SetChecked(autoRepeater)
+	autoSensorCheck := widget.NewCheck("Sensor (telemetry)", nil)
+	autoSensorCheck.SetChecked(autoSensor)
 	// "Use radio GPS" snaps the manual lat/lon entries to whatever
 	// the radio's GNSS chip last reported (T1000-E and similar
 	// trackers). Convenient one-click capture; manual edits still
@@ -1681,14 +1699,21 @@ func (g *GUI) showMeshcoreSettings() {
 		widget.NewFormItem("Name", nameEntry),
 		widget.NewFormItem("Latitude", latEntry),
 		widget.NewFormItem("Longitude", lonEntry),
-		widget.NewFormItem("Manual-add contacts", manualAddCheck),
+	)
+	autoAddBox := container.NewVBox(
+		widget.NewLabelWithStyle("Auto-add new contacts by type:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		autoChatCheck,
+		autoRoomCheck,
+		autoRepeaterCheck,
+		autoSensorCheck,
 	)
 	profileTab := container.NewVBox(
 		profileForm,
 		container.NewHBox(useGPSBtn, pickMapBtn),
 		container.NewHBox(advertBtn, profileStatus),
 		widget.NewLabel("Advert name + location are broadcast to other mesh nodes when you Send self-advert (or on the firmware's periodic advert). Leave lat/lon blank to use whatever the radio's GPS reports; explicit values override the GPS."),
-		widget.NewLabel("Manual-add: when checked, the radio stops auto-adding every node it hears. New peers must be added explicitly — useful on busy meshes where the contact table fills up."),
+		autoAddBox,
+		widget.NewLabel("Unchecked types arrive in PENDING ADVERTS instead of joining your contacts table. Repeaters don't need to be contacts for routing — only check infrastructure types you actually want to DM (admin / status / login)."),
 	)
 
 	// ── Radio tab ────────────────────────────────────────────────
@@ -1899,8 +1924,21 @@ func (g *GUI) showMeshcoreSettings() {
 			lonF, _ := strconv.ParseFloat(strings.TrimSpace(lonEntry.Text), 64)
 			prefs.SetFloat(mcPrefProfileLat, latF)
 			prefs.SetFloat(mcPrefProfileLon, lonF)
-			manualAdd := manualAddCheck.Checked
-			prefs.SetBool(mcPrefProfileManualAdd, manualAdd)
+			// Persist per-type auto-add prefs and refresh the
+			// in-memory map. The radio is always kept in manual
+			// mode below; these prefs decide host-side promotion.
+			prefs.SetBool(mcPrefAutoAddChat, autoChatCheck.Checked)
+			prefs.SetBool(mcPrefAutoAddRoom, autoRoomCheck.Checked)
+			prefs.SetBool(mcPrefAutoAddRepeater, autoRepeaterCheck.Checked)
+			prefs.SetBool(mcPrefAutoAddSensor, autoSensorCheck.Checked)
+			g.mcMu.Lock()
+			g.mcAutoAddByType = map[meshcore.AdvType]bool{
+				meshcore.AdvTypeChat:     autoChatCheck.Checked,
+				meshcore.AdvTypeRoom:     autoRoomCheck.Checked,
+				meshcore.AdvTypeRepeater: autoRepeaterCheck.Checked,
+				meshcore.AdvTypeSensor:   autoSensorCheck.Checked,
+			}
+			g.mcMu.Unlock()
 			// Radio tab persistence + push. Parsing is forgiving:
 			// blank or unparseable fields skip the corresponding
 			// SetRadioParams / SetTxPower call so the operator can
@@ -1954,7 +1992,11 @@ func (g *GUI) showMeshcoreSettings() {
 							g.mcAppendSystem("SetAdvertLatLon: " + err.Error())
 						}
 					}
-					if err := client.SetManualAddContacts(manualAdd); err != nil {
+					// Always force the radio into manual-add mode
+					// so we get rich PushNewAdvert events for every
+					// advert; per-type filtering happens host-side
+					// in mcRecordPendingAdvert.
+					if err := client.SetManualAddContacts(true); err != nil {
 						g.mcAppendSystem("SetManualAddContacts: " + err.Error())
 					}
 					// Radio params are an all-or-nothing push: the
@@ -6229,16 +6271,32 @@ func (g *GUI) refreshModeRail() {
 // (address + display name). Storing both transports' state lets the
 // operator flip between them without losing the other side's pick.
 const (
-	mcPrefTransport        = "meshcore.transport"
-	mcPrefDeviceBoard      = "meshcore.device.board"
-	mcPrefDevicePort       = "meshcore.device.port"
-	mcPrefDeviceBaud       = "meshcore.device.baud"
-	mcPrefBLEAddress       = "meshcore.ble.address"
-	mcPrefBLEDeviceName    = "meshcore.ble.device_name"
-	mcPrefProfileName      = "meshcore.profile.name"
-	mcPrefProfileLat       = "meshcore.profile.lat"
-	mcPrefProfileLon       = "meshcore.profile.lon"
+	mcPrefTransport     = "meshcore.transport"
+	mcPrefDeviceBoard   = "meshcore.device.board"
+	mcPrefDevicePort    = "meshcore.device.port"
+	mcPrefDeviceBaud    = "meshcore.device.baud"
+	mcPrefBLEAddress    = "meshcore.ble.address"
+	mcPrefBLEDeviceName = "meshcore.ble.device_name"
+	mcPrefProfileName   = "meshcore.profile.name"
+	mcPrefProfileLat    = "meshcore.profile.lat"
+	mcPrefProfileLon    = "meshcore.profile.lon"
+	// mcPrefProfileManualAdd is the legacy single-bool toggle
+	// (true = no auto-add of any type, false = auto-add everything
+	// at the radio level). Superseded by the per-type prefs below;
+	// kept for one-time migration on first read.
 	mcPrefProfileManualAdd = "meshcore.profile.manual_add"
+	// Per-type auto-add prefs. The radio is always kept in
+	// manual-add mode so we get rich PushNewAdvert events for
+	// every advert the firmware hears; these prefs decide which
+	// types get host-side auto-promoted to real contacts (via
+	// AddUpdateContact) vs stashed in the pending sidebar for
+	// the operator to review. Defaults reflect the typical
+	// operator preference: keep DM-able human/room contacts,
+	// keep infrastructure (repeaters/sensors) out of the table.
+	mcPrefAutoAddChat     = "meshcore.profile.autoadd_chat"
+	mcPrefAutoAddRoom     = "meshcore.profile.autoadd_room"
+	mcPrefAutoAddRepeater = "meshcore.profile.autoadd_repeater"
+	mcPrefAutoAddSensor   = "meshcore.profile.autoadd_sensor"
 	// Radio tab — LoRa physical layer. Stored in wire-native units
 	// (Hz for freq + bw, raw integers for SF/CR/dBm) so the values
 	// hand straight to Client.SetRadioParams / SetTxPower without
@@ -7190,13 +7248,71 @@ func (g *GUI) mcToggleFavorite(pub meshcore.PubKey) {
 	g.mcRefreshLists()
 }
 
-// mcRecordPendingAdvert upserts a pending-advert record into the
-// in-memory map and the bbolt pending bucket. Called from the
-// EventAdvert handler when Manual=true (auto-add-contacts is off
-// on the radio so the firmware never persisted this advert).
-// Skips entries that already match an admitted contact — promoting
-// to a real contact removes the pending entry, but a still-loaded
-// pending entry should NOT shadow a fresh contact import.
+// mcLoadAutoAddPrefs reads the four per-type auto-add prefs with
+// a one-time migration from the legacy single mcPrefProfileManualAdd
+// bool: if the legacy pref says manual=true (operator gatekeeping
+// everything) AND none of the new prefs are set, all four default
+// to false; otherwise the standard defaults apply (chat + room on,
+// repeater + sensor off). Returns (chat, room, repeater, sensor).
+func (g *GUI) mcLoadAutoAddPrefs(prefs fyne.Preferences) (chat, room, repeater, sensor bool) {
+	// "Has any of the new prefs been written?" → check by looking
+	// for either explicit true or non-default false. Fyne preferences
+	// don't expose existence, so we use a sentinel pattern: re-read
+	// with two different fallbacks and see if they agree.
+	const sentinel = "__nocord_unset__"
+	hasNew := prefs.StringWithFallback("meshcore.profile.autoadd_migrated", "") == "yes"
+	if !hasNew {
+		legacyManual := prefs.BoolWithFallback(mcPrefProfileManualAdd, false)
+		if legacyManual {
+			chat, room, repeater, sensor = false, false, false, false
+		} else {
+			chat, room, repeater, sensor = true, true, false, false
+		}
+		// Persist so we don't keep re-running the migration.
+		prefs.SetBool(mcPrefAutoAddChat, chat)
+		prefs.SetBool(mcPrefAutoAddRoom, room)
+		prefs.SetBool(mcPrefAutoAddRepeater, repeater)
+		prefs.SetBool(mcPrefAutoAddSensor, sensor)
+		prefs.SetString("meshcore.profile.autoadd_migrated", "yes")
+		_ = sentinel
+		return
+	}
+	chat = prefs.BoolWithFallback(mcPrefAutoAddChat, true)
+	room = prefs.BoolWithFallback(mcPrefAutoAddRoom, true)
+	repeater = prefs.BoolWithFallback(mcPrefAutoAddRepeater, false)
+	sensor = prefs.BoolWithFallback(mcPrefAutoAddSensor, false)
+	return
+}
+
+// mcAutoAddTypesLocked returns the per-type auto-add map, hydrating
+// it from prefs on first access if the operator hasn't opened
+// Settings yet this session. Caller must hold mcMu.
+func (g *GUI) mcAutoAddTypesLocked() map[meshcore.AdvType]bool {
+	if g.mcAutoAddByType != nil {
+		return g.mcAutoAddByType
+	}
+	prefs := fyne.CurrentApp().Preferences()
+	chat, room, repeater, sensor := g.mcLoadAutoAddPrefs(prefs)
+	g.mcAutoAddByType = map[meshcore.AdvType]bool{
+		meshcore.AdvTypeChat:     chat,
+		meshcore.AdvTypeRoom:     room,
+		meshcore.AdvTypeRepeater: repeater,
+		meshcore.AdvTypeSensor:   sensor,
+	}
+	return g.mcAutoAddByType
+}
+
+// mcRecordPendingAdvert decides what to do with an advert the
+// firmware delivered via PushNewAdvert (radio is in manual-add
+// mode so the firmware DIDN'T persist it). The per-type auto-add
+// prefs are consulted: if the type is checked, we promote
+// immediately (call AddUpdateContact via the wire); otherwise we
+// upsert the record into the pending bucket so it shows up in the
+// PENDING ADVERTS sidebar / map ring for operator review.
+//
+// Skips entries whose pubkey is on the blocklist OR already in
+// the contacts table — promoting an already-admitted contact
+// would no-op on the radio but we'd waste a wire round-trip.
 func (g *GUI) mcRecordPendingAdvert(c meshcore.Contact) {
 	g.mcMu.Lock()
 	if g.mcBlockedAdverts[c.PubKey] {
@@ -7208,6 +7324,35 @@ func (g *GUI) mcRecordPendingAdvert(c meshcore.Contact) {
 			g.mcMu.Unlock()
 			return
 		}
+	}
+	// Per-type auto-promote: if the operator has the type
+	// checked, push to the radio's contacts table now and skip
+	// the pending entry entirely.
+	autoTypes := g.mcAutoAddTypesLocked()
+	if autoTypes[c.Type] {
+		client := g.mcClient
+		g.mcMu.Unlock()
+		if client == nil {
+			return
+		}
+		go func() {
+			if err := client.AddUpdateContact(c); err != nil {
+				g.mcAppendSystem("auto-add " + c.AdvName + ": " + err.Error())
+				return
+			}
+			name := c.AdvName
+			if name == "" {
+				name = fmt.Sprintf("%x", c.PubKey[:4])
+			}
+			g.mcAppendSystem("added contact (auto): " + name)
+			g.mcMu.Lock()
+			cl := g.mcClient
+			g.mcMu.Unlock()
+			if cl != nil {
+				g.scheduleMcContactsRefresh(cl)
+			}
+		}()
+		return
 	}
 	if g.mcPendingAdverts == nil {
 		g.mcPendingAdverts = map[meshcore.PubKey]meshcore.StoredPendingAdvert{}
@@ -9725,17 +9870,23 @@ func (g *GUI) connectMeshcore() {
 		// so without this the per-message senderTimestamp is
 		// nonsense for the first send. Errors are non-fatal.
 		_ = client.SetDeviceTime(time.Now())
-		// Push the manual-add-contacts toggle if it differs from
-		// the radio's current state. Critical on busy meshes where
-		// auto-add fills the contacts table to MAX_CONTACTS and
-		// the firmware starts thrashing on evictions.
-		manualAdd := prefs.BoolWithFallback(mcPrefProfileManualAdd, false)
-		currentManual := info.ManualAddContacts != 0
-		if manualAdd != currentManual {
-			if err := client.SetManualAddContacts(manualAdd); err != nil {
+		// Always force manual-add ON. We get rich PushNewAdvert
+		// events for every advert that way, and per-type
+		// auto-promotion is handled host-side via the per-type
+		// auto-add prefs (see mcRecordPendingAdvert). Skipping the
+		// push when the radio's already in manual mode avoids a
+		// pointless wire round-trip on every connect.
+		if info.ManualAddContacts == 0 {
+			if err := client.SetManualAddContacts(true); err != nil {
 				g.mcAppendSystem("SetManualAddContacts: " + err.Error())
 			}
 		}
+		// Hydrate the in-memory per-type auto-add map so the very
+		// first advert after connect uses the operator's saved
+		// preferences instead of falling back to defaults.
+		g.mcMu.Lock()
+		_ = g.mcAutoAddTypesLocked()
+		g.mcMu.Unlock()
 		// Repeaters drop packets whose senderTimestamp is earlier
 		// than the most recent timestamp seen from that pubkey
 		// (per the MeshCore crypto reference). A long-running
