@@ -1711,9 +1711,9 @@ func (g *GUI) showMeshcoreSettings() {
 		profileForm,
 		container.NewHBox(useGPSBtn, pickMapBtn),
 		container.NewHBox(advertBtn, profileStatus),
-		widget.NewLabel("Advert name + location are broadcast to other mesh nodes when you Send self-advert (or on the firmware's periodic advert). Leave lat/lon blank to use whatever the radio's GPS reports; explicit values override the GPS."),
+		wrappedLabel("Advert name + location are broadcast to other mesh nodes when you Send self-advert (or on the firmware's periodic advert). Leave lat/lon blank to use whatever the radio's GPS reports; explicit values override the GPS."),
 		autoAddBox,
-		widget.NewLabel("Unchecked types arrive in PENDING ADVERTS instead of joining your contacts table. Repeaters don't need to be contacts for routing — only check infrastructure types you actually want to DM (admin / status / login)."),
+		wrappedLabel("Unchecked types arrive in PENDING ADVERTS instead of joining your contacts table. Repeaters don't need to be contacts for routing — only check infrastructure types you actually want to DM (admin / status / login)."),
 	)
 
 	// ── Radio tab ────────────────────────────────────────────────
@@ -1836,7 +1836,7 @@ func (g *GUI) showMeshcoreSettings() {
 	radioTab := container.NewVBox(
 		radioForm,
 		radioStatus,
-		widget.NewLabel("Radio settings push to the connected device on Save. Every node on the mesh must use matching frequency, bandwidth, SF, and CR — mismatches cause silent decode failures. Pick a regional preset first; tweak only if you know your repeater uses a non-standard config."),
+		wrappedLabel("Radio settings push to the connected device on Save. Every node on the mesh must use matching frequency, bandwidth, SF, and CR — mismatches cause silent decode failures. Pick a regional preset first; tweak only if you know your repeater uses a non-standard config."),
 	)
 
 	// ── Status tab ────────────────────────────────────────────────
@@ -2192,7 +2192,7 @@ func (g *GUI) buildMeshcoreStatusTab() (fyne.CanvasObject, func()) {
 	body := container.NewVBox(
 		form,
 		container.NewHBox(refreshBtn, rebootBtn, statusFooter),
-		widget.NewLabel("Snapshot of what the radio reports about itself. Cumulative counters reset on radio reboot. Battery readings on mains-powered repeaters typically read 0 mV."),
+		wrappedLabel("Snapshot of what the radio reports about itself. Cumulative counters reset on radio reboot. Battery readings on mains-powered repeaters typically read 0 mV."),
 	)
 	return body, refresh
 }
@@ -2247,6 +2247,17 @@ func formatUptime(secs uint32) string {
 		return fmt.Sprintf("%dm %ds", m, s)
 	}
 	return fmt.Sprintf("%ds", s)
+}
+
+// wrappedLabel returns a widget.Label with TextWrapWord set so
+// long explainer paragraphs in Settings dialogs reflow to the
+// container width instead of being clipped at the right edge.
+// Default Fyne labels truncate; this is the one-liner most call
+// sites that need wrapping want.
+func wrappedLabel(text string) *widget.Label {
+	l := widget.NewLabel(text)
+	l.Wrapping = fyne.TextWrapWord
+	return l
 }
 
 // formatBLESelection returns the user-facing label shown next to
@@ -8475,7 +8486,7 @@ func (g *GUI) showMcAddHashtagChannelDialog() {
 	dialog.ShowCustomConfirm("Add hashtag channel", "Join", "Cancel",
 		container.NewVBox(form,
 			derivedHint,
-			widget.NewLabel("Hashtag channels (#volcano, #meshbud, …) derive the channel secret from the name itself. Typing the name is enough to join — every node using that name shares the same key."),
+			wrappedLabel("Hashtag channels (#volcano, #meshbud, …) derive the channel secret from the name itself. Typing the name is enough to join — every node using that name shares the same key."),
 			warning,
 		),
 		func(ok bool) {
@@ -8523,7 +8534,7 @@ func (g *GUI) showMcAddPrivateChannelDialog() {
 	)
 	dialog.ShowCustomConfirm("Add private channel", "Add", "Cancel",
 		container.NewVBox(form,
-			widget.NewLabel("Private channels are keyed by an arbitrary 16-byte AES-128 secret distributed out of band by the channel creator. Accepts base64 or hex. (For community hashtag channels, use Add Hashtag Channel — the secret comes from the name automatically.)"),
+			wrappedLabel("Private channels are keyed by an arbitrary 16-byte AES-128 secret distributed out of band by the channel creator. Accepts base64 or hex. (For community hashtag channels, use Add Hashtag Channel — the secret comes from the name automatically.)"),
 		),
 		func(ok bool) {
 			if !ok {
