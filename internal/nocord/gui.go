@@ -752,6 +752,9 @@ func (g *GUI) SetRadio(r *cat.AtomicRadio) {
 
 // LoadSavedAudio returns the persisted audio device names and RX gain chosen
 // via Settings → Radio. Empty device strings mean "use CLI default".
+// RX gain is loaded per-radio-type so swapping between an Icom and a
+// Yaesu doesn't carry a high-gain Yaesu setting onto a hot-line-out
+// Icom (which would saturate the waterfall to red).
 func (g *GUI) LoadSavedAudio() (rx, tx string, rxGain float32) {
 	if g.app == nil {
 		return "", "", 1.0
@@ -759,8 +762,31 @@ func (g *GUI) LoadSavedAudio() (rx, tx string, rxGain float32) {
 	prefs := g.app.Preferences()
 	rx = prefs.String("audio_rx_device")
 	tx = prefs.String("audio_tx_device")
-	rxGain = float32(prefs.FloatWithFallback("rx_gain", 1.0))
+	rxGain = float32(prefs.FloatWithFallback(rxGainPrefKey(prefs.String("radio_type")), prefs.FloatWithFallback("rx_gain", 1.0)))
 	return
+}
+
+// rxGainPrefKey returns the preference key for RX gain scoped to the
+// given radio type ("icom", "yaesu", …). Empty radio type falls back
+// to the legacy flat "rx_gain" key — that path also serves as the
+// migration fallback the first time any per-radio key is read.
+func rxGainPrefKey(radioType string) string {
+	if radioType == "" {
+		return "rx_gain"
+	}
+	return "audio.rx_gain." + radioType
+}
+
+// txLevelPrefKey is the TX-level analogue of rxGainPrefKey. Different
+// radios need wildly different drive levels to hit the same ALC
+// reading (an IC-7300's USB MOD path has internal attenuation an
+// FT-991 doesn't), so binding tx_level to radio_type avoids the
+// "swapped radios, signal disappeared / went hot" trap.
+func txLevelPrefKey(radioType string) string {
+	if radioType == "" {
+		return "tx_level"
+	}
+	return "audio.tx_level." + radioType
 }
 
 // SetRXGainCallback registers a callback invoked when the operator moves the
@@ -1197,7 +1223,13 @@ func (g *GUI) showFT8Settings() {
 	})
 
 	// RX gain — amplifies weak signals before waterfall + decoder.
-	curRXGain := prefs.FloatWithFallback("rx_gain", 1.0)
+	// Per-radio: an Icom IC-7300's USB Audio CODEC is hot enough at
+	// default that 1× saturates; a Yaesu FT-991's line-out often
+	// needs 2-3× to reach the same waterfall density. Stored under
+	// audio.rx_gain.<radio_type> so swapping rigs doesn't carry the
+	// wrong gain over.
+	curRXGainKey := rxGainPrefKey(prefs.String("radio_type"))
+	curRXGain := prefs.FloatWithFallback(curRXGainKey, prefs.FloatWithFallback("rx_gain", 1.0))
 	rxGainLabel := canvas.NewText(fmt.Sprintf("%.1f×", curRXGain), color.RGBA{200, 205, 215, 255})
 	rxGainLabel.TextStyle = fyne.TextStyle{Monospace: true}
 	rxGainLabel.TextSize = 11
@@ -1356,7 +1388,14 @@ func (g *GUI) showFT8Settings() {
 			} else {
 				prefs.SetString("audio_tx_device", audioTXSel.Selected)
 			}
-			prefs.SetFloat("rx_gain", rxGainSlider.Value)
+			// Save RX gain under the per-radio-type key the dialog
+			// loaded from. Using the original key (captured at open
+			// time) means an in-dialog radio_type change doesn't
+			// retarget the gain to the new radio — the operator is
+			// adjusting for the radio they had selected when they
+			// opened the dialog. Switching radios then re-opening
+			// shows that radio's separately-saved gain.
+			prefs.SetFloat(curRXGainKey, rxGainSlider.Value)
 
 			// LoTW: persist creds, build client, kick off a sync if
 			// both fields were supplied. Empty fields clear the
@@ -5611,18 +5650,25 @@ func (g *GUI) TxFreq() float64 {
 // TxLevel returns the operator-selected TX audio amplitude in [0..1].
 // Drives the encoder's level argument; on USB-CODEC rigs this maps
 // roughly linearly to RF output via the rig's ALC, so the operator
-// can tune it as a soft "TX power" control. Persisted in prefs;
-// default 0.18 (≈ -15 dBFS, conservative to keep ALC happy).
+// can tune it as a soft "TX power" control. Persisted per-radio so
+// swapping rigs (e.g. Icom IC-7300 ↔ Yaesu FT-991) doesn't carry
+// one rig's drive level onto the other; defaults to 0.18 (≈
+// -15 dBFS, conservative to keep ALC happy) when no per-radio
+// value has been saved yet.
 func (g *GUI) TxLevel() float64 {
 	if g.app == nil {
 		return 0.18
 	}
-	return g.app.Preferences().FloatWithFallback("tx_level", 0.18)
+	prefs := g.app.Preferences()
+	rt := prefs.String("radio_type")
+	return prefs.FloatWithFallback(txLevelPrefKey(rt), prefs.FloatWithFallback("tx_level", 0.18))
 }
 
 // SetTxLevel persists a new TX level. Clamped to a sane range so a
 // runaway slider can't blow the rig's ALC or drop transmissions to
-// inaudibility.
+// inaudibility. Writes to the per-radio key for the currently-saved
+// radio_type; the legacy flat "tx_level" key is left intact as a
+// fallback for any new radio_type the operator hasn't tuned yet.
 func (g *GUI) SetTxLevel(v float64) {
 	if g.app == nil {
 		return
@@ -5633,7 +5679,8 @@ func (g *GUI) SetTxLevel(v float64) {
 	if v > 0.5 {
 		v = 0.5
 	}
-	g.app.Preferences().SetFloat("tx_level", v)
+	prefs := g.app.Preferences()
+	prefs.SetFloat(txLevelPrefKey(prefs.String("radio_type")), v)
 }
 
 // handleSubmit parses the input box and queues a TxRequest.
