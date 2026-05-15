@@ -9167,6 +9167,19 @@ func (g *GUI) mcSyncContactsToMap() {
 	if mw == nil {
 		return
 	}
+	// Only push mesh nodes onto the map when the operator is
+	// actually viewing MeshCore mode. Without this gate, a
+	// background contacts-refresh / pending-advert / event-driven
+	// resync after the operator switched to FT8 would re-paint
+	// the mesh repeaters over the FT8 spots — applySidebarForMode
+	// only clears once on the mode flip, not on every subsequent
+	// mesh event.
+	g.mu.Lock()
+	mode := g.activeMode
+	g.mu.Unlock()
+	if mode != "meshcore" {
+		return
+	}
 	g.mcMu.Lock()
 	contacts := append([]meshcore.Contact(nil), g.mcContacts...)
 	pending := make([]meshcore.StoredPendingAdvert, 0, len(g.mcPendingAdverts))
@@ -11062,6 +11075,11 @@ func (g *GUI) applySidebarForMode() {
 			mw.ClearQSOPartner()
 			mw.Refresh()
 		}
+		// Repopulate the mesh-node overlay now that we're back in
+		// MeshCore mode — mcSyncContactsToMap is gated on activeMode
+		// so any background event-driven calls during FT8 mode were
+		// skipped, leaving the map cleared.
+		go g.mcSyncContactsToMap()
 	} else {
 		g.sidebarStack.Objects = []fyne.CanvasObject{g.bandList}
 		if g.chanHeader != nil {
@@ -11102,6 +11120,7 @@ func (g *GUI) applySidebarForMode() {
 			mw.SetShowMeshcoreLegend(false)
 			mw.SetShowGrids(true)
 			mw.ClearMeshNodes()
+			mw.ClearMessagePath()  // drop any in-flight lightning traces
 			mw.ClearSelfPosition() // diamond falls back to myGrid centroid
 			mw.Refresh()
 		}
