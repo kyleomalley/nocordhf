@@ -1800,11 +1800,26 @@ func (g *GUI) showMeshcoreSettings() {
 		widget.NewLabel("Radio settings push to the connected device on Save. Every node on the mesh must use matching frequency, bandwidth, SF, and CR — mismatches cause silent decode failures. Pick a regional preset first; tweak only if you know your repeater uses a non-standard config."),
 	)
 
+	// ── Status tab ────────────────────────────────────────────────
+	// Read-only snapshot of what the radio reports about itself —
+	// firmware build, battery, uptime, queue length, link
+	// quality, packet counters. Populated lazily when the tab
+	// opens and refreshable on demand. No Save side; the dialog's
+	// Save still applies Device/Radio/Profile state but Status
+	// fields are display-only.
+	statusTab, refreshStatusTab := g.buildMeshcoreStatusTab()
+
 	tabs := container.NewAppTabs(
 		container.NewTabItem("Device", deviceTab),
 		container.NewTabItem("Radio", radioTab),
 		container.NewTabItem("Profile", profileTab),
+		container.NewTabItem("Status", statusTab),
 	)
+	tabs.OnSelected = func(t *container.TabItem) {
+		if t.Text == "Status" {
+			refreshStatusTab()
+		}
+	}
 	d := dialog.NewCustomConfirm(
 		"MeshCore settings", "Save", "Cancel",
 		tabs,
@@ -1940,6 +1955,188 @@ func (g *GUI) showMeshcoreSettings() {
 	)
 	d.Resize(fyne.NewSize(520, 360))
 	d.Show()
+}
+
+// buildMeshcoreStatusTab returns the Status tab body + a refresh
+// callback that the parent dialog wires to the Status-tab-selected
+// event so values are pulled fresh each time the operator opens
+// it. Battery / firmware / stats commands are issued in parallel
+// from a goroutine so a slow radio doesn't freeze the UI; results
+// land in the labels via fyne.Do.
+func (g *GUI) buildMeshcoreStatusTab() (fyne.CanvasObject, func()) {
+	mono := fyne.TextStyle{Monospace: true}
+	dim := color.RGBA{160, 165, 175, 255}
+	mkLabel := func() *canvas.Text {
+		t := canvas.NewText("(not connected)", dim)
+		t.TextStyle = mono
+		t.TextSize = 12
+		return t
+	}
+	firmwareLbl := mkLabel()
+	buildLbl := mkLabel()
+	modelLbl := mkLabel()
+	batteryLbl := mkLabel()
+	uptimeLbl := mkLabel()
+	queueLbl := mkLabel()
+	noiseLbl := mkLabel()
+	rssiLbl := mkLabel()
+	snrLbl := mkLabel()
+	airTimeLbl := mkLabel()
+	pktRecvLbl := mkLabel()
+	pktSentLbl := mkLabel()
+	pktBreakdownLbl := mkLabel()
+	pktErrLbl := mkLabel()
+	statusFooter := canvas.NewText("", dim)
+	statusFooter.TextStyle = fyne.TextStyle{Italic: true}
+	statusFooter.TextSize = 11
+
+	form := widget.NewForm(
+		widget.NewFormItem("Firmware version", firmwareLbl),
+		widget.NewFormItem("Build date", buildLbl),
+		widget.NewFormItem("Model", modelLbl),
+		widget.NewFormItem("Battery", batteryLbl),
+		widget.NewFormItem("Uptime", uptimeLbl),
+		widget.NewFormItem("TX queue", queueLbl),
+		widget.NewFormItem("Noise floor", noiseLbl),
+		widget.NewFormItem("Last RSSI", rssiLbl),
+		widget.NewFormItem("Last SNR", snrLbl),
+		widget.NewFormItem("Air time (TX / RX)", airTimeLbl),
+		widget.NewFormItem("Packets received", pktRecvLbl),
+		widget.NewFormItem("Packets sent", pktSentLbl),
+		widget.NewFormItem("Sent (flood / direct)", pktBreakdownLbl),
+		widget.NewFormItem("Receive errors", pktErrLbl),
+	)
+
+	refresh := func() {
+		g.mcMu.Lock()
+		client := g.mcClient
+		g.mcMu.Unlock()
+		fyne.Do(func() {
+			statusFooter.Text = "refreshing…"
+			statusFooter.Refresh()
+		})
+		setLine := func(t *canvas.Text, s string) {
+			t.Text = s
+			t.Refresh()
+		}
+		if client == nil {
+			fyne.Do(func() {
+				for _, t := range []*canvas.Text{firmwareLbl, buildLbl, modelLbl, batteryLbl, uptimeLbl, queueLbl, noiseLbl, rssiLbl, snrLbl, airTimeLbl, pktRecvLbl, pktSentLbl, pktBreakdownLbl, pktErrLbl} {
+					setLine(t, "(not connected)")
+				}
+				statusFooter.Text = ""
+				statusFooter.Refresh()
+			})
+			return
+		}
+		go func() {
+			var lines []string
+			info, err := client.DeviceQuery(meshcore.SupportedCompanionProtocolVersion)
+			if err != nil {
+				lines = append(lines, "DeviceQuery: "+err.Error())
+			}
+			coreS, err := client.GetCoreStats()
+			if err != nil {
+				lines = append(lines, "GetCoreStats: "+err.Error())
+			}
+			radioS, err := client.GetRadioStats()
+			if err != nil {
+				lines = append(lines, "GetRadioStats: "+err.Error())
+			}
+			pktS, err := client.GetPacketStats()
+			if err != nil {
+				lines = append(lines, "GetPacketStats: "+err.Error())
+			}
+			fyne.Do(func() {
+				if info.FirmwareBuildDate != "" || info.ManufacturerModel != "" {
+					setLine(firmwareLbl, fmt.Sprintf("v%d", info.FirmwareVersion))
+					setLine(buildLbl, nonEmpty(info.FirmwareBuildDate, "(unknown)"))
+					setLine(modelLbl, nonEmpty(info.ManufacturerModel, "(unknown)"))
+				}
+				setLine(batteryLbl, formatBattery(coreS.BatteryMilliVolts))
+				setLine(uptimeLbl, formatUptime(coreS.UptimeSecs))
+				setLine(queueLbl, fmt.Sprintf("%d packet(s)", coreS.QueueLen))
+				setLine(noiseLbl, fmt.Sprintf("%d dBm", radioS.NoiseFloor))
+				setLine(rssiLbl, fmt.Sprintf("%d dBm", radioS.LastRSSI))
+				setLine(snrLbl, fmt.Sprintf("%.2f dB", radioS.LastSNR))
+				setLine(airTimeLbl, fmt.Sprintf("%s / %s", formatUptime(radioS.TxAirSecs), formatUptime(radioS.RxAirSecs)))
+				setLine(pktRecvLbl, fmt.Sprintf("%d", pktS.Recv))
+				setLine(pktSentLbl, fmt.Sprintf("%d", pktS.Sent))
+				setLine(pktBreakdownLbl, fmt.Sprintf("%d / %d", pktS.NSentFlood, pktS.NSentDirect))
+				if pktS.HasRecvErrs {
+					setLine(pktErrLbl, fmt.Sprintf("%d", pktS.NRecvErrors))
+				} else {
+					setLine(pktErrLbl, "(unsupported by firmware)")
+				}
+				if len(lines) > 0 {
+					statusFooter.Text = strings.Join(lines, "; ")
+				} else {
+					statusFooter.Text = "refreshed " + time.Now().Format("15:04:05")
+				}
+				statusFooter.Refresh()
+			})
+		}()
+	}
+
+	refreshBtn := widget.NewButtonWithIcon("Refresh", theme.ViewRefreshIcon(), refresh)
+	body := container.NewVBox(
+		form,
+		container.NewHBox(refreshBtn, statusFooter),
+		widget.NewLabel("Snapshot of what the radio reports about itself. Cumulative counters reset on radio reboot. Battery readings on mains-powered repeaters typically read 0 mV."),
+	)
+	return body, refresh
+}
+
+// nonEmpty returns s when non-empty, fallback otherwise. Trim
+// helpers in the radio's responses sometimes leave a model field
+// empty on minor firmware variants; this avoids a blank label.
+func nonEmpty(s, fallback string) string {
+	if strings.TrimSpace(s) == "" {
+		return fallback
+	}
+	return s
+}
+
+// formatBattery converts firmware-reported millivolts to a
+// human label. 0 mV is reported by mains-powered repeaters; show
+// that explicitly so the operator doesn't think it's a fault.
+// A rough Li-ion percentage is appended for typical 1S packs
+// (3300 mV ≈ 0%, 4200 mV ≈ 100%) since voltage alone is hard to
+// read at a glance.
+func formatBattery(mv uint16) string {
+	if mv == 0 {
+		return "n/a (mains powered or unsupported)"
+	}
+	pct := int(float64(mv-3300) / float64(4200-3300) * 100)
+	if pct < 0 {
+		pct = 0
+	}
+	if pct > 100 {
+		pct = 100
+	}
+	return fmt.Sprintf("%d mV  (~%d%%)", mv, pct)
+}
+
+// formatUptime renders a uint32 seconds count as a compact
+// d/h/m/s string ("3d 4h 12m"). Units below the largest non-zero
+// component are dropped past 1 day so the label stays scannable.
+func formatUptime(secs uint32) string {
+	if secs == 0 {
+		return "0s"
+	}
+	d := secs / 86400
+	h := (secs % 86400) / 3600
+	m := (secs % 3600) / 60
+	s := secs % 60
+	switch {
+	case d > 0:
+		return fmt.Sprintf("%dd %dh %dm", d, h, m)
+	case h > 0:
+		return fmt.Sprintf("%dh %dm", h, m)
+	case m > 0:
+		return fmt.Sprintf("%dm %ds", m, s)
+	}
+	return fmt.Sprintf("%ds", s)
 }
 
 // formatBLESelection returns the user-facing label shown next to
