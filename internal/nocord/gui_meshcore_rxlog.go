@@ -50,17 +50,20 @@ func (g *GUI) buildMeshcoreRxLog() *fyne.Container {
 			return len(g.mcRxLog)
 		},
 		func() fyne.CanvasObject {
-			t := canvas.NewText("", color.RGBA{200, 205, 215, 255})
-			t.TextStyle = fyne.TextStyle{Monospace: true}
-			// Smaller text so more rows fit and the path-hash
-			// column is readable without truncating; the right-
-			// click Inspect modal still shows the full record.
-			t.TextSize = 10
-			// hoverTip surfaces the row's full local datetime on
-			// hover — the visible "15:04:05" prefix drops the
-			// date, which matters when scrolling back through
-			// hours / days of traffic.
-			tip := newHoverTip(container.NewPadded(t), "")
+			// Two halves: a fixed metadata text on the left
+			// (timestamp / route / payload / hops×hashSize /
+			// SNR / RSSI / sender) and a horizontal flow on the
+			// right for the path hashes. Each path hash renders
+			// as a clickable mcHashLink — left-click flies the
+			// map to that contact, matching the chat-row
+			// inline-hash-link behaviour for "see this hop on
+			// the map without leaving the RX LOG".
+			meta := canvas.NewText("", color.RGBA{200, 205, 215, 255})
+			meta.TextStyle = fyne.TextStyle{Monospace: true}
+			meta.TextSize = 10
+			pathFlow := container.NewHBox()
+			body := container.NewHBox(container.NewPadded(meta), pathFlow)
+			tip := newHoverTip(body, "")
 			row := newHoverRow(tip)
 			row.onTap = func() { g.mcRxLogList.Select(row.listIdx) }
 			row.onSecondary = func(absPos fyne.Position) {
@@ -71,8 +74,10 @@ func (g *GUI) buildMeshcoreRxLog() *fyne.Container {
 		func(id widget.ListItemID, obj fyne.CanvasObject) {
 			row := obj.(*hoverRow)
 			tip := row.inner.(*hoverTip)
-			padded := tip.inner.(*fyne.Container)
-			t := padded.Objects[0].(*canvas.Text)
+			body := tip.inner.(*fyne.Container)
+			padded := body.Objects[0].(*fyne.Container)
+			meta := padded.Objects[0].(*canvas.Text)
+			pathFlow := body.Objects[1].(*fyne.Container)
 			g.mcMu.Lock()
 			if id >= len(g.mcRxLog) {
 				g.mcMu.Unlock()
@@ -86,23 +91,15 @@ func (g *GUI) buildMeshcoreRxLog() *fyne.Container {
 			e := g.mcRxLog[id]
 			contacts := append([]meshcore.Contact(nil), g.mcContacts...)
 			g.mcMu.Unlock()
-			// hashSize tells the operator whether the firmware
-			// is using 1-byte hashes (default — collision-prone
-			// on dense meshes) or wider; useful when chasing
-			// "why didn't this hop resolve" questions.
 			hashSize := int(e.packet.PathLen>>6) + 1
 			if e.packet.PathLen == 0xFF {
 				hashSize = 0
 			}
-			// Try to resolve a sender nickname: for a packet we
-			// hold the path of, the LAST path hash is the
-			// previous repeater that handed the packet to us.
-			// For most payload types that's the most useful
-			// "who sent this to me" cue; a deeper sender (the
-			// originator) would require decrypting the payload
-			// which the firmware does upstack.
+			// Sender nickname from the LAST path-hash byte —
+			// best-effort "previous repeater that handed it
+			// to us" cue.
 			senderTag := "—"
-			if len(e.packet.Path) >= hashSize && hashSize > 0 {
+			if hashSize > 0 && len(e.packet.Path) >= hashSize {
 				lastHash := e.packet.Path[len(e.packet.Path)-hashSize:]
 				if matched, _ := resolvePathHopHash(contacts, lastHash, 0, 0); matched != nil && matched.AdvName != "" {
 					senderTag = matched.AdvName
@@ -113,18 +110,7 @@ func (g *GUI) buildMeshcoreRxLog() *fyne.Container {
 					senderTag = fmt.Sprintf("%x?", lastHash)
 				}
 			}
-			// Compact path bytes — only the first 12 hex chars
-			// so a long path doesn't wrap. Full bytes visible
-			// in the Inspect modal.
-			pathTag := ""
-			if len(e.packet.Path) > 0 {
-				h := fmt.Sprintf("%x", e.packet.Path)
-				if len(h) > 12 {
-					h = h[:12] + "…"
-				}
-				pathTag = h
-			}
-			t.Text = fmt.Sprintf("%s  %-4s %-7s %dh×%dB  S%4.1f R%4d  %-12s %s",
+			meta.Text = fmt.Sprintf("%s  %-4s %-7s %dh×%dB  S%4.1f R%4d  %-12s",
 				e.when.Format("15:04:05"),
 				routeShort(e.route),
 				payloadShort(e.payload),
@@ -133,9 +119,45 @@ func (g *GUI) buildMeshcoreRxLog() *fyne.Container {
 				e.snr,
 				e.rssi,
 				senderTag,
-				pathTag,
 			)
-			t.Refresh()
+			meta.Refresh()
+			// Rebuild the per-hop path flow: comma-separated
+			// hex tokens, each a clickable mcHashLink when it
+			// resolves to a known contact (left-click flies the
+			// map there). Unresolved hops render as dim plain
+			// text so the operator can still see them but can't
+			// click to fly. Matches the chat-row inline-hash
+			// behaviour for "see this hop on the map".
+			pathFlow.RemoveAll()
+			if hashSize > 0 && len(e.packet.Path) > 0 {
+				hopCount := len(e.packet.Path) / hashSize
+				dimCol := color.RGBA{140, 145, 155, 255}
+				for h := 0; h < hopCount; h++ {
+					if h > 0 {
+						sep := canvas.NewText(",", dimCol)
+						sep.TextStyle = fyne.TextStyle{Monospace: true}
+						sep.TextSize = 10
+						pathFlow.Add(sep)
+					}
+					hashBytes := e.packet.Path[h*hashSize : (h+1)*hashSize]
+					tokenText := fmt.Sprintf("%x", hashBytes)
+					matched, _ := resolvePathHopHash(contacts, hashBytes, 0, 0)
+					if matched != nil {
+						pub := matched.PubKey
+						link := newMcHashLink(tokenText,
+							func() { g.mcFlyToPubKey(pub) },
+							nil,
+						)
+						pathFlow.Add(link)
+					} else {
+						unknownTok := canvas.NewText(tokenText, dimCol)
+						unknownTok.TextStyle = fyne.TextStyle{Monospace: true}
+						unknownTok.TextSize = 10
+						pathFlow.Add(unknownTok)
+					}
+				}
+			}
+			pathFlow.Refresh()
 			tip.SetTooltip(formatHoverTime(e.when))
 			// Stash the row index so the secondary-tap handler
 			// can fish out the entry without the closure
