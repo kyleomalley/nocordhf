@@ -3575,7 +3575,20 @@ func (g *GUI) diagnosticBundleBar() fyne.CanvasObject {
 // experience is identical regardless of where the operator right-
 // clicked.
 func (g *GUI) showCallContextMenu(call string, isCQ bool, pos fyne.Position) {
+	if logging.L != nil {
+		logging.L.Debugw("showCallContextMenu enter",
+			"call", call,
+			"isCQ", isCQ,
+			"pos_x", pos.X,
+			"pos_y", pos.Y,
+			"window_nil", g.window == nil,
+			"empty_call", call == "",
+		)
+	}
 	if g.window == nil || call == "" {
+		if logging.L != nil {
+			logging.L.Debugw("showCallContextMenu early-return")
+		}
 		return
 	}
 	directedLabel := "Call"
@@ -5168,12 +5181,20 @@ func (g *GUI) buildLayout() fyne.CanvasObject {
 			flagCenter := flagInner.Objects[0].(*fyne.Container)
 			flagText := flagCenter.Objects[0].(*canvas.Text)
 			t := row.Objects[4].(*canvas.Text)
+			// Stash the row index BEFORE the out-of-range guard
+			// so onTap captures the right value even if a stale
+			// bind fires after a snapshot shrink. hoverRow.listIdx
+			// is the bridge between Fyne's tap dispatch (which
+			// stops bubbling to the parent List once we implement
+			// SecondaryTappable) and the List's selection model.
+			h.listIdx = id
 			snap := g.heardSnapshot()
 			if id >= len(snap) {
 				h.onHoverIn = nil
 				h.onHoverOut = nil
 				h.onHoverMove = nil
 				h.onSecondary = nil
+				h.onTap = nil
 				flagSlot.onHoverIn = nil
 				flagSlot.onHoverOut = nil
 				flagSlot.onHoverMove = nil
@@ -5268,6 +5289,14 @@ func (g *GUI) buildLayout() fyne.CanvasObject {
 			rowIsCQ := !e.lastCQ.IsZero() && time.Since(e.lastCQ) <= 60*time.Second
 			h.onSecondary = func(pos fyne.Position) {
 				g.showCallContextMenu(call, rowIsCQ, pos)
+			}
+			// Left-click → forward to the List's selection so
+			// OnSelected fires (magnification popup + chat scroll).
+			// Without this, Fyne drops left-clicks because the
+			// hoverRow's SecondaryTappable impl stops bubbling all
+			// pointer events to the parent List.
+			h.onTap = func() {
+				g.usersList.Select(h.listIdx)
 			}
 			// Clear flag-slot handlers — the row-level hover above
 			// supersedes them. Leaving them set would double-fire
