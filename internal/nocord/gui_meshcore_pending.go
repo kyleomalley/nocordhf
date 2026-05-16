@@ -183,7 +183,30 @@ func (g *GUI) promoteMcPendingAdvert(p meshcore.StoredPendingAdvert) {
 			g.mcAppendSystem("promote " + p.AdvName + ": " + err.Error())
 			return
 		}
+		// Optimistic local-state update: inject the equivalent
+		// Contact into mcContacts BEFORE deleting from pending
+		// AND before scheduleMcContactsRefresh has a chance to
+		// catch up. Without this the map node disappears for
+		// up to mcContactsRefreshDelay (30s) — the sync renders
+		// from mcContacts ∪ mcPendingAdverts, and during that
+		// window the pubkey is in neither. mcSyncContactsToMap
+		// already de-duplicates pending entries against contacts,
+		// so once the next real refresh lands and confirms the
+		// contact, nothing changes visually.
 		g.mcMu.Lock()
+		already := false
+		for _, existing := range g.mcContacts {
+			if existing.PubKey == p.PubKey {
+				already = true
+				break
+			}
+		}
+		if !already {
+			ct := p.AsContact()
+			ct.LastMod = time.Now().UTC()
+			g.mcContacts = append(g.mcContacts, ct)
+			g.sortMcContactsLocked(g.mcContacts, g.mcContactsSortMode())
+		}
 		delete(g.mcPendingAdverts, p.PubKey)
 		store := g.mcStore
 		g.mcMu.Unlock()
@@ -197,6 +220,7 @@ func (g *GUI) promoteMcPendingAdvert(p meshcore.StoredPendingAdvert) {
 		g.mcAppendSystem("added contact: " + name)
 		g.scheduleMcContactsRefresh(client)
 		g.mcSyncContactsToMap()
+		g.mcRefreshLists()
 	}()
 }
 
