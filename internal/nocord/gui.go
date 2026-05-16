@@ -3917,7 +3917,14 @@ func (g *GUI) dismissDecodePopup() {
 // Subsequent calls with a different call rebuild the label; same-call
 // re-hovers are no-ops. Position updates come from updateHeardTooltipPos.
 func (g *GUI) showHeardTooltip(call, country string) {
-	if g.window == nil || country == "" {
+	if g.window == nil {
+		return
+	}
+	// Build the tooltip body — country first (when known), then a
+	// multi-line worked-history summary so the operator can decide
+	// whether to chase or skip without leaving the HEARD list.
+	worked := g.workedSummaryForCall(call)
+	if country == "" && worked == "" {
 		return
 	}
 	g.mu.Lock()
@@ -3932,13 +3939,31 @@ func (g *GUI) showHeardTooltip(call, country string) {
 	g.mu.Unlock()
 	g.removeHeardTooltipFromCanvas()
 
-	t := canvas.NewText(country, color.RGBA{220, 225, 235, 255})
-	t.TextStyle = fyne.TextStyle{Monospace: true}
-	t.TextSize = 11
+	bodyLines := make([]string, 0, 4)
+	if country != "" {
+		bodyLines = append(bodyLines, country)
+	}
+	if worked != "" {
+		bodyLines = append(bodyLines, strings.Split(worked, "\n")...)
+	}
+	textCol := color.RGBA{220, 225, 235, 255}
+	rows := make([]fyne.CanvasObject, 0, len(bodyLines))
+	for i, line := range bodyLines {
+		t := canvas.NewText(line, textCol)
+		t.TextStyle = fyne.TextStyle{Monospace: true}
+		t.TextSize = 11
+		// Subdued colour for everything past the country header so
+		// the eye lands on the country first; worked-history reads
+		// as supporting detail.
+		if i > 0 {
+			t.Color = color.RGBA{180, 185, 195, 255}
+		}
+		rows = append(rows, t)
+	}
 	bg := canvas.NewRectangle(color.RGBA{30, 32, 38, 240})
 	bg.StrokeColor = color.RGBA{90, 95, 105, 255}
 	bg.StrokeWidth = 1
-	wrapped := container.NewStack(bg, container.NewPadded(t))
+	wrapped := container.NewStack(bg, container.NewPadded(container.NewVBox(rows...)))
 	wrapped.Resize(wrapped.MinSize())
 
 	g.mu.Lock()
@@ -4392,6 +4417,81 @@ func (g *GUI) confirmStatusForCall(call string) int {
 		}
 	}
 	return 0
+}
+
+// workedSummaryForCall returns a short multi-line description of
+// the operator's QSO history with the given call: total contact
+// count, most-recent date + band, and LoTW-confirmed bands.
+// Returns "Not worked before" when nothing matches. Used by the
+// HEARD-list hover tooltip so the operator can decide at a glance
+// whether to chase a station (new one) or skip (already in the
+// log on this band, or LoTW-confirmed).
+//
+// All scans are in-memory against g.adifLog + g.lotwQSLs; the
+// caller must hold g.mu OR this function takes its own lock as
+// the named lock-policy comments around adifLog suggest.
+func (g *GUI) workedSummaryForCall(call string) string {
+	call = strings.ToUpper(strings.TrimSpace(call))
+	if call == "" {
+		return ""
+	}
+	g.mu.Lock()
+	type bandHit struct {
+		band string
+		when time.Time
+	}
+	var hits []bandHit
+	for _, r := range g.adifLog {
+		if strings.EqualFold(r.TheirCall, call) {
+			hits = append(hits, bandHit{band: r.Band, when: r.TimeOn})
+		}
+	}
+	confirmedBands := map[string]bool{}
+	for _, q := range g.lotwQSLs {
+		if q.Confirmed && strings.EqualFold(q.Call, call) {
+			confirmedBands[strings.ToUpper(q.Band)] = true
+		}
+	}
+	g.mu.Unlock()
+	if len(hits) == 0 {
+		return "Not worked before"
+	}
+	// Most-recent first.
+	var mostRecent bandHit
+	for _, h := range hits {
+		if h.when.After(mostRecent.when) {
+			mostRecent = h
+		}
+	}
+	bandsSet := map[string]bool{}
+	for _, h := range hits {
+		bandsSet[strings.ToUpper(h.band)] = true
+	}
+	bandList := make([]string, 0, len(bandsSet))
+	for b := range bandsSet {
+		bandList = append(bandList, b)
+	}
+	sort.Strings(bandList)
+	out := fmt.Sprintf("Worked %d×", len(hits))
+	if !mostRecent.when.IsZero() {
+		out += fmt.Sprintf(" — last %s on %s",
+			mostRecent.when.Format("2006-01-02"),
+			strings.ToUpper(mostRecent.band))
+	}
+	if len(bandList) > 1 {
+		out += fmt.Sprintf("\nBands: %s", strings.Join(bandList, ", "))
+	}
+	if len(confirmedBands) > 0 {
+		confirmedList := make([]string, 0, len(confirmedBands))
+		for b := range confirmedBands {
+			confirmedList = append(confirmedList, b)
+		}
+		sort.Strings(confirmedList)
+		out += fmt.Sprintf("\nLoTW: confirmed on %s", strings.Join(confirmedList, ", "))
+	} else {
+		out += "\nLoTW: not confirmed"
+	}
+	return out
 }
 
 // workedStatusForCall classifies a callsign for map-pin colouring:
@@ -5390,36 +5490,38 @@ func (g *GUI) buildLayout() fyne.CanvasObject {
 			}
 			t.Refresh()
 			// Row-level hover: highlight matching map pin + waterfall
-			// box. No country tooltip here — that lives on the flag
-			// sub-widget so the tooltip only appears when the cursor
-			// is actually over the country flag.
+			// box, AND show the country + worked-before tooltip. The
+			// tooltip used to be flag-slot only, but the flag is a
+			// tiny target — moving it to the whole row makes the
+			// worked-before info actually discoverable while the
+			// operator is scanning the list.
 			call := e.call
 			country := callsign.CountryName(call)
 			h.onHoverIn = func() {
 				if g.scope != nil {
 					g.scope.SetHighlightCall(call)
 				}
+				g.showHeardTooltip(call, country)
 			}
 			h.onHoverOut = func() {
 				if g.scope != nil {
 					g.scope.SetHighlightCall("")
 				}
+				g.hideHeardTooltip()
 			}
-			h.onHoverMove = nil
+			h.onHoverMove = func(absPos fyne.Position) {
+				g.updateHeardTooltipPos(absPos)
+			}
 			rowIsCQ := !e.lastCQ.IsZero() && time.Since(e.lastCQ) <= 60*time.Second
 			h.onSecondary = func(pos fyne.Position) {
 				g.showCallContextMenu(call, rowIsCQ, pos)
 			}
-			// Flag-slot hover: country tooltip only.
-			flagSlot.onHoverIn = func() {
-				if country != "" {
-					g.showHeardTooltip(call, country)
-				}
-			}
-			flagSlot.onHoverOut = func() { g.hideHeardTooltip() }
-			flagSlot.onHoverMove = func(absPos fyne.Position) {
-				g.updateHeardTooltipPos(absPos)
-			}
+			// Clear flag-slot handlers — the row-level hover above
+			// supersedes them. Leaving them set would double-fire
+			// the tooltip request and leak between rows on rebind.
+			flagSlot.onHoverIn = nil
+			flagSlot.onHoverOut = nil
+			flagSlot.onHoverMove = nil
 		},
 	)
 	g.usersList.OnSelected = func(id widget.ListItemID) {
