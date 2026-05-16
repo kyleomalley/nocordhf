@@ -642,21 +642,26 @@ func NewGUI(a fyne.App, buildID string, txCh chan TxRequest, tuneCh chan uint64)
 				return
 			}
 			g.removeSelectedMcContact()
-		case fyne.KeyLeftBracket:
-			// Browser-style back navigation in MeshCore mode —
-			// pop the previous thread off the back stack and
-			// switch to it. Only fires at canvas level (i.e.
-			// nothing's focused), so typing `[` into the chat
-			// input still works normally.
-			if focused := g.window.Canvas().Focused(); focused != nil {
-				return
-			}
-			g.mu.Lock()
-			isMc := g.activeMode == "meshcore"
-			g.mu.Unlock()
-			if isMc {
-				g.mcGoBack()
-			}
+		}
+	})
+	// Cmd/Ctrl+[ — browser-style back navigation in MeshCore
+	// mode. Uses a CustomShortcut (rather than TypedKey) so the
+	// chord fires regardless of which widget has focus, including
+	// while typing in the chat input. Bare `[` would otherwise be
+	// eaten by the focused Entry and never reach us.
+	backShortcut := &desktop.CustomShortcut{
+		KeyName:  fyne.KeyLeftBracket,
+		Modifier: fyne.KeyModifierShortcutDefault, // Cmd on macOS, Ctrl elsewhere
+	}
+	g.window.Canvas().AddShortcut(backShortcut, func(_ fyne.Shortcut) {
+		if logging.L != nil {
+			logging.L.Debugw("back shortcut fired (Cmd/Ctrl+[)")
+		}
+		g.mu.Lock()
+		isMc := g.activeMode == "meshcore"
+		g.mu.Unlock()
+		if isMc {
+			g.mcGoBack()
 		}
 	})
 	return g
@@ -4980,6 +4985,17 @@ func (g *GUI) buildLayout() fyne.CanvasObject {
 				}
 			default:
 				h.onSecondary = nil
+			}
+			// Middle-click on any chat row → browser-style back
+			// navigation in MeshCore mode. Falls back to no-op in
+			// FT8 since the back-stack isn't populated there.
+			h.onMiddle = func() {
+				g.mu.Lock()
+				isMc := g.activeMode == "meshcore"
+				g.mu.Unlock()
+				if isMc {
+					g.mcGoBack()
+				}
 			}
 		},
 	)
@@ -10601,10 +10617,32 @@ type hoverRow struct {
 	// Callers set this to invoke the same logic as OnSelected,
 	// typically `list.Select(row.listIdx)`.
 	onTap func()
+	// onMiddle fires on middle-click (MouseButtonTertiary). Used
+	// for browser-style "back" navigation: the chat-row binder
+	// in MeshCore mode wires this to mcGoBack so middle-clicking
+	// any chat row bounces the operator back to the previous
+	// thread. nil = ignored.
+	onMiddle func()
 }
 
 var _ fyne.SecondaryTappable = (*hoverRow)(nil)
 var _ fyne.Tappable = (*hoverRow)(nil)
+var _ desktop.Mouseable = (*hoverRow)(nil)
+
+// MouseDown gives us the per-button event the Tapped /
+// TappedSecondary callbacks lack — specifically, Fyne 2.7 routes
+// MouseButtonTertiary (middle-click) only through Mouseable, not
+// through any of the convenience Tappable interfaces. We forward
+// just that one button to onMiddle; primary + secondary still
+// go through Tapped / TappedSecondary as usual (Fyne dispatches
+// both interfaces).
+func (h *hoverRow) MouseDown(ev *desktop.MouseEvent) {
+	if ev.Button == desktop.MouseButtonTertiary && h.onMiddle != nil {
+		h.onMiddle()
+	}
+}
+
+func (h *hoverRow) MouseUp(_ *desktop.MouseEvent) {}
 
 func (h *hoverRow) TappedSecondary(ev *fyne.PointEvent) {
 	// Diagnostic instrumentation: log every secondary-tap that
