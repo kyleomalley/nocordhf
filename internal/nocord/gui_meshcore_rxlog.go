@@ -52,7 +52,10 @@ func (g *GUI) buildMeshcoreRxLog() *fyne.Container {
 		func() fyne.CanvasObject {
 			t := canvas.NewText("", color.RGBA{200, 205, 215, 255})
 			t.TextStyle = fyne.TextStyle{Monospace: true}
-			t.TextSize = 11
+			// Smaller text so more rows fit and the path-hash
+			// column is readable without truncating; the right-
+			// click Inspect modal still shows the full record.
+			t.TextSize = 10
 			// hoverTip surfaces the row's full local datetime on
 			// hover — the visible "15:04:05" prefix drops the
 			// date, which matters when scrolling back through
@@ -81,9 +84,57 @@ func (g *GUI) buildMeshcoreRxLog() *fyne.Container {
 			// directly to slice index — autoscroll-on-append
 			// keeps the most-recent line in view.
 			e := g.mcRxLog[id]
+			contacts := append([]meshcore.Contact(nil), g.mcContacts...)
 			g.mcMu.Unlock()
-			t.Text = fmt.Sprintf("%s  %-8s %-9s  %dh  SNR %4.1f  RSSI %4d",
-				e.when.Format("15:04:05"), e.route, e.payload, e.hops, e.snr, e.rssi)
+			// hashSize tells the operator whether the firmware
+			// is using 1-byte hashes (default — collision-prone
+			// on dense meshes) or wider; useful when chasing
+			// "why didn't this hop resolve" questions.
+			hashSize := int(e.packet.PathLen>>6) + 1
+			if e.packet.PathLen == 0xFF {
+				hashSize = 0
+			}
+			// Try to resolve a sender nickname: for a packet we
+			// hold the path of, the LAST path hash is the
+			// previous repeater that handed the packet to us.
+			// For most payload types that's the most useful
+			// "who sent this to me" cue; a deeper sender (the
+			// originator) would require decrypting the payload
+			// which the firmware does upstack.
+			senderTag := "—"
+			if len(e.packet.Path) >= hashSize && hashSize > 0 {
+				lastHash := e.packet.Path[len(e.packet.Path)-hashSize:]
+				if matched, _ := resolvePathHopHash(contacts, lastHash, 0, 0); matched != nil && matched.AdvName != "" {
+					senderTag = matched.AdvName
+					if len(senderTag) > 12 {
+						senderTag = senderTag[:12]
+					}
+				} else {
+					senderTag = fmt.Sprintf("%x?", lastHash)
+				}
+			}
+			// Compact path bytes — only the first 12 hex chars
+			// so a long path doesn't wrap. Full bytes visible
+			// in the Inspect modal.
+			pathTag := ""
+			if len(e.packet.Path) > 0 {
+				h := fmt.Sprintf("%x", e.packet.Path)
+				if len(h) > 12 {
+					h = h[:12] + "…"
+				}
+				pathTag = h
+			}
+			t.Text = fmt.Sprintf("%s  %-4s %-7s %dh×%dB  S%4.1f R%4d  %-12s %s",
+				e.when.Format("15:04:05"),
+				routeShort(e.route),
+				payloadShort(e.payload),
+				e.hops,
+				hashSize,
+				e.snr,
+				e.rssi,
+				senderTag,
+				pathTag,
+			)
 			t.Refresh()
 			tip.SetTooltip(formatHoverTime(e.when))
 			// Stash the row index so the secondary-tap handler
@@ -220,6 +271,62 @@ func (g *GUI) showMcTraceHelpDialog() {
 	scroll := container.NewVScroll(body)
 	scroll.SetMinSize(fyne.NewSize(560, 460))
 	dialog.ShowCustom("About trace routing", "Close", scroll, g.window)
+}
+
+// routeShort abbreviates a RouteType string so it fits the new
+// tighter RX LOG row layout. FLOOD / DIRECT are kept readable;
+// the TRANSPORT_* variants get a two-letter prefix.
+func routeShort(s string) string {
+	switch s {
+	case "FLOOD":
+		return "FLD"
+	case "DIRECT":
+		return "DIR"
+	case "TRANSPORT_FLOOD":
+		return "TFL"
+	case "TRANSPORT_DIRECT":
+		return "TDR"
+	default:
+		if len(s) > 4 {
+			return s[:4]
+		}
+		return s
+	}
+}
+
+// payloadShort abbreviates a PayloadType string for the tight
+// row layout. Preserves uniqueness so the operator can still tell
+// types apart at a glance.
+func payloadShort(s string) string {
+	switch s {
+	case "TXT_MSG":
+		return "TXT"
+	case "GRP_TXT":
+		return "GRP"
+	case "GRP_DATA":
+		return "GRPDAT"
+	case "ADVERT":
+		return "ADV"
+	case "PATH":
+		return "PATH"
+	case "TRACE":
+		return "TRACE"
+	case "ACK":
+		return "ACK"
+	case "REQ":
+		return "REQ"
+	case "RESPONSE":
+		return "RESP"
+	case "ANON_REQ":
+		return "ANON"
+	case "RAW_CUSTOM":
+		return "RAW"
+	default:
+		if len(s) > 7 {
+			return s[:7]
+		}
+		return s
+	}
 }
 
 // percentInt returns an integer percentage of n/total, guarded
