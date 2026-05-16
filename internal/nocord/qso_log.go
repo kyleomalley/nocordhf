@@ -185,12 +185,14 @@ func (t *qsoTracker) ObserveRX(msg string, theirSNR int, decodedAt time.Time) (a
 	//   GRID    (e.g. "DM13") — first reply after our directed call
 	//   ±NN     (e.g. "-12")   — their SNR report of our signal
 	//   R±NN    (e.g. "R-12")  — roger + SNR
-	//   RR73 / 73             — closing
+	//   RR73 / 73 / RRR       — closing (RRR is the legacy "rogers"
+	//                            convention; semantically equivalent
+	//                            to RR73 for QSO finalisation)
 	for i := 2; i < len(fields); i++ {
 		tok := fields[i]
 		switch {
-		case tok == "RR73" || tok == "73":
-			// Don't re-fire onLogged on a repeat 73/RR73 from them:
+		case tok == "RR73" || tok == "73" || tok == "RRR":
+			// Don't re-fire onLogged on a repeat 73/RR73/RRR from them:
 			// the QSO was already finalised on the first one and
 			// removed from t.open. Without this, multiple Costas hits
 			// of the same closing message produce duplicate uploads.

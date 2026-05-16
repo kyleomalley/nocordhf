@@ -84,7 +84,9 @@ func autoReplyTail(rxMsg, ourCall string, ourSNRofThem int) string {
 	case last == "73":
 		// They closed the QSO; we don't TX anything.
 		return ""
-	case last == "RR73":
+	case last == "RR73", last == "RRR":
+		// RRR is the older "rogers" convention (predates RR73); both
+		// signal "I copied, ready to close". Next step is our 73.
 		return "73"
 	case len(last) >= 3 && last[0] == 'R' && (last[1] == '+' || last[1] == '-'):
 		// They sent us R+report; acknowledge with RR73.
