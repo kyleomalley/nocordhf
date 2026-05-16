@@ -42,6 +42,16 @@ type StoredMessage struct {
 	// rows where the matching RxLog frame was missed.
 	PathLen byte   `json:"plen,omitempty"`
 	Path    []byte `json:"path,omitempty"`
+	// Header is the raw Packet.Header byte captured alongside the
+	// path. Carries RouteType in bits 0-1 (FLOOD vs DIRECT vs
+	// TRANSPORT_*) — load-bearing because Path bytes mean different
+	// things by route: FLOOD packets accumulate each forwarder's hash
+	// (true on-air route), DIRECT packets carry the SENDER's stored
+	// OutPath (which can be asymmetric to the reverse path). Without
+	// this byte the operator can't tell why a 4-hop ack might come
+	// back via a 1-byte Path stamp — it's the same physical mesh just
+	// with two routing modes producing two Path semantics.
+	Header byte `json:"hdr,omitempty"`
 }
 
 // Store is the persistent message-history backing for a Client.
@@ -181,6 +191,70 @@ func nanosKey(t time.Time) []byte {
 // a single OpenStore call hydrates everything.
 var favoritesBucket = []byte("__favorites")
 
+// PurgeLegacyChannelBuckets deletes channel chat-history buckets
+// keyed by the firmware's slot index ("channel:0", "channel:1",
+// …). The current keying is "channel:<16-hex-secret-id>" so any
+// bucket whose name matches the legacy `channel:<digits>` shape is
+// orphaned — it can never be re-attached to a live channel because
+// the lookup path no longer produces that key shape. Returns the
+// number of buckets deleted; safe to call repeatedly (no-op once
+// the legacy buckets are gone).
+//
+// Worth doing because legacy buckets are silently displayed by
+// Store.LoadAll, which seeds in-memory chat history on connect —
+// without the purge, an operator who reuses a slot would see the
+// previous occupant's messages bleed in until the bucket grew
+// past whatever max-rows window the GUI applies.
+func (s *Store) PurgeLegacyChannelBuckets() (int, error) {
+	if s == nil || s.db == nil {
+		return 0, nil
+	}
+	deleted := 0
+	err := s.db.Update(func(tx *bbolt.Tx) error {
+		var stale [][]byte
+		err := tx.ForEach(func(name []byte, _ *bbolt.Bucket) error {
+			if isLegacyChannelBucketName(name) {
+				stale = append(stale, append([]byte(nil), name...))
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		for _, name := range stale {
+			if err := tx.DeleteBucket(name); err != nil {
+				return err
+			}
+			deleted++
+		}
+		return nil
+	})
+	return deleted, err
+}
+
+// isLegacyChannelBucketName matches "channel:<one-or-more-digits>"
+// — the pre-secret-keying thread ID format. The new format is
+// "channel:<16 hex chars>", so the digit-only suffix can't collide
+// with a current key (16 hex chars is always longer than 3 digits
+// for any plausible slot index, and contains a-f for any non-zero
+// channel given a SHA-256 prefix).
+func isLegacyChannelBucketName(name []byte) bool {
+	const prefix = "channel:"
+	if len(name) <= len(prefix) {
+		return false
+	}
+	if string(name[:len(prefix)]) != prefix {
+		return false
+	}
+	suffix := name[len(prefix):]
+	for _, b := range suffix {
+		if b < '0' || b > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // SetFavorite marks (on=true) or unmarks (on=false) a contact as
 // favourite. Persisted across launches so the operator's pinned
 // peers survive a relaunch + bbolt re-open.
@@ -195,6 +269,195 @@ func (s *Store) SetFavorite(pub PubKey, on bool) error {
 		}
 		if on {
 			return b.Put(pub[:], nil)
+		}
+		return b.Delete(pub[:])
+	})
+}
+
+// pendingAdvertsBucket holds adverts seen while the radio's
+// auto-add-contacts mode was off — the firmware delivered them as
+// PushNewAdvert (rich Contact-shaped record) but never persisted
+// them. We hang on to them locally so the operator can see them
+// on the map without admitting them to the radio's contacts table.
+// Keyed by 32-byte pubkey, value = JSON-encoded StoredPendingAdvert.
+var pendingAdvertsBucket = []byte("__pending_adverts")
+
+// StoredPendingAdvert is the serialised form of a pending advert.
+// FirstSeen lets the GUI surface "discovered N hours ago"; LastSeen
+// gets bumped every time the same pubkey re-advertises.
+type StoredPendingAdvert struct {
+	PubKey     PubKey    `json:"pk"`
+	Type       AdvType   `json:"type"`
+	Flags      byte      `json:"flags,omitempty"`
+	OutPathLen int8      `json:"plen,omitempty"`
+	OutPath    []byte    `json:"path,omitempty"` // first OutPathLen bytes only
+	AdvName    string    `json:"name"`
+	AdvLatE6   int32     `json:"lat,omitempty"`
+	AdvLonE6   int32     `json:"lon,omitempty"`
+	LastAdvert time.Time `json:"last_adv"`
+	FirstSeen  time.Time `json:"first_seen"`
+	LastSeen   time.Time `json:"last_seen"`
+}
+
+// AsContact converts back to the Contact shape AddUpdateContact
+// expects when promoting to a real contact.
+func (p StoredPendingAdvert) AsContact() Contact {
+	var c Contact
+	c.PubKey = p.PubKey
+	c.Type = p.Type
+	c.Flags = p.Flags
+	c.OutPathLen = p.OutPathLen
+	copy(c.OutPath[:], p.OutPath)
+	c.AdvName = p.AdvName
+	c.AdvLatE6 = p.AdvLatE6
+	c.AdvLonE6 = p.AdvLonE6
+	c.LastAdvert = p.LastAdvert
+	return c
+}
+
+// SavePendingAdvert upserts a pending-advert record. If the pubkey
+// is already present, FirstSeen is preserved and LastSeen is
+// refreshed; the rest of the fields are overwritten with the new
+// values from this advert (name / lat / lon may have changed since
+// last time we saw this node).
+func (s *Store) SavePendingAdvert(p StoredPendingAdvert) error {
+	if s == nil || s.db == nil {
+		return errors.New("meshcore: store closed")
+	}
+	now := time.Now().UTC()
+	if p.LastSeen.IsZero() {
+		p.LastSeen = now
+	}
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		b, err := tx.CreateBucketIfNotExists(pendingAdvertsBucket)
+		if err != nil {
+			return err
+		}
+		// Preserve FirstSeen across re-advertisements.
+		if existing := b.Get(p.PubKey[:]); existing != nil {
+			var prev StoredPendingAdvert
+			if err := json.Unmarshal(existing, &prev); err == nil && !prev.FirstSeen.IsZero() {
+				p.FirstSeen = prev.FirstSeen
+			}
+		}
+		if p.FirstSeen.IsZero() {
+			p.FirstSeen = now
+		}
+		val, err := json.Marshal(p)
+		if err != nil {
+			return err
+		}
+		return b.Put(p.PubKey[:], val)
+	})
+}
+
+// LoadPendingAdverts returns every pending advert in the store,
+// keyed by pubkey. Used on connect to seed the in-memory map so
+// adverts persist across launches even though the radio doesn't
+// know about them.
+func (s *Store) LoadPendingAdverts() (map[PubKey]StoredPendingAdvert, error) {
+	out := map[PubKey]StoredPendingAdvert{}
+	if s == nil || s.db == nil {
+		return out, nil
+	}
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(pendingAdvertsBucket)
+		if b == nil {
+			return nil
+		}
+		return b.ForEach(func(k, v []byte) error {
+			if len(k) != 32 {
+				return nil
+			}
+			var p StoredPendingAdvert
+			if err := json.Unmarshal(v, &p); err != nil {
+				return nil // skip malformed entries rather than fail the whole load
+			}
+			var pk PubKey
+			copy(pk[:], k)
+			out[pk] = p
+			return nil
+		})
+	})
+	return out, err
+}
+
+// blockedAdvertsBucket persists pubkeys the operator has chosen to
+// permanently silence. Without this, "Discard" on a pending advert
+// only drops the record until the next periodic re-advertisement
+// (which on a busy mesh is constant), so spammy nodes keep
+// reappearing on the map. Block makes the silence durable.
+var blockedAdvertsBucket = []byte("__blocked_adverts")
+
+// BlockAdvert marks a pubkey as permanently blocked. Future
+// PushNewAdvert events for this pubkey are dropped at the GUI
+// layer before they reach the pending-advert store. Idempotent.
+func (s *Store) BlockAdvert(pub PubKey) error {
+	if s == nil || s.db == nil {
+		return errors.New("meshcore: store closed")
+	}
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		b, err := tx.CreateBucketIfNotExists(blockedAdvertsBucket)
+		if err != nil {
+			return err
+		}
+		return b.Put(pub[:], nil)
+	})
+}
+
+// UnblockAdvert removes a pubkey from the block list. The next
+// advert from this node will be admitted into the pending store
+// as usual.
+func (s *Store) UnblockAdvert(pub PubKey) error {
+	if s == nil || s.db == nil {
+		return errors.New("meshcore: store closed")
+	}
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(blockedAdvertsBucket)
+		if b == nil {
+			return nil
+		}
+		return b.Delete(pub[:])
+	})
+}
+
+// LoadBlockedAdverts returns the set of pubkeys the operator has
+// blocked. Hydrated on connect so the in-memory filter survives
+// relaunch.
+func (s *Store) LoadBlockedAdverts() (map[PubKey]bool, error) {
+	out := map[PubKey]bool{}
+	if s == nil || s.db == nil {
+		return out, nil
+	}
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(blockedAdvertsBucket)
+		if b == nil {
+			return nil
+		}
+		return b.ForEach(func(k, _ []byte) error {
+			if len(k) != 32 {
+				return nil
+			}
+			var pk PubKey
+			copy(pk[:], k)
+			out[pk] = true
+			return nil
+		})
+	})
+	return out, err
+}
+
+// DeletePendingAdvert removes a pending-advert record. Called after
+// a successful AddUpdateContact promotion so the same node doesn't
+// show up in both the contacts list and the pending overlay.
+func (s *Store) DeletePendingAdvert(pub PubKey) error {
+	if s == nil || s.db == nil {
+		return errors.New("meshcore: store closed")
+	}
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(pendingAdvertsBucket)
+		if b == nil {
+			return nil
 		}
 		return b.Delete(pub[:])
 	})

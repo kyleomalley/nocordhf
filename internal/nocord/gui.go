@@ -18,7 +18,6 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -104,36 +103,11 @@ type TxRequest struct {
 	StopCh      chan struct{}
 }
 
-// heardSortMode picks how the HEARD sidebar orders its entries. Alpha is
-// the default (predictable, like an IRC nick list); SNR sorts strongest
-// first to surface the loudest stations on the band. The header label
-// click cycles through these.
-type heardSortMode int
-
-const (
-	heardSortAlpha heardSortMode = iota
-	heardSortSNR
-	heardSortRecent
-)
-
-// heardEntry is one HEARD-sidebar row: the most recent SNR for that
-// callsign plus the wall-clock time we last decoded a transmission FROM
-// that station. Stored in a map keyed by callsign so repeated decodes
-// from the same operator just refresh the SNR rather than duplicating.
-type heardEntry struct {
-	snr      float64
-	lastSeen time.Time
-	lastCQ   time.Time // most recent slot we heard this op call CQ; zero if never
-	// lastOTA is the most recent slot we heard this op transmit from
-	// a portable / outdoor activity. lastOTAType is the *OTA program
-	// name (POTA/SOTA/IOTA/WWFF/BOTA/LOTA/NOTA), or "PORTABLE" for a
-	// /P /M /MM /AM suffix without an explicit programme. Empty when
-	// never.
-	lastOTA     time.Time
-	lastOTAType string
-}
-
-const maxHeard = 200
+// (HEARD-list types, the in-memory roster, and its hover-tooltip
+// plumbing live in gui_heard.go. Cross-feature methods that touch
+// HEARD plus other surfaces — sweepStaleRoster, selectCall,
+// confirmStatusForCall, workedStatusForCall — stay below so the
+// coupling is visible.)
 
 // chatRow is one rendered line in the chat pane -either a real RX decode or
 // a synthesised system message ("connected to 20m", "TX queued: CQ ...").
@@ -191,6 +165,15 @@ type chatRow struct {
 	// correlation could be made (radio relaunched, ring rolled).
 	mcPathLen byte
 	mcPath    []byte
+	// mcHeader is the raw Packet.Header byte captured alongside
+	// mcPath. RouteType lives in bits 0-1 (FLOOD / DIRECT /
+	// TRANSPORT_FLOOD / TRANSPORT_DIRECT). Persisted so a chat
+	// row's Info dialog can explain WHY a 1-hop Path sometimes
+	// shows up on a route that physically traverses many more
+	// hops — DIRECT packets stamp the SENDER's stored OutPath
+	// rather than accumulating per-forwarder hashes like FLOOD,
+	// and that OutPath can be asymmetric to the reverse direction.
+	mcHeader byte
 }
 
 // MeshCore delivery-state values for chatRow.mcDelivery.
@@ -279,6 +262,12 @@ type GUI struct {
 	// first. Capped at maxHeard entries (oldest evicted).
 	heard     map[string]heardEntry
 	heardSort heardSortMode
+	// heardIgnored is the operator-curated set of callsigns
+	// silently filtered out of HEARD before they ever land in
+	// `heard`. Persisted to prefs via gui_heard_ignore.go; lazy-
+	// loaded on first read so we don't need an explicit init
+	// in the GUI bootstrap.
+	heardIgnored map[string]bool
 
 	// bandActivity returns the number of unique stations heard on `band`
 	// over the recent activity window, or 0 if no data. Sourced from
@@ -361,9 +350,46 @@ type GUI struct {
 	mcChannelsList   *widget.List
 	mcContactsHeader *canvas.Text
 	mcChannelsHeader *canvas.Text
-	mcStatusText     *canvas.Text
-	mcCurrentThread  string
-	mcThreadHistory  map[string][]chatRow
+	mcPendingHeader  *canvas.Text
+	mcPendingList    *widget.List
+	// mcPendingOrder is the deterministic display order for the
+	// PENDING ADVERTS list — sorted alphabetically by AdvName at
+	// refresh time so the UI doesn't jitter as new adverts come in.
+	// Stored separately from the unordered mcPendingAdverts map to
+	// avoid re-sorting per row binding.
+	mcPendingOrder []meshcore.PubKey
+	// mcContactsFilter is the case-insensitive substring filter
+	// applied to the Contacts sidebar — populated by the search
+	// entry above the list. Empty means show everything. Stored
+	// here (not in the widget) so mcRebuildContactsViewLocked
+	// can re-filter on every roster change without re-reading
+	// the entry text from the UI thread.
+	mcContactsFilter      string
+	mcContactsFilterEntry *widget.Entry
+	// mcContactsView is the filtered + sorted slice the contacts
+	// list widget actually iterates. Rebuilt under mcMu in
+	// mcRebuildContactsViewLocked from mcContacts + mcContactsFilter
+	// so list count / bind / OnSelected callbacks stay O(1) and
+	// indexing is stable across a single repaint cycle.
+	mcContactsView []meshcore.Contact
+	// mcAutoAddByType is the in-memory copy of the per-type
+	// auto-add prefs (Chat / Room / Repeater / Sensor). Consulted
+	// by mcRecordPendingAdvert to decide whether to promote a
+	// freshly-arrived advert into the contacts table immediately
+	// or stash it in the pending sidebar. Hydrated on connect;
+	// updated when the operator saves Settings.
+	mcAutoAddByType map[meshcore.AdvType]bool
+	mcStatusText    *canvas.Text
+	mcCurrentThread string
+	// mcBackStack records the trail of thread IDs the operator has
+	// visited so the back navigation (Cmd+[ / middle-click) can
+	// pop one off and switch to it. Pushed by mcSwitchThread when
+	// recordHistory=true; popped + replayed by mcGoBack without
+	// pushing again. Bounded informally — the stack only grows
+	// while the operator is actively jumping between threads, and
+	// even a busy session rarely exceeds a few dozen entries.
+	mcBackStack     []string
+	mcThreadHistory map[string][]chatRow
 	// mcContactsSortBy is the sidebar sort mode chosen via the
 	// CONTACTS header menu (Recent / Name / Type). Persists in
 	// memory only — defaults to Recent on every launch.
@@ -400,6 +426,19 @@ type GUI struct {
 	// from the bbolt store on connect; toggled via the contact
 	// context menu's Favorite / Unfavorite item.
 	mcFavorites map[meshcore.PubKey]bool
+	// mcPendingAdverts holds adverts the radio surfaced via
+	// PushNewAdvert (auto-add-contacts off) but never persisted.
+	// Keyed by full pubkey; the GUI overlays them onto the map
+	// without admitting them to the firmware's contacts table.
+	// Promoting to a real contact (right-click → Add as Contact)
+	// calls AddUpdateContact and removes the entry from this map.
+	mcPendingAdverts map[meshcore.PubKey]meshcore.StoredPendingAdvert
+	// mcBlockedAdverts is the operator's permanent ignore-list:
+	// PushNewAdvert events for these pubkeys are dropped before
+	// they reach mcPendingAdverts, so the map / sidebar stay
+	// quiet even on chatty spammers. Backed by the bbolt
+	// __blocked_adverts bucket so it survives relaunch.
+	mcBlockedAdverts map[meshcore.PubKey]bool
 	// mcPendingByAck maps SentResult.ExpectedAckCRC to the
 	// (thread, row index) of the chat row awaiting delivery
 	// confirmation. PushSendConfirmed look-up flips the row to
@@ -614,6 +653,26 @@ func NewGUI(a fyne.App, buildID string, txCh chan TxRequest, tuneCh chan uint64)
 			g.removeSelectedMcContact()
 		}
 	})
+	// Cmd/Ctrl+[ — browser-style back navigation in MeshCore
+	// mode. Uses a CustomShortcut (rather than TypedKey) so the
+	// chord fires regardless of which widget has focus, including
+	// while typing in the chat input. Bare `[` would otherwise be
+	// eaten by the focused Entry and never reach us.
+	backShortcut := &desktop.CustomShortcut{
+		KeyName:  fyne.KeyLeftBracket,
+		Modifier: fyne.KeyModifierShortcutDefault, // Cmd on macOS, Ctrl elsewhere
+	}
+	g.window.Canvas().AddShortcut(backShortcut, func(_ fyne.Shortcut) {
+		if logging.L != nil {
+			logging.L.Debugw("back shortcut fired (Cmd/Ctrl+[)")
+		}
+		g.mu.Lock()
+		isMc := g.activeMode == "meshcore"
+		g.mu.Unlock()
+		if isMc {
+			g.mcGoBack()
+		}
+	})
 	return g
 }
 
@@ -710,6 +769,9 @@ func (g *GUI) SetRadio(r *cat.AtomicRadio) {
 
 // LoadSavedAudio returns the persisted audio device names and RX gain chosen
 // via Settings → Radio. Empty device strings mean "use CLI default".
+// RX gain is loaded per-radio-type so swapping between an Icom and a
+// Yaesu doesn't carry a high-gain Yaesu setting onto a hot-line-out
+// Icom (which would saturate the waterfall to red).
 func (g *GUI) LoadSavedAudio() (rx, tx string, rxGain float32) {
 	if g.app == nil {
 		return "", "", 1.0
@@ -717,8 +779,31 @@ func (g *GUI) LoadSavedAudio() (rx, tx string, rxGain float32) {
 	prefs := g.app.Preferences()
 	rx = prefs.String("audio_rx_device")
 	tx = prefs.String("audio_tx_device")
-	rxGain = float32(prefs.FloatWithFallback("rx_gain", 1.0))
+	rxGain = float32(prefs.FloatWithFallback(rxGainPrefKey(prefs.String("radio_type")), prefs.FloatWithFallback("rx_gain", 1.0)))
 	return
+}
+
+// rxGainPrefKey returns the preference key for RX gain scoped to the
+// given radio type ("icom", "yaesu", …). Empty radio type falls back
+// to the legacy flat "rx_gain" key — that path also serves as the
+// migration fallback the first time any per-radio key is read.
+func rxGainPrefKey(radioType string) string {
+	if radioType == "" {
+		return "rx_gain"
+	}
+	return "audio.rx_gain." + radioType
+}
+
+// txLevelPrefKey is the TX-level analogue of rxGainPrefKey. Different
+// radios need wildly different drive levels to hit the same ALC
+// reading (an IC-7300's USB MOD path has internal attenuation an
+// FT-991 doesn't), so binding tx_level to radio_type avoids the
+// "swapped radios, signal disappeared / went hot" trap.
+func txLevelPrefKey(radioType string) string {
+	if radioType == "" {
+		return "tx_level"
+	}
+	return "audio.tx_level." + radioType
 }
 
 // SetRXGainCallback registers a callback invoked when the operator moves the
@@ -1155,7 +1240,13 @@ func (g *GUI) showFT8Settings() {
 	})
 
 	// RX gain — amplifies weak signals before waterfall + decoder.
-	curRXGain := prefs.FloatWithFallback("rx_gain", 1.0)
+	// Per-radio: an Icom IC-7300's USB Audio CODEC is hot enough at
+	// default that 1× saturates; a Yaesu FT-991's line-out often
+	// needs 2-3× to reach the same waterfall density. Stored under
+	// audio.rx_gain.<radio_type> so swapping rigs doesn't carry the
+	// wrong gain over.
+	curRXGainKey := rxGainPrefKey(prefs.String("radio_type"))
+	curRXGain := prefs.FloatWithFallback(curRXGainKey, prefs.FloatWithFallback("rx_gain", 1.0))
 	rxGainLabel := canvas.NewText(fmt.Sprintf("%.1f×", curRXGain), color.RGBA{200, 205, 215, 255})
 	rxGainLabel.TextStyle = fyne.TextStyle{Monospace: true}
 	rxGainLabel.TextSize = 11
@@ -1314,7 +1405,14 @@ func (g *GUI) showFT8Settings() {
 			} else {
 				prefs.SetString("audio_tx_device", audioTXSel.Selected)
 			}
-			prefs.SetFloat("rx_gain", rxGainSlider.Value)
+			// Save RX gain under the per-radio-type key the dialog
+			// loaded from. Using the original key (captured at open
+			// time) means an in-dialog radio_type change doesn't
+			// retarget the gain to the new radio — the operator is
+			// adjusting for the radio they had selected when they
+			// opened the dialog. Switching radios then re-opening
+			// shows that radio's separately-saved gain.
+			prefs.SetFloat(curRXGainKey, rxGainSlider.Value)
 
 			// LoTW: persist creds, build client, kick off a sync if
 			// both fields were supplied. Empty fields clear the
@@ -1618,8 +1716,19 @@ func (g *GUI) showMeshcoreSettings() {
 			})
 		}()
 	})
-	manualAddCheck := widget.NewCheck("", nil)
-	manualAddCheck.SetChecked(prefs.BoolWithFallback(mcPrefProfileManualAdd, false))
+	// Per-type auto-add checkboxes — replace the legacy single
+	// "Manual-add" toggle. The radio is always kept in manual
+	// mode (so we get rich PushNewAdvert events); these
+	// checkboxes filter on the host side.
+	autoChat, autoRoom, autoRepeater, autoSensor := g.mcLoadAutoAddPrefs(prefs)
+	autoChatCheck := widget.NewCheck("Chat (people)", nil)
+	autoChatCheck.SetChecked(autoChat)
+	autoRoomCheck := widget.NewCheck("Room (group endpoints)", nil)
+	autoRoomCheck.SetChecked(autoRoom)
+	autoRepeaterCheck := widget.NewCheck("Repeater (infrastructure)", nil)
+	autoRepeaterCheck.SetChecked(autoRepeater)
+	autoSensorCheck := widget.NewCheck("Sensor (telemetry)", nil)
+	autoSensorCheck.SetChecked(autoSensor)
 	// "Use radio GPS" snaps the manual lat/lon entries to whatever
 	// the radio's GNSS chip last reported (T1000-E and similar
 	// trackers). Convenient one-click capture; manual edits still
@@ -1642,28 +1751,209 @@ func (g *GUI) showMeshcoreSettings() {
 	pickMapBtn := widget.NewButton("Pick on map…", func() {
 		g.showMcLocationPicker(latEntry, lonEntry, profileStatus)
 	})
+	// Tracker re-advert interval (minutes). 0 disables. Tracker
+	// radios (T1000-E etc.) move faster than the firmware's
+	// default auto-advert cycle, so peers benefit from a more
+	// frequent re-advert. Stationary radios should leave this at 0.
+	trackerAdvertEntry := widget.NewEntry()
+	trackerAdvertEntry.SetPlaceHolder("minutes (0 = disabled)")
+	trackerAdvertEntry.SetText(strconv.Itoa(prefs.IntWithFallback(mcPrefTrackerAdvertMin, 0)))
 	profileForm := widget.NewForm(
 		widget.NewFormItem("Name", nameEntry),
 		widget.NewFormItem("Latitude", latEntry),
 		widget.NewFormItem("Longitude", lonEntry),
-		widget.NewFormItem("Manual-add contacts", manualAddCheck),
+		widget.NewFormItem("Tracker re-advert (min)", trackerAdvertEntry),
+	)
+	autoAddBox := container.NewVBox(
+		widget.NewLabelWithStyle("Auto-add new contacts by type:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		autoChatCheck,
+		autoRoomCheck,
+		autoRepeaterCheck,
+		autoSensorCheck,
 	)
 	profileTab := container.NewVBox(
 		profileForm,
 		container.NewHBox(useGPSBtn, pickMapBtn),
 		container.NewHBox(advertBtn, profileStatus),
-		widget.NewLabel("Advert name + location are broadcast to other mesh nodes when you Send self-advert (or on the firmware's periodic advert). Leave lat/lon blank to use whatever the radio's GPS reports; explicit values override the GPS."),
-		widget.NewLabel("Manual-add: when checked, the radio stops auto-adding every node it hears. New peers must be added explicitly — useful on busy meshes where the contact table fills up."),
+		wrappedLabel("Advert name + location are broadcast to other mesh nodes when you Send self-advert (or on the firmware's periodic advert). Leave lat/lon blank to use whatever the radio's GPS reports; explicit values override the GPS."),
+		autoAddBox,
+		wrappedLabel("Unchecked types arrive in PENDING ADVERTS instead of joining your contacts table. Repeaters don't need to be contacts for routing — only check infrastructure types you actually want to DM (admin / status / login)."),
 	)
+
+	// ── Radio tab ────────────────────────────────────────────────
+	// LoRa physical-layer config (frequency, bandwidth, SF, CR,
+	// TX power). Mismatched params cause silent on-air decode
+	// failures — every node on the mesh has to agree on these for
+	// each other to hear them. Region-preset dropdown auto-fills
+	// regulator-correct defaults; the operator can tweak any field
+	// after picking a preset.
+	const presetCustom = "Custom"
+	regionOpts := []string{presetCustom}
+	for _, p := range meshcore.Presets {
+		regionOpts = append(regionOpts, p.Name)
+	}
+	regionSel := widget.NewSelect(regionOpts, nil)
+	freqEntry := widget.NewEntry()
+	freqEntry.SetPlaceHolder("MHz, e.g. 915.000")
+	// BW dropdown — matches upstream meshcore-web's SettingsPage.vue
+	// option list verbatim (10 LoRa physical bandwidths the SX1276/
+	// SX1262 chips support, expressed in kHz). Fractional values are
+	// real BW choices, not display rounding, so the parser below is
+	// a float not an int. Stored to prefs as Hz (BwHz * 1000).
+	bwSel := widget.NewSelect([]string{
+		"7.8", "10.4", "15.6", "20.8", "31.25", "41.7",
+		"62.5", "125", "250", "500",
+	}, nil)
+	bwSel.PlaceHolder = "kHz"
+	sfSel := widget.NewSelect([]string{"7", "8", "9", "10", "11", "12"}, nil)
+	sfSel.PlaceHolder = "spreading factor"
+	crSel := widget.NewSelect([]string{"5 (4/5)", "6 (4/6)", "7 (4/7)", "8 (4/8)"}, nil)
+	crSel.PlaceHolder = "coding rate"
+	txPowerEntry := widget.NewEntry()
+	txPowerEntry.SetPlaceHolder("dBm, 0–22")
+	radioStatus := canvas.NewText("", color.RGBA{160, 165, 175, 255})
+	radioStatus.TextStyle = fyne.TextStyle{Monospace: true}
+	radioStatus.TextSize = 11
+	// Hydrate. Source-of-truth priority is:
+	//   1) Live SelfInfo from the connected radio (what's actually
+	//      programmed right now — beats whatever we last saved if
+	//      e.g. another tool tuned the radio between sessions).
+	//   2) Prefs (last-saved values, used when disconnected).
+	// Empty values fall through to placeholder text and the
+	// operator picks a preset to populate them.
+	g.mcMu.Lock()
+	liveInfo := g.mcSelfInfo
+	liveConnected := g.mcClient != nil
+	g.mcMu.Unlock()
+	freqKHzInit := uint32(0)
+	bwHzInit := uint32(0)
+	sfInit := 0
+	crInit := 0
+	txInit := 0
+	if liveConnected && liveInfo.RadioFreqKHz > 0 {
+		freqKHzInit = liveInfo.RadioFreqKHz
+		bwHzInit = liveInfo.RadioBwHz
+		sfInit = int(liveInfo.RadioSF)
+		crInit = int(liveInfo.RadioCR)
+		txInit = int(liveInfo.TxPower)
+	} else {
+		freqKHzInit = uint32(prefs.IntWithFallback(mcPrefRadioFreqKHz, 0))
+		bwHzInit = uint32(prefs.IntWithFallback(mcPrefRadioBwHz, 0))
+		sfInit = prefs.IntWithFallback(mcPrefRadioSF, 0)
+		crInit = prefs.IntWithFallback(mcPrefRadioCR, 0)
+		txInit = prefs.IntWithFallback(mcPrefRadioTxDbm, 0)
+	}
+	if freqKHzInit > 0 {
+		freqEntry.SetText(strconv.FormatFloat(float64(freqKHzInit)/1000.0, 'f', 3, 64))
+	}
+	if bwHzInit > 0 {
+		// %g strips trailing zeros: 62500 → "62.5", 125000 → "125".
+		// Matches the dropdown options exactly so SetSelected hits
+		// rather than no-op'ing on a missing entry.
+		bwSel.SetSelected(fmt.Sprintf("%g", float64(bwHzInit)/1000.0))
+	}
+	if sfInit >= 7 && sfInit <= 12 {
+		sfSel.SetSelected(strconv.Itoa(sfInit))
+	}
+	if crInit >= 5 && crInit <= 8 {
+		// Match the option labels; map int back to "N (4/N)" form.
+		for _, opt := range crSel.Options {
+			if strings.HasPrefix(opt, strconv.Itoa(crInit)+" ") {
+				crSel.SetSelected(opt)
+				break
+			}
+		}
+	}
+	if txInit > 0 {
+		txPowerEntry.SetText(strconv.Itoa(txInit))
+	}
+	regionSel.OnChanged = func(name string) {
+		preset, ok := meshcore.PresetByName(name)
+		if !ok {
+			return // "Custom" — leave fields as-is
+		}
+		freqEntry.SetText(strconv.FormatFloat(float64(preset.FreqKHz)/1000.0, 'f', 3, 64))
+		bwSel.SetSelected(fmt.Sprintf("%g", float64(preset.BwHz)/1000.0))
+		sfSel.SetSelected(strconv.Itoa(int(preset.SF)))
+		for _, opt := range crSel.Options {
+			if strings.HasPrefix(opt, strconv.Itoa(int(preset.CR))+" ") {
+				crSel.SetSelected(opt)
+				break
+			}
+		}
+		txPowerEntry.SetText(strconv.Itoa(int(preset.TxPower)))
+		radioStatus.Text = "preset: " + preset.Note
+		radioStatus.Refresh()
+	}
+	// Default to Custom so loaded prefs aren't clobbered if the
+	// operator just opens the dialog and clicks Save.
+	regionSel.SetSelected(presetCustom)
+
+	radioForm := widget.NewForm(
+		widget.NewFormItem("Region preset", regionSel),
+		widget.NewFormItem("Frequency", freqEntry),
+		widget.NewFormItem("Bandwidth (kHz)", bwSel),
+		widget.NewFormItem("Spreading factor", sfSel),
+		widget.NewFormItem("Coding rate", crSel),
+		widget.NewFormItem("TX power (dBm)", txPowerEntry),
+	)
+	radioTab := container.NewVBox(
+		radioForm,
+		radioStatus,
+		wrappedLabel("Radio settings push to the connected device on Save. Every node on the mesh must use matching frequency, bandwidth, SF, and CR — mismatches cause silent decode failures. Pick a regional preset first; tweak only if you know your repeater uses a non-standard config."),
+	)
+
+	// ── Status tab ────────────────────────────────────────────────
+	// Read-only snapshot of what the radio reports about itself —
+	// firmware build, battery, uptime, queue length, link
+	// quality, packet counters. Populated lazily when the tab
+	// opens and refreshable on demand. No Save side; the dialog's
+	// Save still applies Device/Radio/Profile state but Status
+	// fields are display-only.
+	statusTab, refreshStatusTab := g.buildMeshcoreStatusTab()
 
 	tabs := container.NewAppTabs(
 		container.NewTabItem("Device", deviceTab),
+		container.NewTabItem("Radio", radioTab),
 		container.NewTabItem("Profile", profileTab),
+		container.NewTabItem("Status", statusTab),
 	)
+	// Status tab gets a background refresh ticker — values like
+	// queue length and packet counters change continuously so a
+	// one-shot pull goes stale within seconds. Ticker only runs
+	// while the Status tab is the active tab; switching away
+	// stops it so we don't keep the radio busy answering stat
+	// queries the operator can't see.
+	var statusTicker *time.Ticker
+	stopStatusTicker := func() {
+		if statusTicker != nil {
+			statusTicker.Stop()
+			statusTicker = nil
+		}
+	}
+	tabs.OnSelected = func(t *container.TabItem) {
+		stopStatusTicker()
+		if t.Text != "Status" {
+			return
+		}
+		refreshStatusTab()
+		statusTicker = time.NewTicker(30 * time.Second)
+		ticker := statusTicker
+		go func() {
+			for range ticker.C {
+				refreshStatusTab()
+			}
+		}()
+	}
 	d := dialog.NewCustomConfirm(
 		"MeshCore settings", "Save", "Cancel",
 		tabs,
 		func(ok bool) {
+			// Stop the Status-tab auto-refresh ticker either way:
+			// dialog dismissal means there's nobody to read the
+			// values, so keeping the ticker alive would just leak
+			// goroutines and waste radio cycles.
+			stopStatusTicker()
 			if !ok {
 				return
 			}
@@ -1698,8 +1988,67 @@ func (g *GUI) showMeshcoreSettings() {
 			lonF, _ := strconv.ParseFloat(strings.TrimSpace(lonEntry.Text), 64)
 			prefs.SetFloat(mcPrefProfileLat, latF)
 			prefs.SetFloat(mcPrefProfileLon, lonF)
-			manualAdd := manualAddCheck.Checked
-			prefs.SetBool(mcPrefProfileManualAdd, manualAdd)
+			// Tracker re-advert interval — clamp negatives to 0
+			// (disabled) so a typo can't put the radio into a
+			// pathological super-frequent advert loop. Change
+			// takes effect on next connect since the watcher
+			// reads the pref at startup; the operator can also
+			// click Disconnect + Reconnect to re-arm.
+			if v, err := strconv.Atoi(strings.TrimSpace(trackerAdvertEntry.Text)); err == nil && v >= 0 {
+				prefs.SetInt(mcPrefTrackerAdvertMin, v)
+			}
+			// Persist per-type auto-add prefs and refresh the
+			// in-memory map. The radio is always kept in manual
+			// mode below; these prefs decide host-side promotion.
+			prefs.SetBool(mcPrefAutoAddChat, autoChatCheck.Checked)
+			prefs.SetBool(mcPrefAutoAddRoom, autoRoomCheck.Checked)
+			prefs.SetBool(mcPrefAutoAddRepeater, autoRepeaterCheck.Checked)
+			prefs.SetBool(mcPrefAutoAddSensor, autoSensorCheck.Checked)
+			g.mcMu.Lock()
+			g.mcAutoAddByType = map[meshcore.AdvType]bool{
+				meshcore.AdvTypeChat:     autoChatCheck.Checked,
+				meshcore.AdvTypeRoom:     autoRoomCheck.Checked,
+				meshcore.AdvTypeRepeater: autoRepeaterCheck.Checked,
+				meshcore.AdvTypeSensor:   autoSensorCheck.Checked,
+			}
+			g.mcMu.Unlock()
+			// Radio tab persistence + push. Parsing is forgiving:
+			// blank or unparseable fields skip the corresponding
+			// SetRadioParams / SetTxPower call so the operator can
+			// save partial config without clobbering the radio.
+			freqMHz, _ := strconv.ParseFloat(strings.TrimSpace(freqEntry.Text), 64)
+			// SetRadioParams expects kHz on the wire, not Hz.
+			// Sending Hz makes the value 1000× too large and the
+			// firmware returns RespErr (ErrIllegalArg).
+			freqKHz := uint32(freqMHz * 1000)
+			bwKHz, _ := strconv.ParseFloat(strings.TrimSpace(bwSel.Selected), 64)
+			bwHz := uint32(bwKHz * 1000)
+			sfVal, _ := strconv.Atoi(strings.TrimSpace(sfSel.Selected))
+			crVal := 0
+			if crSel.Selected != "" {
+				// "5 (4/5)" → 5
+				if i := strings.IndexByte(crSel.Selected, ' '); i > 0 {
+					crVal, _ = strconv.Atoi(crSel.Selected[:i])
+				} else {
+					crVal, _ = strconv.Atoi(crSel.Selected)
+				}
+			}
+			txDbm, _ := strconv.Atoi(strings.TrimSpace(txPowerEntry.Text))
+			if freqKHz > 0 {
+				prefs.SetInt(mcPrefRadioFreqKHz, int(freqKHz))
+			}
+			if bwHz > 0 {
+				prefs.SetInt(mcPrefRadioBwHz, int(bwHz))
+			}
+			if sfVal >= 7 && sfVal <= 12 {
+				prefs.SetInt(mcPrefRadioSF, sfVal)
+			}
+			if crVal >= 5 && crVal <= 8 {
+				prefs.SetInt(mcPrefRadioCR, crVal)
+			}
+			if txDbm > 0 && txDbm <= 30 {
+				prefs.SetInt(mcPrefRadioTxDbm, txDbm)
+			}
 			g.mcMu.Lock()
 			client := g.mcClient
 			g.mcMu.Unlock()
@@ -1716,8 +2065,44 @@ func (g *GUI) showMeshcoreSettings() {
 							g.mcAppendSystem("SetAdvertLatLon: " + err.Error())
 						}
 					}
-					if err := client.SetManualAddContacts(manualAdd); err != nil {
+					// Always force the radio into manual-add mode
+					// so we get rich PushNewAdvert events for every
+					// advert; per-type filtering happens host-side
+					// in mcRecordPendingAdvert.
+					if err := client.SetManualAddContacts(true); err != nil {
 						g.mcAppendSystem("SetManualAddContacts: " + err.Error())
+					}
+					// Radio params are an all-or-nothing push: the
+					// firmware's CmdSetRadioParams takes all four
+					// (freq/bw/sf/cr) in one frame, so we only fire
+					// when every value is valid. TX power is a
+					// separate call and pushes independently.
+					if freqKHz > 0 && bwHz > 0 && sfVal >= 7 && sfVal <= 12 && crVal >= 5 && crVal <= 8 {
+						if err := client.SetRadioParams(freqKHz, bwHz, uint8(sfVal), uint8(crVal)); err != nil {
+							g.mcAppendSystem("SetRadioParams: " + err.Error())
+						} else {
+							// Display freq as MHz with 3 decimals to match the Settings input.
+							g.mcAppendSystem(fmt.Sprintf("radio params: %.3f MHz / %g kHz / SF%d / CR4-%d", float64(freqKHz)/1000.0, float64(bwHz)/1000.0, sfVal, crVal))
+							// Mirror into mcSelfInfo so the next Settings
+							// open shows the just-applied values rather
+							// than the stale snapshot from AppStart.
+							g.mcMu.Lock()
+							g.mcSelfInfo.RadioFreqKHz = freqKHz
+							g.mcSelfInfo.RadioBwHz = bwHz
+							g.mcSelfInfo.RadioSF = uint8(sfVal)
+							g.mcSelfInfo.RadioCR = uint8(crVal)
+							g.mcMu.Unlock()
+						}
+					}
+					if txDbm > 0 && txDbm <= 30 {
+						if err := client.SetTxPower(uint8(txDbm)); err != nil {
+							g.mcAppendSystem("SetTxPower: " + err.Error())
+						} else {
+							g.mcAppendSystem(fmt.Sprintf("TX power: %d dBm", txDbm))
+							g.mcMu.Lock()
+							g.mcSelfInfo.TxPower = uint8(txDbm)
+							g.mcMu.Unlock()
+						}
 					}
 				}()
 			}
@@ -1726,6 +2111,226 @@ func (g *GUI) showMeshcoreSettings() {
 	)
 	d.Resize(fyne.NewSize(520, 360))
 	d.Show()
+}
+
+// buildMeshcoreStatusTab returns the Status tab body + a refresh
+// callback that the parent dialog wires to the Status-tab-selected
+// event so values are pulled fresh each time the operator opens
+// it. Battery / firmware / stats commands are issued in parallel
+// from a goroutine so a slow radio doesn't freeze the UI; results
+// land in the labels via fyne.Do.
+func (g *GUI) buildMeshcoreStatusTab() (fyne.CanvasObject, func()) {
+	mono := fyne.TextStyle{Monospace: true}
+	dim := color.RGBA{160, 165, 175, 255}
+	mkLabel := func() *canvas.Text {
+		t := canvas.NewText("(not connected)", dim)
+		t.TextStyle = mono
+		t.TextSize = 12
+		return t
+	}
+	firmwareLbl := mkLabel()
+	buildLbl := mkLabel()
+	modelLbl := mkLabel()
+	batteryLbl := mkLabel()
+	uptimeLbl := mkLabel()
+	queueLbl := mkLabel()
+	noiseLbl := mkLabel()
+	rssiLbl := mkLabel()
+	snrLbl := mkLabel()
+	airTimeLbl := mkLabel()
+	pktRecvLbl := mkLabel()
+	pktSentLbl := mkLabel()
+	pktBreakdownLbl := mkLabel()
+	pktErrLbl := mkLabel()
+	statusFooter := canvas.NewText("", dim)
+	statusFooter.TextStyle = fyne.TextStyle{Italic: true}
+	statusFooter.TextSize = 11
+
+	form := widget.NewForm(
+		widget.NewFormItem("Firmware version", firmwareLbl),
+		widget.NewFormItem("Build date", buildLbl),
+		widget.NewFormItem("Model", modelLbl),
+		widget.NewFormItem("Battery", batteryLbl),
+		widget.NewFormItem("Uptime", uptimeLbl),
+		widget.NewFormItem("TX queue", queueLbl),
+		widget.NewFormItem("Noise floor", noiseLbl),
+		widget.NewFormItem("Last RSSI", rssiLbl),
+		widget.NewFormItem("Last SNR", snrLbl),
+		widget.NewFormItem("Air time (TX / RX)", airTimeLbl),
+		widget.NewFormItem("Packets received", pktRecvLbl),
+		widget.NewFormItem("Packets sent", pktSentLbl),
+		widget.NewFormItem("Sent (flood / direct)", pktBreakdownLbl),
+		widget.NewFormItem("Receive errors", pktErrLbl),
+	)
+
+	refresh := func() {
+		g.mcMu.Lock()
+		client := g.mcClient
+		g.mcMu.Unlock()
+		fyne.Do(func() {
+			statusFooter.Text = "refreshing…"
+			statusFooter.Refresh()
+		})
+		setLine := func(t *canvas.Text, s string) {
+			t.Text = s
+			t.Refresh()
+		}
+		if client == nil {
+			fyne.Do(func() {
+				for _, t := range []*canvas.Text{firmwareLbl, buildLbl, modelLbl, batteryLbl, uptimeLbl, queueLbl, noiseLbl, rssiLbl, snrLbl, airTimeLbl, pktRecvLbl, pktSentLbl, pktBreakdownLbl, pktErrLbl} {
+					setLine(t, "(not connected)")
+				}
+				statusFooter.Text = ""
+				statusFooter.Refresh()
+			})
+			return
+		}
+		go func() {
+			var lines []string
+			info, err := client.DeviceQuery(meshcore.SupportedCompanionProtocolVersion)
+			if err != nil {
+				lines = append(lines, "DeviceQuery: "+err.Error())
+			}
+			coreS, err := client.GetCoreStats()
+			if err != nil {
+				lines = append(lines, "GetCoreStats: "+err.Error())
+			}
+			radioS, err := client.GetRadioStats()
+			if err != nil {
+				lines = append(lines, "GetRadioStats: "+err.Error())
+			}
+			pktS, err := client.GetPacketStats()
+			if err != nil {
+				lines = append(lines, "GetPacketStats: "+err.Error())
+			}
+			fyne.Do(func() {
+				if info.FirmwareBuildDate != "" || info.ManufacturerModel != "" {
+					setLine(firmwareLbl, fmt.Sprintf("v%d", info.FirmwareVersion))
+					setLine(buildLbl, nonEmpty(info.FirmwareBuildDate, "(unknown)"))
+					setLine(modelLbl, nonEmpty(info.ManufacturerModel, "(unknown)"))
+				}
+				setLine(batteryLbl, formatBattery(coreS.BatteryMilliVolts))
+				setLine(uptimeLbl, formatUptime(coreS.UptimeSecs))
+				setLine(queueLbl, fmt.Sprintf("%d packet(s)", coreS.QueueLen))
+				setLine(noiseLbl, fmt.Sprintf("%d dBm", radioS.NoiseFloor))
+				setLine(rssiLbl, fmt.Sprintf("%d dBm", radioS.LastRSSI))
+				setLine(snrLbl, fmt.Sprintf("%.2f dB", radioS.LastSNR))
+				setLine(airTimeLbl, fmt.Sprintf("%s / %s", formatUptime(radioS.TxAirSecs), formatUptime(radioS.RxAirSecs)))
+				setLine(pktRecvLbl, fmt.Sprintf("%d", pktS.Recv))
+				setLine(pktSentLbl, fmt.Sprintf("%d", pktS.Sent))
+				setLine(pktBreakdownLbl, fmt.Sprintf("%d / %d", pktS.NSentFlood, pktS.NSentDirect))
+				if pktS.HasRecvErrs {
+					setLine(pktErrLbl, fmt.Sprintf("%d", pktS.NRecvErrors))
+				} else {
+					setLine(pktErrLbl, "(unsupported by firmware)")
+				}
+				if len(lines) > 0 {
+					statusFooter.Text = strings.Join(lines, "; ")
+				} else {
+					statusFooter.Text = "refreshed " + time.Now().Format("15:04:05")
+				}
+				statusFooter.Refresh()
+			})
+		}()
+	}
+
+	refreshBtn := widget.NewButtonWithIcon("Refresh", theme.ViewRefreshIcon(), refresh)
+	rebootBtn := widget.NewButtonWithIcon("Reboot device", theme.WarningIcon(), func() {
+		dialog.ShowConfirm(
+			"Reboot MeshCore device?",
+			"The radio will restart and reconnect after a few seconds. Any in-flight messages will be dropped.",
+			func(ok bool) {
+				if !ok {
+					return
+				}
+				g.mcMu.Lock()
+				client := g.mcClient
+				g.mcMu.Unlock()
+				if client == nil {
+					g.mcAppendSystem("reboot: not connected")
+					return
+				}
+				go func() {
+					if err := client.Reboot(); err != nil {
+						g.mcAppendSystem("reboot: " + err.Error())
+						return
+					}
+					g.mcAppendSystem("reboot command sent — reconnecting shortly")
+				}()
+			},
+			g.window,
+		)
+	})
+	rebootBtn.Importance = widget.LowImportance
+	body := container.NewVBox(
+		form,
+		container.NewHBox(refreshBtn, rebootBtn, statusFooter),
+		wrappedLabel("Snapshot of what the radio reports about itself. Cumulative counters reset on radio reboot. Battery readings on mains-powered repeaters typically read 0 mV."),
+	)
+	return body, refresh
+}
+
+// nonEmpty returns s when non-empty, fallback otherwise. Trim
+// helpers in the radio's responses sometimes leave a model field
+// empty on minor firmware variants; this avoids a blank label.
+func nonEmpty(s, fallback string) string {
+	if strings.TrimSpace(s) == "" {
+		return fallback
+	}
+	return s
+}
+
+// formatBattery converts firmware-reported millivolts to a
+// human label. 0 mV is reported by mains-powered repeaters; show
+// that explicitly so the operator doesn't think it's a fault.
+// A rough Li-ion percentage is appended for typical 1S packs
+// (3300 mV ≈ 0%, 4200 mV ≈ 100%) since voltage alone is hard to
+// read at a glance.
+func formatBattery(mv uint16) string {
+	if mv == 0 {
+		return "n/a (mains powered or unsupported)"
+	}
+	pct := int(float64(mv-3300) / float64(4200-3300) * 100)
+	if pct < 0 {
+		pct = 0
+	}
+	if pct > 100 {
+		pct = 100
+	}
+	return fmt.Sprintf("%d mV  (~%d%%)", mv, pct)
+}
+
+// formatUptime renders a uint32 seconds count as a compact
+// d/h/m/s string ("3d 4h 12m"). Units below the largest non-zero
+// component are dropped past 1 day so the label stays scannable.
+func formatUptime(secs uint32) string {
+	if secs == 0 {
+		return "0s"
+	}
+	d := secs / 86400
+	h := (secs % 86400) / 3600
+	m := (secs % 3600) / 60
+	s := secs % 60
+	switch {
+	case d > 0:
+		return fmt.Sprintf("%dd %dh %dm", d, h, m)
+	case h > 0:
+		return fmt.Sprintf("%dh %dm", h, m)
+	case m > 0:
+		return fmt.Sprintf("%dm %ds", m, s)
+	}
+	return fmt.Sprintf("%ds", s)
+}
+
+// wrappedLabel returns a widget.Label with TextWrapWord set so
+// long explainer paragraphs in Settings dialogs reflow to the
+// container width instead of being clipped at the right edge.
+// Default Fyne labels truncate; this is the one-liner most call
+// sites that need wrapping want.
+func wrappedLabel(text string) *widget.Label {
+	l := widget.NewLabel(text)
+	l.Wrapping = fyne.TextWrapWord
+	return l
 }
 
 // formatBLESelection returns the user-facing label shown next to
@@ -2210,6 +2815,55 @@ func (g *GUI) sweepPendingRetries() {
 	}
 }
 
+// freezeInProgressTxRows halts the live "characters going green"
+// animation on every in-flight TX row. Called from cancelAllSends
+// after closing the playback stop channels — without this, the
+// 1 Hz advanceTxRows ticker keeps interpolating txProgress until
+// the full txAudioDuration elapses, so the operator sees text
+// continue to fill in green long after the radio has dropped PTT
+// and the cancel actually took effect.
+//
+// Behaviour per row:
+//   - Clamp txProgress to its current value (no further advance).
+//   - Clear txInProgress so the renderer stops splitting the text
+//     at the green/grey boundary.
+//   - Suffix " ✕" to the original message so a cancelled mid-TX
+//     reads visually distinct from a clean-completion TX echo.
+//
+// Idempotent — safe to call when no TX is in flight (loop body
+// short-circuits on the !r.tx || !r.txInProgress guard).
+func (g *GUI) freezeInProgressTxRows() {
+	g.mu.Lock()
+	dirty := false
+	for i := range g.rows {
+		r := &g.rows[i]
+		if !r.tx || !r.txInProgress {
+			continue
+		}
+		r.txInProgress = false
+		runeLen := len([]rune(r.text))
+		if r.txProgress < 0 {
+			r.txProgress = 0
+		}
+		if r.txProgress > runeLen {
+			r.txProgress = runeLen
+		}
+		// Append a cancel marker so the row visually distinguishes
+		// from a successful TX (which renders fully green). Don't
+		// re-append if already present so back-to-back cancels
+		// (e.g. ESC twice) don't pile up markers.
+		if !strings.HasSuffix(r.text, " ✕") {
+			r.text += " ✕"
+		}
+		dirty = true
+	}
+	chatList := g.chatList
+	g.mu.Unlock()
+	if dirty && chatList != nil {
+		fyne.Do(func() { chatList.Refresh() })
+	}
+}
+
 // advanceTxRows nudges the txProgress on every in-progress TX row by
 // the proportion of the FT8 audio duration that's elapsed since the
 // row was created. Called once a second by the status ticker; cheap
@@ -2325,6 +2979,13 @@ func (g *GUI) cancelAllSends(reason string, verbose bool) {
 	for _, p := range pending {
 		closeStopCh(p.stopCh)
 	}
+	// Closing the stop channels aborts the audio + drops PTT, but the
+	// in-progress chat row keeps animating ("characters going green")
+	// because advanceTxRows interpolates against txStart and doesn't
+	// know the playback was cut short. Freeze the row now so the
+	// animation halts at the actual cancellation point and it's
+	// visually distinct from a normal-completion TX echo.
+	g.freezeInProgressTxRows()
 	// Drain queued TxRequests. Non-blocking — stop as soon as the
 	// channel is empty. Each drained request gets its StopCh closed
 	// in case runTX picked it up between the drain and the close
@@ -2556,91 +3217,7 @@ func (g *GUI) appendRow(r chatRow) {
 	}
 }
 
-func (g *GUI) rememberHeard(call string, snr float64, isCQ bool, otaType string) {
-	call = strings.ToUpper(strings.TrimSpace(call))
-	if call == "" || strings.HasPrefix(call, "<") {
-		return
-	}
-	// Last-line-of-defence callsign-shape gate: senderFromMessage
-	// already filters CQ modifiers (ASIA / BY / numeric zones / …),
-	// but any future change to that path could leak grid squares,
-	// reports (R-18), or sign-offs (RR73) into the roster. Require
-	// at least one letter + one digit — eliminates the obvious
-	// non-callsign tokens without an exhaustive ITU-prefix table.
-	if !isPlausibleCallsign(call) {
-		return
-	}
-	now := time.Now()
-	g.mu.Lock()
-	if g.heard == nil {
-		g.heard = make(map[string]heardEntry)
-	}
-	entry := g.heard[call]
-	entry.snr = snr
-	entry.lastSeen = now
-	if isCQ {
-		entry.lastCQ = now
-	}
-	if otaType != "" {
-		entry.lastOTA = now
-		entry.lastOTAType = otaType
-	}
-	g.heard[call] = entry
-	// Cap memory: when the map gets too large, drop the oldest half.
-	if len(g.heard) > maxHeard {
-		type kv struct {
-			call string
-			t    time.Time
-		}
-		all := make([]kv, 0, len(g.heard))
-		for k, v := range g.heard {
-			all = append(all, kv{k, v.lastSeen})
-		}
-		sort.Slice(all, func(i, j int) bool { return all[i].t.Before(all[j].t) })
-		for i := 0; i < len(all)/2; i++ {
-			delete(g.heard, all[i].call)
-		}
-	}
-	g.mu.Unlock()
-	if g.usersList != nil {
-		fyne.Do(func() { g.usersList.Refresh() })
-	}
-}
-
-// heardSnapshot returns the HEARD map flattened into a slice sorted by
-// most-recently-seen first. Built fresh on every list redraw -small N
-// (≤ maxHeard) keeps this trivially cheap. Decouples the list callbacks
-// from the live map so they don't need to hold g.mu while drawing.
-type heardRow struct {
-	call        string
-	snr         float64
-	when        time.Time
-	lastCQ      time.Time
-	lastOTA     time.Time
-	lastOTAType string
-}
-
-func (g *GUI) heardSnapshot() []heardRow {
-	g.mu.Lock()
-	mode := g.heardSort
-	out := make([]heardRow, 0, len(g.heard))
-	for c, e := range g.heard {
-		out = append(out, heardRow{
-			call: c, snr: e.snr, when: e.lastSeen,
-			lastCQ: e.lastCQ, lastOTA: e.lastOTA, lastOTAType: e.lastOTAType,
-		})
-	}
-	g.mu.Unlock()
-	switch mode {
-	case heardSortSNR:
-		sort.Slice(out, func(i, j int) bool { return out[i].snr > out[j].snr })
-	case heardSortRecent:
-		sort.Slice(out, func(i, j int) bool { return out[i].when.After(out[j].when) })
-	default: // heardSortAlpha
-		sort.Slice(out, func(i, j int) bool { return out[i].call < out[j].call })
-	}
-	return out
-}
+// (rememberHeard, heardRow, heardSnapshot moved to gui_heard.go.)
 
 // senderFromMessage extracts the operator who keyed the transmission
 // (used for HEARD): for "CQ X …" the sender is X; for a directed
@@ -2842,7 +3419,8 @@ Retries up to 4 times, 30 seconds apart, if they don't respond.
 	rt.Wrapping = fyne.TextWrapWord
 	scroll := container.NewScroll(rt)
 	scroll.SetMinSize(fyne.NewSize(600, 620))
-	dialog.ShowCustom("NocordHF — chat reference", "Close", scroll, g.window)
+	body := container.NewBorder(nil, g.diagnosticBundleBar(), nil, nil, scroll)
+	dialog.ShowCustom("NocordHF — chat reference", "Close", body, g.window)
 }
 
 // showMcLocationPicker opens a modal with a fresh MapWidget so the
@@ -2987,7 +3565,43 @@ indicators are hidden — irrelevant here.
 	rt.Wrapping = fyne.TextWrapWord
 	scroll := container.NewScroll(rt)
 	scroll.SetMinSize(fyne.NewSize(620, 640))
-	dialog.ShowCustom("NocordHF — MeshCore reference", "Close", scroll, g.window)
+	body := container.NewBorder(nil, g.diagnosticBundleBar(), nil, nil, scroll)
+	dialog.ShowCustom("NocordHF — MeshCore reference", "Close", body, g.window)
+}
+
+// diagnosticBundleBar returns the small footer row that lets the
+// operator save a zip of recent logs + sanitised prefs for bug
+// reports. Placed at the bottom of both chat-help dialogs so it
+// rides along with the (?) icon — the natural "help" surface
+// already in front of the operator when something's gone wrong.
+func (g *GUI) diagnosticBundleBar() fyne.CanvasObject {
+	includeHistoryChk := widget.NewCheck("Include chat history (bbolt)", nil)
+	includeRecordingsChk := widget.NewCheck("Include recent TX recordings (~3× WAV)", nil)
+	saveBtn := widget.NewButtonWithIcon("Save diagnostic bundle…", theme.DownloadIcon(), func() {
+		opts := DiagnosticOptions{
+			IncludeChatHistory: includeHistoryChk.Checked,
+			IncludeRecordings:  includeRecordingsChk.Checked,
+		}
+		dialog.ShowFileSave(func(uc fyne.URIWriteCloser, err error) {
+			if err != nil || uc == nil {
+				return
+			}
+			path := uc.URI().Path()
+			_ = uc.Close()
+			go func() {
+				if err := saveDiagnosticBundle(path, opts); err != nil {
+					g.AppendSystem("diag bundle: " + err.Error())
+					return
+				}
+				g.AppendSystem("diag bundle saved: " + path)
+			}()
+		}, g.window)
+	})
+	hint := wrappedLabel("Bundle: log tail (last 2 MB) + runtime info + prefs (passwords / device names redacted). Tick the boxes ONLY if the recipient needs them — chat history and recordings carry operator-private content.")
+	return container.NewVBox(
+		container.NewHBox(saveBtn, includeHistoryChk, includeRecordingsChk),
+		hint,
+	)
 }
 
 // showCallContextMenu opens a small popup menu at the given canvas
@@ -2998,12 +3612,29 @@ indicators are hidden — irrelevant here.
 // experience is identical regardless of where the operator right-
 // clicked.
 func (g *GUI) showCallContextMenu(call string, isCQ bool, pos fyne.Position) {
+	if logging.L != nil {
+		logging.L.Debugw("showCallContextMenu enter",
+			"call", call,
+			"isCQ", isCQ,
+			"pos_x", pos.X,
+			"pos_y", pos.Y,
+			"window_nil", g.window == nil,
+			"empty_call", call == "",
+		)
+	}
 	if g.window == nil || call == "" {
+		if logging.L != nil {
+			logging.L.Debugw("showCallContextMenu early-return")
+		}
 		return
 	}
 	directedLabel := "Call"
 	if isCQ {
 		directedLabel = "Reply"
+	}
+	ignoreLabel := "Ignore (hide from HEARD)"
+	if g.isHeardIgnored(call) {
+		ignoreLabel = "Unignore (show in HEARD)"
 	}
 	items := []*fyne.MenuItem{
 		fyne.NewMenuItem("Profile", func() { g.showProfile(call, pos) }),
@@ -3017,6 +3648,10 @@ func (g *GUI) showCallContextMenu(call string, isCQ bool, pos fyne.Position) {
 		}),
 		fyne.NewMenuItem("Open QRZ", func() {
 			_ = openURL(fmt.Sprintf("https://www.qrz.com/db/%s", call))
+		}),
+		fyne.NewMenuItemSeparator(),
+		fyne.NewMenuItem(ignoreLabel, func() {
+			g.setHeardIgnored(call, !g.isHeardIgnored(call))
 		}),
 	}
 	menu := fyne.NewMenu("", items...)
@@ -3289,95 +3924,8 @@ func (g *GUI) dismissDecodePopup() {
 //
 // Subsequent calls with a different call rebuild the label; same-call
 // re-hovers are no-ops. Position updates come from updateHeardTooltipPos.
-func (g *GUI) showHeardTooltip(call, country string) {
-	if g.window == nil || country == "" {
-		return
-	}
-	g.mu.Lock()
-	if g.heardTooltipHide != nil {
-		g.heardTooltipHide.Stop()
-		g.heardTooltipHide = nil
-	}
-	if g.heardTooltipCall == call && g.heardTooltip != nil {
-		g.mu.Unlock()
-		return
-	}
-	g.mu.Unlock()
-	g.removeHeardTooltipFromCanvas()
-
-	t := canvas.NewText(country, color.RGBA{220, 225, 235, 255})
-	t.TextStyle = fyne.TextStyle{Monospace: true}
-	t.TextSize = 11
-	bg := canvas.NewRectangle(color.RGBA{30, 32, 38, 240})
-	bg.StrokeColor = color.RGBA{90, 95, 105, 255}
-	bg.StrokeWidth = 1
-	wrapped := container.NewStack(bg, container.NewPadded(t))
-	wrapped.Resize(wrapped.MinSize())
-
-	g.mu.Lock()
-	g.heardTooltip = wrapped
-	g.heardTooltipCall = call
-	g.mu.Unlock()
-	fyne.Do(func() {
-		g.window.Canvas().Overlays().Add(wrapped)
-	})
-}
-
-// updateHeardTooltipPos repositions the tooltip near the cursor. Called
-// from the hoverRow MouseMoved handler so the tooltip tracks the
-// pointer instead of being pinned to a fixed corner of the column.
-func (g *GUI) updateHeardTooltipPos(absPos fyne.Position) {
-	g.mu.Lock()
-	tip := g.heardTooltip
-	g.mu.Unlock()
-	if tip == nil {
-		return
-	}
-	fyne.Do(func() {
-		// Offset so the tooltip doesn't sit directly under the pointer
-		// (which would make it follow micro-jitter and visually crowd
-		// the row text being inspected).
-		tip.Move(fyne.NewPos(absPos.X+12, absPos.Y+8))
-	})
-}
-
-// removeHeardTooltipFromCanvas pulls the tooltip off the canvas
-// overlay stack if one is currently displayed. Safe to call when none
-// is showing.
-func (g *GUI) removeHeardTooltipFromCanvas() {
-	g.mu.Lock()
-	tip := g.heardTooltip
-	g.mu.Unlock()
-	if tip != nil && g.window != nil {
-		fyne.Do(func() {
-			g.window.Canvas().Overlays().Remove(tip)
-		})
-	}
-}
-
-// hideHeardTooltip schedules the tooltip to disappear after a short
-// debounce so a rapid leave/enter (cursor jitter, list re-binding)
-// doesn't tear it down and rebuild visibly.
-func (g *GUI) hideHeardTooltip() {
-	g.mu.Lock()
-	if g.heardTooltipHide != nil {
-		g.heardTooltipHide.Stop()
-	}
-	g.heardTooltipHide = time.AfterFunc(150*time.Millisecond, func() {
-		g.mu.Lock()
-		tip := g.heardTooltip
-		g.heardTooltip = nil
-		g.heardTooltipCall = ""
-		g.heardTooltipHide = nil
-		g.mu.Unlock()
-		if tip != nil && g.window != nil {
-			fyne.Do(func() {
-				g.window.Canvas().Overlays().Remove(tip)
-			})
-		}
-	})
-	g.mu.Unlock()
-}
+// (showHeardTooltip, updateHeardTooltipPos, removeHeardTooltipFromCanvas,
+// hideHeardTooltip moved to gui_heard.go.)
 
 // showProfile opens a Discord-style operator profile for the given
 // callsign. Pulls everything available locally -country / continent
@@ -3767,6 +4315,20 @@ func (g *GUI) confirmStatusForCall(call string) int {
 	return 0
 }
 
+// workedSummaryForCall returns a short multi-line description of
+// the operator's QSO history with the given call: total contact
+// count, most-recent date + band, and LoTW-confirmed bands.
+// Returns "Not worked before" when nothing matches. Used by the
+// HEARD-list hover tooltip so the operator can decide at a glance
+// whether to chase a station (new one) or skip (already in the
+// log on this band, or LoTW-confirmed).
+//
+// All scans are in-memory against g.adifLog + g.lotwQSLs; the
+// caller must hold g.mu OR this function takes its own lock as
+// the named lock-policy comments around adifLog suggest.
+// (workedSummaryForCall moved to gui_heard.go alongside the
+// HEARD-tooltip code that consumes it.)
+
 // workedStatusForCall classifies a callsign for map-pin colouring:
 //
 //	0 = not worked on this band  (default green)
@@ -3895,39 +4457,7 @@ func (g *GUI) scrollChatToCall(call string) {
 
 // scrollHeardToCall finds the call's row in the HEARD list and
 // scrolls / selects it.
-func (g *GUI) scrollHeardToCall(call string) {
-	if g.usersList == nil {
-		return
-	}
-	snap := g.heardSnapshot()
-	for i, e := range snap {
-		if strings.EqualFold(e.call, call) {
-			fyne.Do(func() {
-				g.mu.Lock()
-				g.suppressHeardSelectAction = true
-				g.mu.Unlock()
-				g.usersList.ScrollTo(i)
-				g.usersList.Select(i)
-			})
-			return
-		}
-	}
-}
-
-// shouldBlinkCall returns true if the row binder should render call
-// in a blink-highlight state on this redraw. Alternates on/off every
-// 250 ms while the highlight window is active.
-func (g *GUI) shouldBlinkCall(call string) bool {
-	g.mu.Lock()
-	hl := g.highlightedCall
-	until := g.highlightUntil
-	g.mu.Unlock()
-	if hl == "" || !strings.EqualFold(hl, call) || time.Now().After(until) {
-		return false
-	}
-	// Phase: 4 cycles per second (250 ms steps), even = highlight on.
-	return (time.Now().UnixMilli()/250)%2 == 0
-}
+// (scrollHeardToCall, shouldBlinkCall moved to gui_heard.go.)
 
 // scrollChatToDecode finds the chat row matching (slotStart, call) and
 // scrolls the chat list to it, selecting it briefly to flash a visual
@@ -4465,6 +4995,17 @@ func (g *GUI) buildLayout() fyne.CanvasObject {
 			default:
 				h.onSecondary = nil
 			}
+			// Middle-click on any chat row → browser-style back
+			// navigation in MeshCore mode. Falls back to no-op in
+			// FT8 since the back-stack isn't populated there.
+			h.onMiddle = func() {
+				g.mu.Lock()
+				isMc := g.activeMode == "meshcore"
+				g.mu.Unlock()
+				if isMc {
+					g.mcGoBack()
+				}
+			}
 		},
 	)
 	// Click a chat row to populate the input box with that station's call —
@@ -4688,12 +5229,20 @@ func (g *GUI) buildLayout() fyne.CanvasObject {
 			flagCenter := flagInner.Objects[0].(*fyne.Container)
 			flagText := flagCenter.Objects[0].(*canvas.Text)
 			t := row.Objects[4].(*canvas.Text)
+			// Stash the row index BEFORE the out-of-range guard
+			// so onTap captures the right value even if a stale
+			// bind fires after a snapshot shrink. hoverRow.listIdx
+			// is the bridge between Fyne's tap dispatch (which
+			// stops bubbling to the parent List once we implement
+			// SecondaryTappable) and the List's selection model.
+			h.listIdx = id
 			snap := g.heardSnapshot()
 			if id >= len(snap) {
 				h.onHoverIn = nil
 				h.onHoverOut = nil
 				h.onHoverMove = nil
 				h.onSecondary = nil
+				h.onTap = nil
 				flagSlot.onHoverIn = nil
 				flagSlot.onHoverOut = nil
 				flagSlot.onHoverMove = nil
@@ -4763,36 +5312,55 @@ func (g *GUI) buildLayout() fyne.CanvasObject {
 			}
 			t.Refresh()
 			// Row-level hover: highlight matching map pin + waterfall
-			// box. No country tooltip here — that lives on the flag
-			// sub-widget so the tooltip only appears when the cursor
-			// is actually over the country flag.
+			// box, AND show the country + worked-before tooltip. The
+			// tooltip used to be flag-slot only, but the flag is a
+			// tiny target — moving it to the whole row makes the
+			// worked-before info actually discoverable while the
+			// operator is scanning the list.
 			call := e.call
 			country := callsign.CountryName(call)
 			h.onHoverIn = func() {
 				if g.scope != nil {
 					g.scope.SetHighlightCall(call)
 				}
+				g.showHeardTooltip(call, country)
 			}
 			h.onHoverOut = func() {
 				if g.scope != nil {
 					g.scope.SetHighlightCall("")
 				}
+				g.hideHeardTooltip()
 			}
-			h.onHoverMove = nil
-			rowIsCQ := !e.lastCQ.IsZero() && time.Since(e.lastCQ) <= 60*time.Second
-			h.onSecondary = func(pos fyne.Position) {
-				g.showCallContextMenu(call, rowIsCQ, pos)
-			}
-			// Flag-slot hover: country tooltip only.
-			flagSlot.onHoverIn = func() {
-				if country != "" {
-					g.showHeardTooltip(call, country)
-				}
-			}
-			flagSlot.onHoverOut = func() { g.hideHeardTooltip() }
-			flagSlot.onHoverMove = func(absPos fyne.Position) {
+			h.onHoverMove = func(absPos fyne.Position) {
 				g.updateHeardTooltipPos(absPos)
 			}
+			rowIsCQ := !e.lastCQ.IsZero() && time.Since(e.lastCQ) <= 60*time.Second
+			h.onSecondary = func(pos fyne.Position) {
+				if logging.L != nil {
+					logging.L.Debugw("HEARD row onSecondary fired",
+						"call", call, "rowIsCQ", rowIsCQ,
+						"pos_x", pos.X, "pos_y", pos.Y)
+				}
+				g.showCallContextMenu(call, rowIsCQ, pos)
+			}
+			// Left-click → forward to the List's selection so
+			// OnSelected fires (magnification popup + chat scroll).
+			// Without this, Fyne drops left-clicks because the
+			// hoverRow's SecondaryTappable impl stops bubbling all
+			// pointer events to the parent List.
+			h.onTap = func() {
+				if logging.L != nil {
+					logging.L.Debugw("HEARD row onTap fired",
+						"call", call, "listIdx", h.listIdx)
+				}
+				g.usersList.Select(h.listIdx)
+			}
+			// Clear flag-slot handlers — the row-level hover above
+			// supersedes them. Leaving them set would double-fire
+			// the tooltip request and leak between rows on rebind.
+			flagSlot.onHoverIn = nil
+			flagSlot.onHoverOut = nil
+			flagSlot.onHoverMove = nil
 		},
 	)
 	g.usersList.OnSelected = func(id widget.ListItemID) {
@@ -4841,7 +5409,20 @@ func (g *GUI) buildLayout() fyne.CanvasObject {
 	// the neighbouring HSplit pane.
 	g.usersCol = container.New(&fixedWidthLayout{width: 170}, g.usersInner)
 
-	chatCenter := container.NewBorder(headerStack, inputStack, nil, nil, g.chatList)
+	// Wrap the chat list in a Mouseable shim so middle-click
+	// (mouse "back" on 5-button mice often maps to button 3)
+	// fires mcGoBack. Keyboard shortcut Cmd/Ctrl+[ also works;
+	// the mouse path is the more natural reach when you've
+	// just clicked into a DM from somewhere.
+	chatWithBack := newMiddleClickBackWrapper(g.chatList, func() {
+		g.mu.Lock()
+		isMc := g.activeMode == "meshcore"
+		g.mu.Unlock()
+		if isMc {
+			g.mcGoBack()
+		}
+	})
+	chatCenter := container.NewBorder(headerStack, inputStack, nil, nil, chatWithBack)
 	chatCol := container.NewBorder(nil, nil, nil, g.usersCol, chatCenter)
 	chatBg := canvas.NewRectangle(color.RGBA{40, 43, 48, 255})
 	chatColStack := container.NewStack(chatBg, chatCol)
@@ -5079,18 +5660,25 @@ func (g *GUI) TxFreq() float64 {
 // TxLevel returns the operator-selected TX audio amplitude in [0..1].
 // Drives the encoder's level argument; on USB-CODEC rigs this maps
 // roughly linearly to RF output via the rig's ALC, so the operator
-// can tune it as a soft "TX power" control. Persisted in prefs;
-// default 0.18 (≈ -15 dBFS, conservative to keep ALC happy).
+// can tune it as a soft "TX power" control. Persisted per-radio so
+// swapping rigs (e.g. Icom IC-7300 ↔ Yaesu FT-991) doesn't carry
+// one rig's drive level onto the other; defaults to 0.18 (≈
+// -15 dBFS, conservative to keep ALC happy) when no per-radio
+// value has been saved yet.
 func (g *GUI) TxLevel() float64 {
 	if g.app == nil {
 		return 0.18
 	}
-	return g.app.Preferences().FloatWithFallback("tx_level", 0.18)
+	prefs := g.app.Preferences()
+	rt := prefs.String("radio_type")
+	return prefs.FloatWithFallback(txLevelPrefKey(rt), prefs.FloatWithFallback("tx_level", 0.18))
 }
 
 // SetTxLevel persists a new TX level. Clamped to a sane range so a
 // runaway slider can't blow the rig's ALC or drop transmissions to
-// inaudibility.
+// inaudibility. Writes to the per-radio key for the currently-saved
+// radio_type; the legacy flat "tx_level" key is left intact as a
+// fallback for any new radio_type the operator hasn't tuned yet.
 func (g *GUI) SetTxLevel(v float64) {
 	if g.app == nil {
 		return
@@ -5101,7 +5689,8 @@ func (g *GUI) SetTxLevel(v float64) {
 	if v > 0.5 {
 		v = 0.5
 	}
-	g.app.Preferences().SetFloat("tx_level", v)
+	prefs := g.app.Preferences()
+	prefs.SetFloat(txLevelPrefKey(prefs.String("radio_type")), v)
 }
 
 // handleSubmit parses the input box and queues a TxRequest.
@@ -5278,29 +5867,45 @@ func formatRowSegments(r chatRow) (ts, meta, msg string) {
 	}
 	if r.system {
 		if r.mc {
-			return "[" + r.when.UTC().Format("15:04:05") + "]", "", r.text
+			return "[" + r.when.UTC().Format("15:04:05") + "]", "", flattenForChatLine(r.text)
 		}
-		return "", "", fmt.Sprintf("* %s", r.text)
+		return "", "", fmt.Sprintf("* %s", flattenForChatLine(r.text))
 	}
 	t := r.when.UTC().Format("15:04:05")
 	if r.mc {
 		// Cell contents are populated by the bind callback;
 		// return ts only so the timestamp still renders.
-		return "[" + t + "]", "", r.text
+		return "[" + t + "]", "", flattenForChatLine(r.text)
 	}
 	if r.tx {
-		return t, " TX> ", r.text
+		return t, " TX> ", flattenForChatLine(r.text)
 	}
 	region := r.region
 	if region == "" {
 		region = "-"
 	}
 	meta = fmt.Sprintf(" %+3.0f dB  %-7s ", r.snrDB, region)
-	msg = r.text
+	msg = flattenForChatLine(r.text)
 	if r.method != "" {
 		msg += " ~" + r.method
 	}
 	return t, meta, msg
+}
+
+// flattenForChatLine collapses a multi-line message body into one
+// renderable line. Fyne's canvas.Text is single-line and falls
+// through to the missing-glyph (◊) for any \n / \r, so a bot
+// broadcasting a 4-line status block ends up as one run of
+// diamond separators. Replacing the newlines with " · " keeps the
+// content readable in the chat row while the unmodified text is
+// still available in Info / chatRow.text for copy + paste.
+func flattenForChatLine(s string) string {
+	if !strings.ContainsAny(s, "\r\n") {
+		return s
+	}
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	return strings.ReplaceAll(s, "\n", " · ")
 }
 
 // formatMcSnrCell renders the SNR cell for a MeshCore chat row.
@@ -5556,6 +6161,50 @@ func (t *tappableContainer) Tapped(_ *fyne.PointEvent) {
 	}
 }
 
+// middleClickBackWrapper wraps any CanvasObject so MouseButtonTertiary
+// (the standard middle-click; many 5-button mice route their "back"
+// side button through it) fires onBack. Other mouse buttons /
+// scroll / hover pass through to the wrapped child untouched
+// because the wrapper isn't a Tappable / Scrollable / Hoverable —
+// only desktop.Mouseable's MouseDown is implemented, and primary
+// + secondary clicks are forwarded to the child via Fyne's normal
+// event routing (the wrapper doesn't claim them).
+//
+// Wraps the chat list in MeshCore mode so right after clicking
+// into a DM from a channel HEARD entry, the operator can middle-
+// click anywhere in the chat area to bounce back to the channel.
+type middleClickBackWrapper struct {
+	widget.BaseWidget
+	content fyne.CanvasObject
+	onBack  func()
+}
+
+func newMiddleClickBackWrapper(content fyne.CanvasObject, onBack func()) *middleClickBackWrapper {
+	w := &middleClickBackWrapper{content: content, onBack: onBack}
+	w.ExtendBaseWidget(w)
+	return w
+}
+
+func (w *middleClickBackWrapper) CreateRenderer() fyne.WidgetRenderer {
+	return widget.NewSimpleRenderer(w.content)
+}
+
+// MouseDown fires for any pointer button press on the wrapper.
+// We only care about the middle button; primary + secondary
+// propagate to children naturally via the renderer.
+func (w *middleClickBackWrapper) MouseDown(ev *desktop.MouseEvent) {
+	if ev.Button == desktop.MouseButtonTertiary && w.onBack != nil {
+		w.onBack()
+	}
+}
+
+// MouseUp is part of the desktop.Mouseable interface contract;
+// we don't need to act on release but the method must exist for
+// the interface assertion to succeed.
+func (w *middleClickBackWrapper) MouseUp(_ *desktop.MouseEvent) {}
+
+var _ desktop.Mouseable = (*middleClickBackWrapper)(nil)
+
 // circleBadge renders a colored circle with up to a few characters of
 // text inside it — used as a visual marker in the HEARD roster + on
 // the map. Shape is enforced via canvas.Circle (Fyne primitive that
@@ -5750,16 +6399,48 @@ func (g *GUI) refreshModeRail() {
 // (address + display name). Storing both transports' state lets the
 // operator flip between them without losing the other side's pick.
 const (
-	mcPrefTransport        = "meshcore.transport"
-	mcPrefDeviceBoard      = "meshcore.device.board"
-	mcPrefDevicePort       = "meshcore.device.port"
-	mcPrefDeviceBaud       = "meshcore.device.baud"
-	mcPrefBLEAddress       = "meshcore.ble.address"
-	mcPrefBLEDeviceName    = "meshcore.ble.device_name"
-	mcPrefProfileName      = "meshcore.profile.name"
-	mcPrefProfileLat       = "meshcore.profile.lat"
-	mcPrefProfileLon       = "meshcore.profile.lon"
+	mcPrefTransport     = "meshcore.transport"
+	mcPrefDeviceBoard   = "meshcore.device.board"
+	mcPrefDevicePort    = "meshcore.device.port"
+	mcPrefDeviceBaud    = "meshcore.device.baud"
+	mcPrefBLEAddress    = "meshcore.ble.address"
+	mcPrefBLEDeviceName = "meshcore.ble.device_name"
+	mcPrefProfileName   = "meshcore.profile.name"
+	mcPrefProfileLat    = "meshcore.profile.lat"
+	mcPrefProfileLon    = "meshcore.profile.lon"
+	// mcPrefProfileManualAdd is the legacy single-bool toggle
+	// (true = no auto-add of any type, false = auto-add everything
+	// at the radio level). Superseded by the per-type prefs below;
+	// kept for one-time migration on first read.
 	mcPrefProfileManualAdd = "meshcore.profile.manual_add"
+	// Per-type auto-add prefs. The radio is always kept in
+	// manual-add mode so we get rich PushNewAdvert events for
+	// every advert the firmware hears; these prefs decide which
+	// types get host-side auto-promoted to real contacts (via
+	// AddUpdateContact) vs stashed in the pending sidebar for
+	// the operator to review. Defaults reflect the typical
+	// operator preference: keep DM-able human/room contacts,
+	// keep infrastructure (repeaters/sensors) out of the table.
+	mcPrefAutoAddChat     = "meshcore.profile.autoadd_chat"
+	mcPrefAutoAddRoom     = "meshcore.profile.autoadd_room"
+	mcPrefAutoAddRepeater = "meshcore.profile.autoadd_repeater"
+	mcPrefAutoAddSensor   = "meshcore.profile.autoadd_sensor"
+	// Radio tab — LoRa physical layer. Stored in wire-native units
+	// (Hz for freq + bw, raw integers for SF/CR/dBm) so the values
+	// hand straight to Client.SetRadioParams / SetTxPower without
+	// per-launch conversion. The GUI converts to MHz / kHz at
+	// display time so the operator sees natural units.
+	// Frequency stored in kHz (wire-native unit for SetRadioParams,
+	// even though bandwidth on the same command is in Hz — that's
+	// upstream's asymmetry, not ours). Pref key renamed from
+	// `freq_hz` to force-discard any pre-fix saved values that were
+	// stored as Hz and would otherwise be interpreted 1000× too
+	// large after the unit fix.
+	mcPrefRadioFreqKHz = "meshcore.radio.freq_khz"
+	mcPrefRadioBwHz    = "meshcore.radio.bw_hz"
+	mcPrefRadioSF      = "meshcore.radio.sf"
+	mcPrefRadioCR      = "meshcore.radio.cr"
+	mcPrefRadioTxDbm   = "meshcore.radio.tx_power_dbm"
 	// Auto-reconnect interval in MINUTES. 0 disables. Default 5 min
 	// is a battery-conscious choice for BLE-attached trackers like
 	// the T1000-E — aggressive reconnect would keep the radio's
@@ -5767,6 +6448,15 @@ const (
 	// common case where reconnect is needed.
 	mcPrefAutoReconnectMin    = "meshcore.auto_reconnect_minutes"
 	mcDefaultAutoReconnectMin = 5
+	// Periodic self-advert ("tracker re-advert") — fires
+	// SendSelfAdvert(Flood) every N minutes while a client is
+	// connected. 0 disables (the firmware's own auto-advert
+	// cycle stays in effect, typically every few hours). Useful
+	// for trackers (T1000-E and similar) where peers should see
+	// fresh GPS position more often than the firmware default.
+	// For stationary radios leave at 0 — repeated adverts waste
+	// air time without changing what peers know about you.
+	mcPrefTrackerAdvertMin = "meshcore.tracker.advert_interval_min"
 )
 
 // MeshCore transport identifiers as persisted in mcPrefTransport.
@@ -5829,7 +6519,9 @@ const maxMcRxLog = 200
 
 // mcThreadID returns the map key for a per-conversation chat buffer.
 // kind is "contact" or "channel"; id is the lowercase hex pubkey
-// prefix for contacts or the decimal channel index for channels.
+// prefix for contacts or the secret-derived ChannelIdentity for
+// channels. See mcChannelThreadID for why channels are keyed by
+// secret hash and not slot index.
 func mcThreadID(kind, id string) string { return kind + ":" + id }
 
 // mcContactThreadID is the convenience version for a Contact —
@@ -5855,8 +6547,16 @@ func mcContactIcon(t meshcore.AdvType) fyne.Resource {
 }
 
 // mcChannelThreadID is the convenience version for a Channel.
+//
+// The id is the channel's stable secret-derived identity, NOT the
+// firmware slot index. Slot indices are reusable: wipe NVRAM and
+// the next channel the operator adds lands in slot 0, which would
+// otherwise inherit slot 0's previous chat history. Keying by the
+// secret hash instead means the same channel (anywhere on the
+// mesh, in any slot) shares one history bucket, and a new channel
+// dropped into a recycled slot starts clean.
 func mcChannelThreadID(c meshcore.Channel) string {
-	return mcThreadID("channel", fmt.Sprintf("%d", c.Index))
+	return mcThreadID("channel", meshcore.ChannelIdentity(c.Secret))
 }
 
 // mcChannelLabel returns the display label for a channel + a flag
@@ -5922,12 +6622,15 @@ func (g *GUI) buildMeshcoreSidebar() *fyne.Container {
 	g.mcChannelsHeader = canvas.NewText("CHANNELS  (0)", color.RGBA{140, 140, 145, 255})
 	g.mcChannelsHeader.TextSize = 11
 	g.mcChannelsHeader.TextStyle = fyne.TextStyle{Bold: true}
+	g.mcPendingHeader = canvas.NewText("PENDING  (0)", color.RGBA{140, 140, 145, 255})
+	g.mcPendingHeader.TextSize = 11
+	g.mcPendingHeader.TextStyle = fyne.TextStyle{Bold: true}
 
 	g.mcContactsList = widget.NewList(
 		func() int {
 			g.mcMu.Lock()
 			defer g.mcMu.Unlock()
-			return len(g.mcContacts)
+			return len(g.mcContactsView)
 		},
 		func() fyne.CanvasObject {
 			// Row template: [star][icon-slot][name]. Star is a
@@ -5971,11 +6674,11 @@ func (g *GUI) buildMeshcoreSidebar() *fyne.Container {
 			t := border.Objects[0].(*canvas.Text)
 			row.listIdx = id
 			g.mcMu.Lock()
-			if id >= len(g.mcContacts) {
+			if id >= len(g.mcContactsView) {
 				g.mcMu.Unlock()
 				return
 			}
-			ct := g.mcContacts[id]
+			ct := g.mcContactsView[id]
 			active := mcContactThreadID(ct) == g.mcCurrentThread
 			g.mcMu.Unlock()
 			name := ct.AdvName
@@ -6028,11 +6731,11 @@ func (g *GUI) buildMeshcoreSidebar() *fyne.Container {
 	)
 	g.mcContactsList.OnSelected = func(id widget.ListItemID) {
 		g.mcMu.Lock()
-		if id >= len(g.mcContacts) {
+		if id >= len(g.mcContactsView) {
 			g.mcMu.Unlock()
 			return
 		}
-		ct := g.mcContacts[id]
+		ct := g.mcContactsView[id]
 		g.mcMu.Unlock()
 		g.mcSwitchThread(mcContactThreadID(ct))
 		if g.mcChannelsList != nil {
@@ -6138,6 +6841,95 @@ func (g *GUI) buildMeshcoreSidebar() *fyne.Container {
 		}
 	}
 
+	// Pending adverts list — populated when the radio runs in
+	// manual-add-contacts mode. Each row is one advert the
+	// firmware delivered via PushNewAdvert but didn't persist;
+	// right-click opens the same Add / Discard / Block menu as
+	// the map ring. Single-tap pans the map to the advert
+	// location (when one was broadcast) so the operator can see
+	// where the unknown peer is before deciding.
+	g.mcPendingList = widget.NewList(
+		func() int {
+			g.mcMu.Lock()
+			defer g.mcMu.Unlock()
+			return len(g.mcPendingOrder)
+		},
+		func() fyne.CanvasObject {
+			icon := canvas.NewImageFromResource(theme.AccountIcon())
+			icon.FillMode = canvas.ImageFillContain
+			icon.SetMinSize(fyne.NewSize(16, 16))
+			iconSlot := container.New(&fixedWidthLayout{width: 20}, icon)
+			t := canvas.NewText("", color.RGBA{200, 200, 210, 255})
+			t.TextStyle = fyne.TextStyle{Monospace: true}
+			t.TextSize = 13
+			row := newHoverRow(container.NewPadded(container.NewBorder(nil, nil, iconSlot, nil, t)))
+			row.onSecondary = func(absPos fyne.Position) {
+				g.mcMu.Lock()
+				if row.listIdx >= len(g.mcPendingOrder) {
+					g.mcMu.Unlock()
+					return
+				}
+				pk := g.mcPendingOrder[row.listIdx]
+				p, ok := g.mcPendingAdverts[pk]
+				g.mcMu.Unlock()
+				if !ok {
+					return
+				}
+				g.showMcPendingAdvertContextMenu(p, absPos)
+			}
+			row.onTap = func() {
+				g.mcMu.Lock()
+				if row.listIdx >= len(g.mcPendingOrder) {
+					g.mcMu.Unlock()
+					return
+				}
+				pk := g.mcPendingOrder[row.listIdx]
+				p, ok := g.mcPendingAdverts[pk]
+				g.mcMu.Unlock()
+				if !ok {
+					return
+				}
+				if p.AdvLatE6 == 0 && p.AdvLonE6 == 0 {
+					return
+				}
+				if mw := g.scopeMapWidget(); mw != nil {
+					mw.PanTo(float64(p.AdvLatE6)/1e6, float64(p.AdvLonE6)/1e6)
+				}
+			}
+			return row
+		},
+		func(id widget.ListItemID, obj fyne.CanvasObject) {
+			row := obj.(*hoverRow)
+			padded := row.inner.(*fyne.Container)
+			border := padded.Objects[0].(*fyne.Container)
+			iconSlot := border.Objects[1].(*fyne.Container)
+			icon := iconSlot.Objects[0].(*canvas.Image)
+			t := border.Objects[0].(*canvas.Text)
+			row.listIdx = id
+			g.mcMu.Lock()
+			if id >= len(g.mcPendingOrder) {
+				g.mcMu.Unlock()
+				return
+			}
+			pk := g.mcPendingOrder[id]
+			p := g.mcPendingAdverts[pk]
+			g.mcMu.Unlock()
+			label := p.AdvName
+			if label == "" {
+				label = fmt.Sprintf("(unnamed %x)", pk[:4])
+			}
+			// Tag with location indicator so the operator knows
+			// at a glance which entries have a position to map.
+			if p.AdvLatE6 != 0 || p.AdvLonE6 != 0 {
+				label += "  ◯" // hollow ring matches the map glyph
+			}
+			t.Text = label
+			icon.Resource = mcContactIcon(p.Type)
+			icon.Refresh()
+			t.Refresh()
+		},
+	)
+
 	g.mcStatusText = canvas.NewText("", color.RGBA{160, 165, 175, 255})
 	g.mcStatusText.TextStyle = fyne.TextStyle{Italic: true}
 	g.mcStatusText.TextSize = 10
@@ -6183,26 +6975,50 @@ func (g *GUI) buildMeshcoreSidebar() *fyne.Container {
 			fyne.NewMenuItem("Sort by Type", func() { g.mcSetContactsSortBy(mcContactsSortType) }),
 			fyne.NewMenuItem("Sort by Distance", func() { g.mcSetContactsSortBy(mcContactsSortDistance) }),
 			fyne.NewMenuItemSeparator(),
+			fyne.NewMenuItem("Mark all as read", func() { g.mcClearAllUnread() }),
+			fyne.NewMenuItemSeparator(),
 			fyne.NewMenuItem("Bulk delete…", func() { g.showMcBulkDeleteDialog() }),
 		)
 		widget.ShowPopUpMenuAtPosition(menu, g.window.Canvas(), pos)
 	}
-	contactsHeader := container.NewBorder(
+	contactsTitle := container.NewBorder(
 		nil, nil,
 		container.NewPadded(g.mcContactsHeader),
 		contactsMenuBtn, nil,
 	)
+	g.mcContactsFilterEntry = widget.NewEntry()
+	g.mcContactsFilterEntry.SetPlaceHolder("Filter contacts…")
+	g.mcContactsFilterEntry.OnChanged = func(s string) {
+		g.mcMu.Lock()
+		g.mcContactsFilter = s
+		g.mcMu.Unlock()
+		g.mcRefreshLists()
+	}
+	contactsHeader := container.NewVBox(contactsTitle, g.mcContactsFilterEntry)
 
-	// Two scrollable lists stacked vertically with proportional weight
-	// — contacts get the top half, channels the bottom. fixedHeight
-	// won't work here because Fyne lists need a parent that reports a
-	// real height. NewVSplit with a 0.6 default keeps both lists usable
-	// at typical sidebar widths.
+	pendingHeader := container.NewBorder(
+		nil, nil,
+		container.NewPadded(g.mcPendingHeader),
+		nil, nil,
+	)
+
+	// Three scrollable lists stacked vertically — contacts at the
+	// top, channels in the middle, pending adverts at the bottom.
+	// Pending exists primarily for manual-add-contacts mode; the
+	// header is always visible (with a (0) count) so the feature
+	// is discoverable even before any adverts arrive. Fyne VSplit
+	// only takes two children, so we nest: top half = contacts,
+	// bottom half = nested split of channels + pending.
+	channelsAndPending := container.NewVSplit(
+		container.NewBorder(channelsHeader, nil, nil, nil, g.mcChannelsList),
+		container.NewBorder(pendingHeader, nil, nil, nil, g.mcPendingList),
+	)
+	channelsAndPending.SetOffset(0.7)
 	listsSplit := container.NewVSplit(
 		container.NewBorder(contactsHeader, nil, nil, nil, g.mcContactsList),
-		container.NewBorder(channelsHeader, nil, nil, nil, g.mcChannelsList),
+		channelsAndPending,
 	)
-	listsSplit.SetOffset(0.6)
+	listsSplit.SetOffset(0.5)
 
 	g.mcSidebar = container.NewBorder(
 		nil,
@@ -6213,28 +7029,92 @@ func (g *GUI) buildMeshcoreSidebar() *fyne.Container {
 	return g.mcSidebar
 }
 
-// mcRefreshLists repaints the contacts/channels lists + their header
-// counts. Safe from any goroutine; UI mutations are dispatched via
-// fyne.Do.
+// mcRebuildContactsViewLocked refreshes mcContactsView from
+// mcContacts under the current mcContactsFilter. Caller must hold
+// mcMu. Empty filter copies the full roster verbatim; non-empty
+// filter does a case-insensitive substring match against AdvName
+// AND against the lowercase-hex pubkey prefix so an operator
+// searching by hash fragment still finds the right node.
+func (g *GUI) mcRebuildContactsViewLocked() {
+	q := strings.ToLower(strings.TrimSpace(g.mcContactsFilter))
+	if q == "" {
+		g.mcContactsView = append(g.mcContactsView[:0], g.mcContacts...)
+		return
+	}
+	out := g.mcContactsView[:0]
+	for _, c := range g.mcContacts {
+		if strings.Contains(strings.ToLower(c.AdvName), q) {
+			out = append(out, c)
+			continue
+		}
+		hex := fmt.Sprintf("%x", c.PubKey[:6])
+		if strings.Contains(hex, q) {
+			out = append(out, c)
+		}
+	}
+	g.mcContactsView = out
+}
+
+// mcRefreshLists repaints the contacts/channels/pending lists +
+// their header counts. Rebuilds mcContactsView (filter applied)
+// and mcPendingOrder under the lock so list widget index lookups
+// stay stable across repaint. Safe from any goroutine; UI
+// mutations are dispatched via fyne.Do.
 func (g *GUI) mcRefreshLists() {
 	if g.mcContactsList == nil || g.mcChannelsList == nil {
 		return
 	}
 	g.mcMu.Lock()
+	g.mcRebuildContactsViewLocked()
 	nc := len(g.mcContacts)
+	nv := len(g.mcContactsView)
 	nch := len(g.mcChannels)
+	// Rebuild the pending order — alphabetised by AdvName so the
+	// list doesn't shuffle as new entries arrive. Empty names sort
+	// to the end so unnamed nodes stay visible without dominating
+	// the top of the list.
+	order := make([]meshcore.PubKey, 0, len(g.mcPendingAdverts))
+	for pk := range g.mcPendingAdverts {
+		order = append(order, pk)
+	}
+	sort.Slice(order, func(i, j int) bool {
+		ai := g.mcPendingAdverts[order[i]].AdvName
+		aj := g.mcPendingAdverts[order[j]].AdvName
+		switch {
+		case ai == "" && aj != "":
+			return false
+		case ai != "" && aj == "":
+			return true
+		}
+		return strings.ToLower(ai) < strings.ToLower(aj)
+	})
+	g.mcPendingOrder = order
+	np := len(order)
 	g.mcMu.Unlock()
 	fyne.Do(func() {
 		if g.mcContactsHeader != nil {
-			g.mcContactsHeader.Text = fmt.Sprintf("CONTACTS  (%d)", nc)
+			// Show "(filtered/total)" when a filter is active so the
+			// operator knows how many entries are hidden.
+			if nv != nc {
+				g.mcContactsHeader.Text = fmt.Sprintf("CONTACTS  (%d/%d)", nv, nc)
+			} else {
+				g.mcContactsHeader.Text = fmt.Sprintf("CONTACTS  (%d)", nc)
+			}
 			g.mcContactsHeader.Refresh()
 		}
 		if g.mcChannelsHeader != nil {
 			g.mcChannelsHeader.Text = fmt.Sprintf("CHANNELS  (%d)", nch)
 			g.mcChannelsHeader.Refresh()
 		}
+		if g.mcPendingHeader != nil {
+			g.mcPendingHeader.Text = fmt.Sprintf("PENDING  (%d)", np)
+			g.mcPendingHeader.Refresh()
+		}
 		g.mcContactsList.Refresh()
 		g.mcChannelsList.Refresh()
+		if g.mcPendingList != nil {
+			g.mcPendingList.Refresh()
+		}
 	})
 }
 
@@ -6254,8 +7134,35 @@ func (g *GUI) mcSetStatus(msg string) {
 // mcSwitchThread snapshots the current g.rows into mcThreadHistory
 // (under the previous thread key) and swaps in the requested thread's
 // buffer. Empty buffer if the thread has no history yet. Repaints the
-// chat list and the topic bar.
+// chat list and the topic bar. Records the previous thread on the
+// back stack so mcGoBack can replay it (push the operator's
+// navigation trail).
 func (g *GUI) mcSwitchThread(newThread string) {
+	g.mcSwitchThreadInternal(newThread, true)
+}
+
+// mcGoBack pops the most-recent prior thread from the back stack
+// and switches to it without re-pushing — so chained backs walk
+// the stack rather than oscillating between the same two threads.
+// No-op when the stack is empty (caller's been on one thread the
+// whole session or has already walked back to the start).
+func (g *GUI) mcGoBack() {
+	g.mu.Lock()
+	if len(g.mcBackStack) == 0 {
+		g.mu.Unlock()
+		return
+	}
+	prev := g.mcBackStack[len(g.mcBackStack)-1]
+	g.mcBackStack = g.mcBackStack[:len(g.mcBackStack)-1]
+	g.mu.Unlock()
+	g.mcSwitchThreadInternal(prev, false)
+}
+
+// mcSwitchThreadInternal is the shared body. recordHistory=true
+// pushes the outgoing thread onto mcBackStack so the operator can
+// undo this navigation; mcGoBack calls with false to avoid the
+// "back to back" loop.
+func (g *GUI) mcSwitchThreadInternal(newThread string, recordHistory bool) {
 	g.mu.Lock()
 	prev := g.mcCurrentThread
 	if prev == newThread {
@@ -6271,6 +7178,9 @@ func (g *GUI) mcSwitchThread(newThread string) {
 		snap := make([]chatRow, len(g.rows))
 		copy(snap, g.rows)
 		g.mcThreadHistory[prev] = snap
+		if recordHistory {
+			g.mcBackStack = append(g.mcBackStack, prev)
+		}
 	}
 	g.mcCurrentThread = newThread
 	hist := g.mcThreadHistory[newThread]
@@ -6505,6 +7415,73 @@ func (g *GUI) mcToggleFavorite(pub meshcore.PubKey) {
 	g.mcRefreshLists()
 }
 
+// mcLoadAutoAddPrefs reads the four per-type auto-add prefs with
+// a one-time migration from the legacy single mcPrefProfileManualAdd
+// bool: if the legacy pref says manual=true (operator gatekeeping
+// everything) AND none of the new prefs are set, all four default
+// to false; otherwise the standard defaults apply (chat + room on,
+// repeater + sensor off). Returns (chat, room, repeater, sensor).
+func (g *GUI) mcLoadAutoAddPrefs(prefs fyne.Preferences) (chat, room, repeater, sensor bool) {
+	// "Has any of the new prefs been written?" → check by looking
+	// for either explicit true or non-default false. Fyne preferences
+	// don't expose existence, so we use a sentinel pattern: re-read
+	// with two different fallbacks and see if they agree.
+	const sentinel = "__nocord_unset__"
+	hasNew := prefs.StringWithFallback("meshcore.profile.autoadd_migrated", "") == "yes"
+	if !hasNew {
+		legacyManual := prefs.BoolWithFallback(mcPrefProfileManualAdd, false)
+		if legacyManual {
+			chat, room, repeater, sensor = false, false, false, false
+		} else {
+			chat, room, repeater, sensor = true, true, false, false
+		}
+		// Persist so we don't keep re-running the migration.
+		prefs.SetBool(mcPrefAutoAddChat, chat)
+		prefs.SetBool(mcPrefAutoAddRoom, room)
+		prefs.SetBool(mcPrefAutoAddRepeater, repeater)
+		prefs.SetBool(mcPrefAutoAddSensor, sensor)
+		prefs.SetString("meshcore.profile.autoadd_migrated", "yes")
+		_ = sentinel
+		return
+	}
+	chat = prefs.BoolWithFallback(mcPrefAutoAddChat, true)
+	room = prefs.BoolWithFallback(mcPrefAutoAddRoom, true)
+	repeater = prefs.BoolWithFallback(mcPrefAutoAddRepeater, false)
+	sensor = prefs.BoolWithFallback(mcPrefAutoAddSensor, false)
+	return
+}
+
+// mcAutoAddTypesLocked returns the per-type auto-add map, hydrating
+// it from prefs on first access if the operator hasn't opened
+// Settings yet this session. Caller must hold mcMu.
+func (g *GUI) mcAutoAddTypesLocked() map[meshcore.AdvType]bool {
+	if g.mcAutoAddByType != nil {
+		return g.mcAutoAddByType
+	}
+	prefs := fyne.CurrentApp().Preferences()
+	chat, room, repeater, sensor := g.mcLoadAutoAddPrefs(prefs)
+	g.mcAutoAddByType = map[meshcore.AdvType]bool{
+		meshcore.AdvTypeChat:     chat,
+		meshcore.AdvTypeRoom:     room,
+		meshcore.AdvTypeRepeater: repeater,
+		meshcore.AdvTypeSensor:   sensor,
+	}
+	return g.mcAutoAddByType
+}
+
+// mcRecordPendingAdvert decides what to do with an advert the
+// firmware delivered via PushNewAdvert (radio is in manual-add
+// mode so the firmware DIDN'T persist it). The per-type auto-add
+// prefs are consulted: if the type is checked, we promote
+// immediately (call AddUpdateContact via the wire); otherwise we
+// upsert the record into the pending bucket so it shows up in the
+// PENDING ADVERTS sidebar / map ring for operator review.
+//
+// Skips entries whose pubkey is on the blocklist OR already in
+// the contacts table — promoting an already-admitted contact
+// would no-op on the radio but we'd waste a wire round-trip.
+// (mcRecordPendingAdvert moved to gui_meshcore_pending.go.)
+
 // distanceMiles is a great-circle distance via the haversine
 // formula. Returns (miles, true) when both endpoints have a
 // non-zero broadcast position; (0, false) when the contact's
@@ -6529,12 +7506,15 @@ func distanceMiles(lat1, lon1, lat2, lon2 float64, contactLatE6, contactLonE6 in
 // record) and Remove (call CmdRemoveContact then refresh the
 // roster).
 func (g *GUI) showMcContactContextMenu(visibleIdx int, absPos fyne.Position) {
+	if logging.L != nil {
+		logging.L.Debugw("showMcContactContextMenu enter", "visibleIdx", visibleIdx)
+	}
 	g.mcMu.Lock()
-	if visibleIdx < 0 || visibleIdx >= len(g.mcContacts) {
+	if visibleIdx < 0 || visibleIdx >= len(g.mcContactsView) {
 		g.mcMu.Unlock()
 		return
 	}
-	ct := g.mcContacts[visibleIdx]
+	ct := g.mcContactsView[visibleIdx]
 	g.mcMu.Unlock()
 	canvas := g.window.Canvas()
 	favLabel := "Favorite"
@@ -6544,10 +7524,175 @@ func (g *GUI) showMcContactContextMenu(visibleIdx int, absPos fyne.Position) {
 	menu := fyne.NewMenu("",
 		fyne.NewMenuItem(favLabel, func() { g.mcToggleFavorite(ct.PubKey) }),
 		fyne.NewMenuItem("Info", func() { g.showMcContactInfoDialog(ct) }),
+		fyne.NewMenuItem("Share over mesh", func() { g.shareMcContact(ct) }),
+		fyne.NewMenuItem("Share in channel…", func() { g.showMcShareInChannelDialog(ct) }),
+		fyne.NewMenuItem("Trace path", func() { g.traceMcContactPath(ct) }),
+		fyne.NewMenuItem("Query telemetry", func() { g.requestMcContactTelemetry(ct) }),
+		fyne.NewMenuItem("Query repeater status", func() { g.requestMcContactStatus(ct) }),
+		fyne.NewMenuItem("Login…", func() { g.showMcLoginDialog(ct) }),
 		fyne.NewMenuItem("Reset path", func() { g.confirmResetMcPath(ct) }),
 		fyne.NewMenuItem("Remove", func() { g.confirmRemoveMcContact(ct) }),
 	)
 	widget.ShowPopUpMenuAtPosition(menu, canvas, absPos)
+}
+
+// showMcShareInChannelDialog opens a dialog with a channel
+// picker for sharing a contact card. Used when no convenient
+// anchor widget is available (sidebar / map context menus open
+// from a popup, so we use a modal instead of a popup-anchored
+// submenu).
+func (g *GUI) showMcShareInChannelDialog(ct meshcore.Contact) {
+	g.mcMu.Lock()
+	channels := append([]meshcore.Channel(nil), g.mcChannels...)
+	g.mcMu.Unlock()
+	if len(channels) == 0 {
+		g.mcAppendSystem("share in channel: no channels configured — add one in the sidebar first")
+		return
+	}
+	options := make([]string, 0, len(channels))
+	byLabel := map[string]meshcore.Channel{}
+	for _, ch := range channels {
+		label, _ := mcChannelLabel(ch)
+		options = append(options, label)
+		byLabel[label] = ch
+	}
+	sel := widget.NewSelect(options, nil)
+	sel.SetSelected(options[0])
+	display := ct.AdvName
+	if display == "" {
+		display = fmt.Sprintf("%x", ct.PubKey[:6])
+	}
+	body := container.NewVBox(
+		wrappedLabel(fmt.Sprintf("Share %s as a contact card in:", display)),
+		sel,
+		wrappedLabel("The recipient sees a clickable [Add contact] pill in chat. The card is short — pubkey + name + lat/lon — but does NOT include a signature, so trust the channel members accordingly."),
+	)
+	dialog.ShowCustomConfirm("Share contact in channel", "Send", "Cancel", body, func(ok bool) {
+		if !ok {
+			return
+		}
+		ch, found := byLabel[sel.Selected]
+		if !found {
+			return
+		}
+		g.sendMcContactCardToChannel(ct, ch)
+	}, g.window)
+}
+
+// sendMcContactCardToChannel encodes ct as an mc://contact/<b64>
+// URL and sends it as a channel chat message. Errors surface in
+// the system log; the message is short enough that the 140-byte
+// LoRa cap can never be hit (EncodeContactCard caps name at 32B,
+// guaranteeing total ≤ ~115 bytes).
+func (g *GUI) sendMcContactCardToChannel(ct meshcore.Contact, ch meshcore.Channel) {
+	g.mcMu.Lock()
+	client := g.mcClient
+	g.mcMu.Unlock()
+	if client == nil {
+		g.mcAppendSystem("share in channel: not connected")
+		return
+	}
+	card := meshcore.ContactCard{
+		PubKey:   ct.PubKey,
+		Type:     ct.Type,
+		AdvLatE6: ct.AdvLatE6,
+		AdvLonE6: ct.AdvLonE6,
+		Name:     ct.AdvName,
+	}
+	url := meshcore.EncodeContactCard(card)
+	chLabel, _ := mcChannelLabel(ch)
+	display := ct.AdvName
+	if display == "" {
+		display = fmt.Sprintf("%x", ct.PubKey[:6])
+	}
+	go func() {
+		if _, err := client.SendChannelMessage(ch.Index, time.Now().UTC(), url); err != nil {
+			g.mcAppendSystem(fmt.Sprintf("share %s in %s: %s", display, chLabel, err.Error()))
+			return
+		}
+		g.mcAppendSystem(fmt.Sprintf("shared contact %s in %s", display, chLabel))
+	}()
+}
+
+// showMcImportContactCardDialog handles a click on a chat-pill
+// representing a received contact card. Asks the operator to
+// confirm before adding the pubkey to their radio's contact
+// table — the card has no embedded signature so trust is on
+// the channel sender, not the firmware's signature verifier.
+// Once admitted, the radio's normal advert-verification kicks
+// in on the next on-air advert from this pubkey.
+func (g *GUI) showMcImportContactCardDialog(card meshcore.ContactCard) {
+	// If the contact is already in the local table, skip the
+	// dialog and just say so — adding twice would no-op on the
+	// radio but waste a wire round-trip.
+	g.mcMu.Lock()
+	for _, c := range g.mcContacts {
+		if c.PubKey == card.PubKey {
+			g.mcMu.Unlock()
+			g.mcAppendSystem("contact " + card.Name + " is already in your roster")
+			return
+		}
+	}
+	g.mcMu.Unlock()
+	display := card.Name
+	if display == "" {
+		display = fmt.Sprintf("%x", card.PubKey[:6])
+	}
+	body := fmt.Sprintf(
+		"Add %s (%s) to your contacts?\n\nPubkey: %x...\n\nThe card was shared in a channel — trust the sender accordingly. The radio will verify signatures against this pubkey on the next on-air advert.",
+		display,
+		strings.ToLower(card.Type.String()),
+		card.PubKey[:6],
+	)
+	dialog.ShowConfirm("Add shared contact?", body, func(ok bool) {
+		if !ok {
+			return
+		}
+		g.mcMu.Lock()
+		client := g.mcClient
+		g.mcMu.Unlock()
+		if client == nil {
+			g.mcAppendSystem("import contact: not connected")
+			return
+		}
+		go func() {
+			if err := client.AddUpdateContact(card.AsContact()); err != nil {
+				g.mcAppendSystem("import " + display + ": " + err.Error())
+				return
+			}
+			g.mcAppendSystem("added contact (from channel share): " + display)
+			g.scheduleMcContactsRefresh(client)
+		}()
+	}, g.window)
+}
+
+// shareMcContact tells the radio to re-broadcast the cached
+// signed advert for this contact via FLOOD. Receivers verify the
+// signature against the embedded pubkey, so this works as a
+// trustworthy "vouching" gesture: nobody can forge an advert for
+// someone they don't have the private key for, and the original
+// timestamp is preserved so it can't replay an outdated one
+// either (peers track per-pubkey latest-timestamp and reject
+// older).
+func (g *GUI) shareMcContact(ct meshcore.Contact) {
+	g.mcMu.Lock()
+	client := g.mcClient
+	g.mcMu.Unlock()
+	if client == nil {
+		g.mcAppendSystem("share contact: not connected")
+		return
+	}
+	display := ct.AdvName
+	if display == "" {
+		display = fmt.Sprintf("%x", ct.PubKey[:6])
+	}
+	go func() {
+		if err := client.ShareContact(ct.PubKey); err != nil {
+			g.mcAppendSystem("share contact " + display + ": " + err.Error())
+			return
+		}
+		g.mcAppendSystem("re-flooded advert for " + display + " — neighbours can pick it up if in range")
+	}()
 }
 
 // confirmResetMcPath asks before issuing CmdResetPath. The
@@ -6607,8 +7752,12 @@ func (g *GUI) showMcMapNodeContextMenu(pub meshcore.PubKey, absPos fyne.Position
 			break
 		}
 	}
+	pending, isPending := g.mcPendingAdverts[pub]
 	g.mcMu.Unlock()
 	if !found {
+		if isPending {
+			g.showMcPendingAdvertContextMenu(pending, absPos)
+		}
 		return
 	}
 	favLabel := "Favorite"
@@ -6651,10 +7800,16 @@ func (g *GUI) showMcMapNodeContextMenu(pub meshcore.PubKey, absPos fyne.Position
 			}
 			mw.AppendMessagePath(nodes)
 		}),
+		fyne.NewMenuItem("Share over mesh", func() { g.shareMcContact(ct) }),
+		fyne.NewMenuItem("Share in channel…", func() { g.showMcShareInChannelDialog(ct) }),
 		fyne.NewMenuItem("Reset path", func() { g.confirmResetMcPath(ct) }),
 	)
 	widget.ShowPopUpMenuAtPosition(menu, g.window.Canvas(), absPos)
 }
+
+// (showMcPendingAdvertContextMenu, blockMcPendingAdvert,
+// promoteMcPendingAdvert, discardMcPendingAdvert moved to
+// gui_meshcore_pending.go.)
 
 // mcAttachHashLinks rebuilds the inline-flow container from text,
 // returning true when at least one inline element (path-hash link
@@ -6676,6 +7831,14 @@ func (g *GUI) mcAttachHashLinks(msgSegments *fyne.Container, text string, plainC
 	msgSegments.RemoveAll()
 	for _, s := range segs {
 		switch {
+		case s.card != nil:
+			card := *s.card
+			label := fmt.Sprintf("[Add contact: %s (%s)]", card.Name, strings.ToLower(card.Type.String()))
+			link := newMcHashLink(label,
+				func() { g.showMcImportContactCardDialog(card) },
+				nil,
+			)
+			msgSegments.Add(link)
 		case s.url != "":
 			href := s.url
 			link := newMcHashLink(s.text,
@@ -7147,6 +8310,9 @@ func (g *GUI) removeSelectedMcContact() {
 // menu-firing time so a roster mutation between hover and click
 // doesn't reach a stale entry.
 func (g *GUI) showMcChannelContextMenu(visibleIdx int, absPos fyne.Position) {
+	if logging.L != nil {
+		logging.L.Debugw("showMcChannelContextMenu enter", "visibleIdx", visibleIdx)
+	}
 	g.mcMu.Lock()
 	if visibleIdx < 0 || visibleIdx >= len(g.mcChannels) {
 		g.mcMu.Unlock()
@@ -7221,10 +8387,24 @@ func (g *GUI) confirmRemoveMcChannel(ch meshcore.Channel) {
 // the message took, when the row matches an entry still in the
 // RxLog ring).
 func (g *GUI) showMcChatRowContextMenu(r chatRow, absPos fyne.Position) {
-	menu := fyne.NewMenu("",
+	if logging.L != nil {
+		logging.L.Debugw("showMcChatRowContextMenu enter", "system", r.system, "tx", r.tx)
+	}
+	items := []*fyne.MenuItem{
 		fyne.NewMenuItem("Info", func() { g.showMcChatRowInfo(r) }),
 		fyne.NewMenuItem("Map Trace", func() { g.showMcChatRowMapTrace(r) }),
-	)
+	}
+	// "Send Signal Report" only makes sense for inbound rows with a
+	// known sender — it reports what we heard from THEM. Skip TX,
+	// system, separator, and unattributable rows so the menu stays
+	// uncluttered for cases the action wouldn't do anything useful.
+	if !r.tx && !r.system && !r.separator && strings.TrimSpace(r.mcSender) != "" {
+		rowCopy := r
+		items = append(items, fyne.NewMenuItem("Send Signal Report", func() {
+			g.sendMcSignalReportForRow(rowCopy)
+		}))
+	}
+	menu := fyne.NewMenu("", items...)
 	widget.ShowPopUpMenuAtPosition(menu, g.window.Canvas(), absPos)
 }
 
@@ -7262,9 +8442,28 @@ func (g *GUI) showMcChatRowInfo(r chatRow) {
 	// the ring at append time. Either source surfaces under the
 	// same "Captured packet" header so Info reads consistently.
 	switch {
-	case r.mcPathLen != 0 || len(r.mcPath) > 0:
-		pkt := meshcore.Packet{PathLen: r.mcPathLen, Path: r.mcPath}
+	case r.mcPathLen != 0 || len(r.mcPath) > 0 || r.mcHeader != 0:
+		pkt := meshcore.Packet{Header: r.mcHeader, PathLen: r.mcPathLen, Path: r.mcPath}
 		body.WriteString("\n--- Captured packet (persisted) ---\n")
+		if r.mcHeader != 0 {
+			rt := pkt.RouteType()
+			fmt.Fprintf(&body, "Route:       %s\n", rt)
+			// Route-specific gloss: explain what Path bytes MEAN
+			// for this packet so the operator knows whether the
+			// hop count reflects on-air forwarders (FLOOD) or
+			// the sender's stored OutPath (DIRECT). Asymmetric
+			// routes between two nodes are normal — uplink and
+			// downlink can use different repeater sets even on
+			// the same mesh.
+			switch rt {
+			case meshcore.RouteFlood, meshcore.RouteTransportFlood:
+				body.WriteString("             (FLOOD — Path accumulates each forwarder's hash;\n")
+				body.WriteString("              hop count reflects the real on-air route.)\n")
+			case meshcore.RouteDirect, meshcore.RouteTransportDirect:
+				body.WriteString("             (DIRECT — Path carries the sender's stored OutPath\n")
+				body.WriteString("              to the destination; reverse direction may differ.)\n")
+			}
+		}
 		fmt.Fprintf(&body, "Hops:        %d\n", pkt.HopCount())
 		if len(pkt.Path) > 0 {
 			fmt.Fprintf(&body, "Path bytes:  %x\n", pkt.Path)
@@ -7291,54 +8490,10 @@ func (g *GUI) showMcChatRowInfo(r chatRow) {
 	d.Show()
 }
 
-// showMcChatRowMapTrace animates the route a chat-row message took
-// across the mesh. Prefers the path snapshot persisted on the row
-// (captured at incoming-append time and reloaded from bbolt across
-// relaunches) and falls back to live RxLog correlation for rows
-// that predate the persisted-path schema or that arrived without a
-// matching frame in the ring. No-op with a friendly system line
-// when neither source has a path.
-func (g *GUI) showMcChatRowMapTrace(r chatRow) {
-	var pkt meshcore.Packet
-	if r.mcPathLen != 0 || len(r.mcPath) > 0 {
-		pkt = meshcore.Packet{PathLen: r.mcPathLen, Path: r.mcPath}
-	} else {
-		var ok bool
-		pkt, ok = g.findMcRxLogPacketForRow(r)
-		if !ok {
-			g.mcAppendSystem("no captured path for this message — try a more recent one")
-			return
-		}
-	}
-	g.mcMu.Lock()
-	nodes := g.buildPathFromPacketLocked(pkt)
-	g.mcMu.Unlock()
-	mw := g.scopeMapWidget()
-	if mw == nil || len(nodes) < 2 {
-		return
-	}
-	mw.AppendMessagePath(nodes)
-}
-
-// mcCapturePathFromRxLog stamps the row with the route bytes from
-// the matching RxLog frame, when one is in the ring. Mutates row
-// in place so the caller's subsequent mcAppendRow persists the
-// path along with the message text. Silently leaves an empty path
-// when no correlation lands; the right-click trace falls back to
-// the live RxLog ring for those.
-func (g *GUI) mcCapturePathFromRxLog(row *chatRow) {
-	if row == nil || row.tx {
-		return
-	}
-	pkt, ok := g.findMcRxLogPacketForRow(*row)
-	if !ok {
-		return
-	}
-	row.mcPathLen = pkt.PathLen
-	if len(pkt.Path) > 0 {
-		row.mcPath = append([]byte(nil), pkt.Path...)
-	}
-}
+// (showMcChatRowMapTrace, showMcOutboundChatRowMapTrace,
+// mcCapturePathFromRxLog, buildPathFromPacketLocked,
+// matchPathHash, resolvePathHopHash, mcInterpolatePathPlaceholders,
+// bytesPrefixEqual, plural moved to gui_meshcore_path.go.)
 
 // findMcRxLogPacketForRow correlates a chat row with the RxLog
 // entry that produced it — same payload type (TXT_MSG / GRP_TXT)
@@ -7481,7 +8636,7 @@ func (g *GUI) showMcAddHashtagChannelDialog() {
 	dialog.ShowCustomConfirm("Add hashtag channel", "Join", "Cancel",
 		container.NewVBox(form,
 			derivedHint,
-			widget.NewLabel("Hashtag channels (#volcano, #meshbud, …) derive the channel secret from the name itself. Typing the name is enough to join — every node using that name shares the same key."),
+			wrappedLabel("Hashtag channels (#volcano, #meshbud, …) derive the channel secret from the name itself. Typing the name is enough to join — every node using that name shares the same key."),
 			warning,
 		),
 		func(ok bool) {
@@ -7529,7 +8684,7 @@ func (g *GUI) showMcAddPrivateChannelDialog() {
 	)
 	dialog.ShowCustomConfirm("Add private channel", "Add", "Cancel",
 		container.NewVBox(form,
-			widget.NewLabel("Private channels are keyed by an arbitrary 16-byte AES-128 secret distributed out of band by the channel creator. Accepts base64 or hex. (For community hashtag channels, use Add Hashtag Channel — the secret comes from the name automatically.)"),
+			wrappedLabel("Private channels are keyed by an arbitrary 16-byte AES-128 secret distributed out of band by the channel creator. Accepts base64 or hex. (For community hashtag channels, use Add Hashtag Channel — the secret comes from the name automatically.)"),
 		),
 		func(ok bool) {
 			if !ok {
@@ -7589,7 +8744,11 @@ func (g *GUI) buildMeshcoreRoster() *fyne.Container {
 	if g.mcRosterPane != nil {
 		return g.mcRosterPane
 	}
-	g.mcRosterHdr = canvas.NewText("ROSTER  (0)", color.RGBA{140, 140, 145, 255})
+	// Header label normalised to "HEARD" so FT8 and MeshCore use
+	// the same word for the same idea (people we've heard from
+	// recently). FT8 sources from decoded transmissions, MeshCore
+	// sources from active-channel posters; semantically the same.
+	g.mcRosterHdr = canvas.NewText("HEARD  (0)", color.RGBA{140, 140, 145, 255})
 	g.mcRosterHdr.TextSize = 11
 	g.mcRosterHdr.TextStyle = fyne.TextStyle{Bold: true}
 	g.mcRosterList = widget.NewList(
@@ -7598,25 +8757,224 @@ func (g *GUI) buildMeshcoreRoster() *fyne.Container {
 			t := canvas.NewText("", color.RGBA{210, 215, 225, 255})
 			t.TextStyle = fyne.TextStyle{Monospace: true}
 			t.TextSize = 12
-			return container.NewPadded(t)
+			row := newHoverRow(container.NewPadded(t))
+			row.onTap = func() {
+				// Single-click → switch to a DM thread with this
+				// contact, like clicking a Discord channel-member
+				// jumps to their profile / DM. Bind sets onTap
+				// per-row so the closure captures the right name.
+				g.mcRosterList.Select(row.listIdx)
+			}
+			row.onSecondary = func(pos fyne.Position) {
+				g.showMcRosterContextMenu(row.listIdx, pos)
+			}
+			return row
 		},
 		func(id widget.ListItemID, obj fyne.CanvasObject) {
-			padded := obj.(*fyne.Container)
+			row := obj.(*hoverRow)
+			padded := row.inner.(*fyne.Container)
 			t := padded.Objects[0].(*canvas.Text)
+			row.listIdx = id
 			roster := g.mcCurrentRoster()
 			if id >= len(roster) {
 				return
 			}
-			t.Text = roster[id]
+			name := roster[id]
+			t.Text = name
+			// Style by relationship so the operator can scan
+			// the HEARD column and immediately tell who's
+			// actionable:
+			//   bold  = admitted contact (one click → DM).
+			//   plain = pending advert (one click → jump to
+			//           PENDING entry to promote / discard /
+			//           block).
+			//   italic + dim = seen in channel chat but we
+			//           haven't received their advert yet;
+			//           no pubkey, no DM possible until they
+			//           broadcast within RF range.
+			switch status, _, _ := g.mcClassifyRosterName(name); status {
+			case mcRosterStatusContact:
+				t.TextStyle = fyne.TextStyle{Monospace: true, Bold: true}
+				t.Color = color.RGBA{220, 225, 235, 255}
+			case mcRosterStatusPending:
+				t.TextStyle = fyne.TextStyle{Monospace: true}
+				t.Color = color.RGBA{210, 215, 225, 255}
+			default:
+				t.TextStyle = fyne.TextStyle{Monospace: true, Italic: true}
+				t.Color = color.RGBA{150, 155, 165, 255}
+			}
 			t.Refresh()
 		},
 	)
+	g.mcRosterList.OnSelected = func(id widget.ListItemID) {
+		// Left-click forwards to here via the row's onTap →
+		// list.Select(). Resolve the roster name to a contact and
+		// switch to its DM thread. If no matching contact (the
+		// poster is a channel member we don't have in our table),
+		// fall through with a system message.
+		g.mcRosterList.UnselectAll()
+		roster := g.mcCurrentRoster()
+		if id < 0 || id >= len(roster) {
+			return
+		}
+		g.activateMcRosterName(roster[id])
+	}
 	bg := canvas.NewRectangle(color.RGBA{36, 38, 43, 255})
 	g.mcRosterPane = container.NewStack(
 		bg,
 		container.NewBorder(container.NewPadded(g.mcRosterHdr), nil, nil, nil, g.mcRosterList),
 	)
 	return g.mcRosterPane
+}
+
+// mcRosterStatus categorises a HEARD-column entry by what we know
+// about that name across our local state:
+//
+//	mcRosterStatusContact — name matches an admitted Contact;
+//	   the operator can DM them right now.
+//	mcRosterStatusPending — name matches a PENDING ADVERT entry;
+//	   we have their pubkey (a fresh PushNewAdvert delivered it)
+//	   but per-type auto-add filtered them out. One promotion
+//	   call admits them.
+//	mcRosterStatusUnknown — we've seen the name in channel chat
+//	   but haven't received an advert from them yet. No pubkey,
+//	   no way to DM until they next advertise within RF range.
+//
+// Drives the HEARD-row style (bold / normal / italic) and the
+// right-click menu's action set.
+type mcRosterStatus int
+
+const (
+	mcRosterStatusUnknown mcRosterStatus = iota
+	mcRosterStatusPending
+	mcRosterStatusContact
+)
+
+// mcClassifyRosterName resolves a HEARD-row display name against
+// the contact + pending tables. Returns the status enum plus the
+// matched record (Contact for status=Contact, StoredPendingAdvert
+// for status=Pending, zero values otherwise). Case-insensitive.
+func (g *GUI) mcClassifyRosterName(name string) (mcRosterStatus, meshcore.Contact, meshcore.StoredPendingAdvert) {
+	if name == "" {
+		return mcRosterStatusUnknown, meshcore.Contact{}, meshcore.StoredPendingAdvert{}
+	}
+	g.mcMu.Lock()
+	defer g.mcMu.Unlock()
+	for _, c := range g.mcContacts {
+		if strings.EqualFold(c.AdvName, name) {
+			return mcRosterStatusContact, c, meshcore.StoredPendingAdvert{}
+		}
+	}
+	for _, p := range g.mcPendingAdverts {
+		if strings.EqualFold(p.AdvName, name) {
+			return mcRosterStatusPending, meshcore.Contact{}, p
+		}
+	}
+	return mcRosterStatusUnknown, meshcore.Contact{}, meshcore.StoredPendingAdvert{}
+}
+
+// showMcRosterContextMenu opens the right-click menu for a row in
+// the MeshCore HEARD column (the per-channel sender roster). The
+// menu branches by mcClassifyRosterName status — a known contact
+// gets the full action set (DM / Info / Trace / Telemetry /
+// Status / Login), a pending advert gets Add / Discard / Block,
+// an unknown name gets only Copy because there's no pubkey to act
+// on yet.
+func (g *GUI) showMcRosterContextMenu(visibleIdx int, absPos fyne.Position) {
+	if g.window == nil {
+		return
+	}
+	roster := g.mcCurrentRoster()
+	if visibleIdx < 0 || visibleIdx >= len(roster) {
+		return
+	}
+	name := roster[visibleIdx]
+	status, ct, pend := g.mcClassifyRosterName(name)
+	canvas := g.window.Canvas()
+	copyItem := fyne.NewMenuItem("Copy name", func() { g.window.Clipboard().SetContent(name) })
+
+	switch status {
+	case mcRosterStatusContact:
+		// Known contact — full action set.
+		menu := fyne.NewMenu("",
+			fyne.NewMenuItem("Open DM", func() { g.activateMcRosterName(name) }),
+			fyne.NewMenuItem("Info", func() { g.showMcContactInfoDialog(ct) }),
+			fyne.NewMenuItem("Trace path", func() { g.traceMcContactPath(ct) }),
+			fyne.NewMenuItem("Query telemetry", func() { g.requestMcContactTelemetry(ct) }),
+			fyne.NewMenuItem("Query repeater status", func() { g.requestMcContactStatus(ct) }),
+			copyItem,
+		)
+		widget.ShowPopUpMenuAtPosition(menu, canvas, absPos)
+	case mcRosterStatusPending:
+		// We have the pubkey — operator can promote, discard,
+		// or block right from here, OR jump to the entry in the
+		// PENDING sidebar to see all the entries together.
+		menu := fyne.NewMenu("",
+			fyne.NewMenuItem(name+"  (pending — not in contacts)", func() {}),
+			fyne.NewMenuItem("Jump to PENDING entry", func() { g.activateMcRosterName(name) }),
+			fyne.NewMenuItem("Add as Contact", func() { g.promoteMcPendingAdvert(pend) }),
+			fyne.NewMenuItem("Discard", func() { g.discardMcPendingAdvert(pend.PubKey) }),
+			fyne.NewMenuItem("Block (permanent)", func() { g.blockMcPendingAdvert(pend) }),
+			copyItem,
+		)
+		widget.ShowPopUpMenuAtPosition(menu, canvas, absPos)
+	default:
+		// Unknown — we've only ever seen the name in chat text,
+		// no advert has reached us. Nothing actionable until
+		// they next advertise within RF range.
+		menu := fyne.NewMenu("",
+			fyne.NewMenuItem(name+"  (no advert yet)", func() {}),
+			copyItem,
+		)
+		widget.ShowPopUpMenuAtPosition(menu, canvas, absPos)
+	}
+}
+
+// activateMcRosterName handles a left-click on a HEARD row. The
+// action depends on the operator's relationship with the name:
+//
+//   - Contact: switch to that contact's DM thread.
+//   - Pending: jump to the PENDING ADVERTS sidebar entry so the
+//     operator can promote / discard / block without rummaging
+//     for the same name in a long list.
+//   - Unknown: system message — no pubkey, nothing to navigate to.
+func (g *GUI) activateMcRosterName(name string) {
+	status, ct, pend := g.mcClassifyRosterName(name)
+	switch status {
+	case mcRosterStatusContact:
+		g.mcSwitchThread(mcContactThreadID(ct))
+	case mcRosterStatusPending:
+		g.scrollMcPendingToPubKey(pend.PubKey, name)
+	default:
+		g.mcAppendSystem(fmt.Sprintf("can't act on %s yet — we've seen the name in chat but haven't received their advert. Wait for them to broadcast within RF range.", name))
+	}
+}
+
+// scrollMcPendingToPubKey finds the row matching pub in the live
+// PENDING list and scrolls the sidebar to it, selecting briefly
+// to flash a visual cue. Mirrors the scrollHeardToCall pattern.
+func (g *GUI) scrollMcPendingToPubKey(pub meshcore.PubKey, display string) {
+	if g.mcPendingList == nil {
+		g.mcAppendSystem(fmt.Sprintf("can't jump to %s — PENDING sidebar not built yet", display))
+		return
+	}
+	g.mcMu.Lock()
+	idx := -1
+	for i, k := range g.mcPendingOrder {
+		if k == pub {
+			idx = i
+			break
+		}
+	}
+	g.mcMu.Unlock()
+	if idx < 0 {
+		g.mcAppendSystem(fmt.Sprintf("can't jump to %s — pending entry missing from sidebar (refresh?)", display))
+		return
+	}
+	fyne.Do(func() {
+		g.mcPendingList.ScrollTo(idx)
+		g.mcPendingList.Select(idx)
+	})
 }
 
 // mcRefreshRoster repaints the roster header count + list when the
@@ -7642,7 +9000,7 @@ func (g *GUI) mcRefreshRoster() {
 			}
 		}
 		if g.mcRosterHdr != nil {
-			g.mcRosterHdr.Text = fmt.Sprintf("ROSTER  (%d)", count)
+			g.mcRosterHdr.Text = fmt.Sprintf("HEARD  (%d)", count)
 			g.mcRosterHdr.Refresh()
 		}
 		g.mcRosterList.Refresh()
@@ -7661,6 +9019,7 @@ func chatRowToStored(r chatRow) meshcore.StoredMessage {
 		SNR:      r.snrDB,
 		Sender:   r.mcSender,
 		PathLen:  r.mcPathLen,
+		Header:   r.mcHeader,
 	}
 	if len(r.mcPath) > 0 {
 		msg.Path = append([]byte(nil), r.mcPath...)
@@ -7688,6 +9047,7 @@ func storedToChatRow(thread string, m meshcore.StoredMessage) chatRow {
 		mc:        true,
 		mcSender:  m.Sender,
 		mcPathLen: m.PathLen,
+		mcHeader:  m.Header,
 	}
 	if len(m.Path) > 0 {
 		r.mcPath = append([]byte(nil), m.Path...)
@@ -7728,79 +9088,8 @@ func (g *GUI) mcPersist(thread string, r chatRow) {
 	}
 }
 
-// mcBumpUnread increments the unread counter for a thread when
-// it's not the live view. Called from the receive paths so the
-// sidebar shows a badge for inbound messages the operator hasn't
-// seen yet. Caller-side g.mu may be held; this method does its
-// own locking.
-func (g *GUI) mcBumpUnread(thread string) {
-	g.mu.Lock()
-	live := g.activeMode == "meshcore" && g.mcCurrentThread == thread
-	if live {
-		g.mu.Unlock()
-		return
-	}
-	if g.mcUnread == nil {
-		g.mcUnread = map[string]int{}
-	}
-	g.mcUnread[thread]++
-	g.mu.Unlock()
-	g.mcRefreshLists()
-}
-
-// mcClearUnread zeros the unread counter and mention flag for a
-// thread — called from mcSwitchThread when the operator selects it.
-func (g *GUI) mcClearUnread(thread string) {
-	g.mu.Lock()
-	if g.mcUnread != nil {
-		delete(g.mcUnread, thread)
-	}
-	if g.mcMentioned != nil {
-		delete(g.mcMentioned, thread)
-	}
-	g.mu.Unlock()
-	g.mcRefreshLists()
-}
-
-// mcUnreadCount reads the current unread count for a thread.
-// Locked-callers can pass true via g.mu being already held — but
-// it's cheap enough to just take the lock.
-func (g *GUI) mcUnreadCount(thread string) int {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.mcUnread == nil {
-		return 0
-	}
-	return g.mcUnread[thread]
-}
-
-// mcIsMentioned returns whether the thread has at least one
-// unread @[<selfName>] mention since last read. Stronger signal
-// than plain unread — drives the warm-amber sidebar highlight
-// reserved for directed call-outs.
-func (g *GUI) mcIsMentioned(thread string) bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.mcMentioned[thread]
-}
-
-// mcMarkMentioned flips the per-thread mention flag on. Caller is
-// responsible for skipping the live-thread case (a mention you're
-// already looking at isn't unread). Also clears on mcClearUnread.
-func (g *GUI) mcMarkMentioned(thread string) {
-	g.mu.Lock()
-	live := g.activeMode == "meshcore" && g.mcCurrentThread == thread
-	if live {
-		g.mu.Unlock()
-		return
-	}
-	if g.mcMentioned == nil {
-		g.mcMentioned = map[string]bool{}
-	}
-	g.mcMentioned[thread] = true
-	g.mu.Unlock()
-	g.mcRefreshLists()
-}
+// (mcBumpUnread, mcClearUnread, mcClearAllUnread, mcUnreadCount,
+// mcIsMentioned, mcMarkMentioned moved to gui_meshcore_unread.go.)
 
 // mcTextMentionsSelf returns true when the message body contains
 // an @[<selfName>] mention (case-insensitive). selfName comes from
@@ -7822,15 +9111,46 @@ func mcTextMentionsSelf(text, selfName string) bool {
 // from the current contact roster. Filters contacts that haven't
 // broadcast a position. Safe from any goroutine; UI-side Refresh
 // is dispatched by the map widget.
+//
+// Pending adverts (received via PushNewAdvert when auto-add was
+// off) are merged in as Pending=true nodes so they render as
+// hollow rings instead of filled dots — the operator can see
+// what's out there without admitting them to the contacts table.
+// Adverts that match an existing contact's pubkey are skipped:
+// the contact entry is the source of truth for an admitted node.
 func (g *GUI) mcSyncContactsToMap() {
 	mw := g.scopeMapWidget()
 	if mw == nil {
 		return
 	}
+	// Only push mesh nodes onto the map when the operator is
+	// actually viewing MeshCore mode. Without this gate, a
+	// background contacts-refresh / pending-advert / event-driven
+	// resync after the operator switched to FT8 would re-paint
+	// the mesh repeaters over the FT8 spots — applySidebarForMode
+	// only clears once on the mode flip, not on every subsequent
+	// mesh event.
+	g.mu.Lock()
+	mode := g.activeMode
+	g.mu.Unlock()
+	if mode != "meshcore" {
+		return
+	}
 	g.mcMu.Lock()
 	contacts := append([]meshcore.Contact(nil), g.mcContacts...)
+	pending := make([]meshcore.StoredPendingAdvert, 0, len(g.mcPendingAdverts))
+	contactKeys := map[meshcore.PubKey]bool{}
+	for _, c := range contacts {
+		contactKeys[c.PubKey] = true
+	}
+	for pk, p := range g.mcPendingAdverts {
+		if contactKeys[pk] {
+			continue
+		}
+		pending = append(pending, p)
+	}
 	g.mcMu.Unlock()
-	nodes := make([]mapview.MeshNode, 0, len(contacts))
+	nodes := make([]mapview.MeshNode, 0, len(contacts)+len(pending))
 	for _, c := range contacts {
 		if c.AdvLatE6 == 0 && c.AdvLonE6 == 0 {
 			continue
@@ -7841,6 +9161,19 @@ func (g *GUI) mcSyncContactsToMap() {
 			Lat:    c.LatDegrees(),
 			Lon:    c.LonDegrees(),
 			Type:   int(c.Type),
+		})
+	}
+	for _, p := range pending {
+		if p.AdvLatE6 == 0 && p.AdvLonE6 == 0 {
+			continue
+		}
+		nodes = append(nodes, mapview.MeshNode{
+			Name:    p.AdvName,
+			PubKey:  [32]byte(p.PubKey),
+			Lat:     float64(p.AdvLatE6) / 1e6,
+			Lon:     float64(p.AdvLonE6) / 1e6,
+			Type:    int(p.Type),
+			Pending: true,
 		})
 	}
 	mw.SetMeshNodes(nodes)
@@ -7901,109 +9234,7 @@ func (g *GUI) doMcContactsRefresh(client *meshcore.Client) {
 	g.mcMu.Unlock()
 	g.mcRefreshLists()
 	g.mcSyncContactsToMap()
-}
-
-// buildMeshcoreRxLog lazily constructs the RxLog viewer pane that
-// sits beneath the map in MeshCore mode. Idempotent — returns the
-// cached container so repeated mode flips don't rebuild list state.
-func (g *GUI) buildMeshcoreRxLog() *fyne.Container {
-	if g.mcRxLogPane != nil {
-		return g.mcRxLogPane
-	}
-	g.mcRxLogHeader = canvas.NewText("RX LOG  (0)", color.RGBA{140, 140, 145, 255})
-	g.mcRxLogHeader.TextSize = 11
-	g.mcRxLogHeader.TextStyle = fyne.TextStyle{Bold: true}
-
-	g.mcRxLogList = widget.NewList(
-		func() int {
-			g.mcMu.Lock()
-			defer g.mcMu.Unlock()
-			return len(g.mcRxLog)
-		},
-		func() fyne.CanvasObject {
-			t := canvas.NewText("", color.RGBA{200, 205, 215, 255})
-			t.TextStyle = fyne.TextStyle{Monospace: true}
-			t.TextSize = 11
-			// hoverTip surfaces the row's full local datetime on
-			// hover — the visible "15:04:05" prefix drops the
-			// date, which matters when scrolling back through
-			// hours / days of traffic.
-			tip := newHoverTip(container.NewPadded(t), "")
-			row := newHoverRow(tip)
-			row.onTap = func() { g.mcRxLogList.Select(row.listIdx) }
-			row.onSecondary = func(absPos fyne.Position) {
-				g.showRxLogContextMenu(row.listIdx, absPos)
-			}
-			return row
-		},
-		func(id widget.ListItemID, obj fyne.CanvasObject) {
-			row := obj.(*hoverRow)
-			tip := row.inner.(*hoverTip)
-			padded := tip.inner.(*fyne.Container)
-			t := padded.Objects[0].(*canvas.Text)
-			g.mcMu.Lock()
-			if id >= len(g.mcRxLog) {
-				g.mcMu.Unlock()
-				return
-			}
-			// Newest at BOTTOM (chronological, like a chat) so
-			// the operator can read the log top-down without
-			// re-anchoring to the latest line. Row id maps
-			// directly to slice index — autoscroll-on-append
-			// keeps the most-recent line in view.
-			e := g.mcRxLog[id]
-			g.mcMu.Unlock()
-			t.Text = fmt.Sprintf("%s  %-8s %-9s  %dh  SNR %4.1f  RSSI %4d",
-				e.when.Format("15:04:05"), e.route, e.payload, e.hops, e.snr, e.rssi)
-			t.Refresh()
-			tip.SetTooltip(formatHoverTime(e.when))
-			// Stash the row index so the secondary-tap handler
-			// can fish out the entry without the closure
-			// capturing a stale value.
-			row.listIdx = id
-		},
-	)
-	g.mcRxLogList.OnSelected = func(id widget.ListItemID) {
-		g.showRxLogInspectByIdx(id)
-		g.mcRxLogList.UnselectAll()
-	}
-
-	bg := canvas.NewRectangle(color.RGBA{30, 32, 38, 255})
-	g.mcRxLogPane = container.NewStack(
-		bg,
-		container.NewBorder(
-			container.NewPadded(g.mcRxLogHeader),
-			nil, nil, nil,
-			g.mcRxLogList,
-		),
-	)
-	return g.mcRxLogPane
-}
-
-// showRxLogContextMenu pops up a right-click menu on a row in the
-// RxLog viewer. Inspect opens the parsed-metadata + hex-dump
-// modal; Show path on map plots the route the packet traversed
-// using contact-roster lookups for each path-hash hop. Clear path
-// removes the most recent path overlay so the operator can de-clutter
-// without flipping modes.
-func (g *GUI) showRxLogContextMenu(visibleIdx int, absPos fyne.Position) {
-	g.mcMu.Lock()
-	if visibleIdx < 0 || visibleIdx >= len(g.mcRxLog) {
-		g.mcMu.Unlock()
-		return
-	}
-	g.mcMu.Unlock()
-	canvas := g.window.Canvas()
-	menu := fyne.NewMenu("",
-		fyne.NewMenuItem("Inspect", func() { g.showRxLogInspectByIdx(visibleIdx) }),
-		fyne.NewMenuItem("Show path on map", func() { g.mcShowPathForRxLog(visibleIdx) }),
-		fyne.NewMenuItem("Clear path", func() {
-			if mw := g.scopeMapWidget(); mw != nil {
-				mw.ClearMessagePath()
-			}
-		}),
-	)
-	widget.ShowPopUpMenuAtPosition(menu, canvas, absPos)
+	g.mcRefreshLists()
 }
 
 // mcShowPathForRxLog draws the route the indexed RxLog packet took
@@ -8033,16 +9264,28 @@ func (g *GUI) mcShowPathForRxLog(visibleIdx int) {
 	}
 	nodes := make([]mapview.MessagePathNode, 0, hashCount+1)
 	// Walk the path in transmit order — each hash is the prefix
-	// of a forwarder's pubkey.
+	// of a forwarder's pubkey. resolvePathHopHash disambiguates
+	// 1-byte collisions by preferring repeaters (path hops are
+	// almost always repeater nodes) and, where multiple
+	// repeaters collide, the one closest to the prior hop.
+	prevLat, prevLon := selfLat, selfLon
 	for h := 0; h < hashCount && h*hashSize+hashSize <= len(pkt.Path); h++ {
 		hashBytes := pkt.Path[h*hashSize : h*hashSize+hashSize]
-		var matched *meshcore.Contact
-		for i := range contacts {
-			if matchPathHash(contacts[i].PubKey[:], hashBytes) {
-				c := contacts[i]
-				matched = &c
-				break
-			}
+		matched, nMatches := resolvePathHopHash(contacts, hashBytes, prevLat, prevLon)
+		if nMatches > 1 && g.mcLog != nil {
+			g.mcLog.Debugw("path-hash collision",
+				"hash", fmt.Sprintf("%x", hashBytes),
+				"matches", nMatches,
+				"picked", func() string {
+					if matched != nil {
+						return matched.AdvName
+					}
+					return "(none)"
+				}(),
+			)
+		}
+		if matched != nil && (matched.AdvLatE6 != 0 || matched.AdvLonE6 != 0) {
+			prevLat, prevLon = matched.LatDegrees(), matched.LonDegrees()
 		}
 		if matched != nil && (matched.AdvLatE6 != 0 || matched.AdvLonE6 != 0) {
 			nodes = append(nodes, mapview.MessagePathNode{
@@ -8183,244 +9426,6 @@ func (g *GUI) mcAnimateOutgoingChannel(roster []string) {
 	}
 	if len(batch) > 0 {
 		mw.AppendMessagePaths(batch)
-	}
-}
-
-// buildPathFromPacketLocked walks a packet's path-hash field and
-// returns the resolved sequence of MessagePathNodes (matched
-// contacts + interpolated placeholders + our position). Caller
-// must hold g.mcMu — used by the auto-animate paths to avoid
-// re-acquiring the lock.
-func (g *GUI) buildPathFromPacketLocked(pkt meshcore.Packet) []mapview.MessagePathNode {
-	hashSize := int(pkt.PathLen>>6) + 1
-	hashCount := int(pkt.PathLen & 0x3F)
-	if pkt.PathLen == 0xFF {
-		hashCount = 0
-	}
-	nodes := make([]mapview.MessagePathNode, 0, hashCount+1)
-	for h := 0; h < hashCount && h*hashSize+hashSize <= len(pkt.Path); h++ {
-		hashBytes := pkt.Path[h*hashSize : h*hashSize+hashSize]
-		var matched *meshcore.Contact
-		for i := range g.mcContacts {
-			if matchPathHash(g.mcContacts[i].PubKey[:], hashBytes) {
-				matched = &g.mcContacts[i]
-				break
-			}
-		}
-		if matched != nil && (matched.AdvLatE6 != 0 || matched.AdvLonE6 != 0) {
-			nodes = append(nodes, mapview.MessagePathNode{
-				Name: matched.AdvName,
-				Lat:  matched.LatDegrees(),
-				Lon:  matched.LonDegrees(),
-			})
-		} else {
-			nodes = append(nodes, mapview.MessagePathNode{
-				Name:        fmt.Sprintf("%x?", hashBytes),
-				Placeholder: true,
-			})
-		}
-	}
-	selfLat := float64(g.mcSelfInfo.AdvLatE6) / 1e6
-	selfLon := float64(g.mcSelfInfo.AdvLonE6) / 1e6
-	if selfLat != 0 || selfLon != 0 {
-		nodes = append(nodes, mapview.MessagePathNode{
-			Name: g.mcSelfInfo.Name,
-			Lat:  selfLat,
-			Lon:  selfLon,
-		})
-	}
-	mcInterpolatePathPlaceholders(nodes)
-	return nodes
-}
-
-// matchPathHash returns true when the leading bytes of pubKey
-// match hash. PATH_HASH_SIZE is firmware-side fixed (default 1).
-func matchPathHash(pubKey, hash []byte) bool {
-	if len(hash) > len(pubKey) {
-		return false
-	}
-	for i := 0; i < len(hash); i++ {
-		if pubKey[i] != hash[i] {
-			return false
-		}
-	}
-	return true
-}
-
-// mcInterpolatePathPlaceholders fills in lat/lon for placeholder
-// nodes by linear-interpolating between the nearest known endpoints
-// on either side. Lets unknown hops still appear on the map between
-// the contacts we DO know rather than collapsing to (0, 0).
-func mcInterpolatePathPlaceholders(nodes []mapview.MessagePathNode) {
-	for i := range nodes {
-		if !nodes[i].Placeholder {
-			continue
-		}
-		// Find nearest known anchor before i.
-		left := -1
-		for j := i - 1; j >= 0; j-- {
-			if !nodes[j].Placeholder && (nodes[j].Lat != 0 || nodes[j].Lon != 0) {
-				left = j
-				break
-			}
-		}
-		right := -1
-		for j := i + 1; j < len(nodes); j++ {
-			if !nodes[j].Placeholder && (nodes[j].Lat != 0 || nodes[j].Lon != 0) {
-				right = j
-				break
-			}
-		}
-		switch {
-		case left >= 0 && right >= 0:
-			frac := float64(i-left) / float64(right-left)
-			nodes[i].Lat = nodes[left].Lat + (nodes[right].Lat-nodes[left].Lat)*frac
-			nodes[i].Lon = nodes[left].Lon + (nodes[right].Lon-nodes[left].Lon)*frac
-		case left >= 0:
-			nodes[i].Lat = nodes[left].Lat
-			nodes[i].Lon = nodes[left].Lon
-		case right >= 0:
-			nodes[i].Lat = nodes[right].Lat
-			nodes[i].Lon = nodes[right].Lon
-		}
-	}
-}
-
-// showRxLogInspect opens the inspect modal for the entry under the
-// given hoverRow. Wraps showRxLogInspectByIdx so the secondary-tap
-// callback doesn't have to look up the index itself.
-func (g *GUI) showRxLogInspect(row *hoverRow) {
-	if row == nil {
-		return
-	}
-	g.showRxLogInspectByIdx(row.listIdx)
-}
-
-// showRxLogInspectByIdx opens a modal showing the parsed metadata
-// + a hex dump of the raw packet bytes for the RxLog entry at the
-// given visible-list index. Visible index 0 = newest packet, so we
-// translate to the underlying slice order before reading.
-func (g *GUI) showRxLogInspectByIdx(visibleIdx int) {
-	g.mcMu.Lock()
-	if visibleIdx < 0 || visibleIdx >= len(g.mcRxLog) {
-		g.mcMu.Unlock()
-		return
-	}
-	entry := g.mcRxLog[visibleIdx]
-	g.mcMu.Unlock()
-
-	// Build a multi-line monospace dump. Mirrors the web client's
-	// RxLogPage detail view: header line + per-payload-type fields
-	// + a hex+ASCII dump of the raw bytes for forensic copy/paste.
-	var b strings.Builder
-	fmt.Fprintf(&b, "Time:        %s\n", entry.when.Format("2006-01-02 15:04:05"))
-	fmt.Fprintf(&b, "Route:       %s\n", entry.route)
-	fmt.Fprintf(&b, "Payload:     %s\n", entry.payload)
-	fmt.Fprintf(&b, "Hops:        %d\n", entry.hops)
-	fmt.Fprintf(&b, "SNR / RSSI:  %.1f dB / %d dBm\n", entry.snr, entry.rssi)
-	fmt.Fprintf(&b, "Header:      0x%02x  (route=%d, type=%d, ver=%d)\n",
-		entry.packet.Header,
-		entry.packet.RouteType(),
-		entry.packet.PayloadType(),
-		entry.packet.PayloadVersion(),
-	)
-	if entry.packet.TransportCode1 != 0 || entry.packet.TransportCode2 != 0 {
-		fmt.Fprintf(&b, "TransportCodes: %04x %04x\n",
-			entry.packet.TransportCode1, entry.packet.TransportCode2)
-	}
-	fmt.Fprintf(&b, "PathLen byte: 0x%02x  (hashSize=%d, hashCount=%d)\n",
-		entry.packet.PathLen,
-		int(entry.packet.PathLen>>6)+1,
-		int(entry.packet.PathLen&0x3F))
-	if len(entry.packet.Path) > 0 {
-		fmt.Fprintf(&b, "Path:        %x\n", entry.packet.Path)
-	}
-	fmt.Fprintf(&b, "Payload len: %d bytes\n", len(entry.packet.Payload))
-	fmt.Fprintf(&b, "Raw len:     %d bytes\n\n", len(entry.raw))
-	b.WriteString(formatHexDump(entry.raw))
-
-	textArea := widget.NewMultiLineEntry()
-	textArea.SetText(b.String())
-	textArea.TextStyle = fyne.TextStyle{Monospace: true}
-	textArea.Wrapping = fyne.TextWrapOff
-	scroller := container.NewScroll(textArea)
-	scroller.SetMinSize(fyne.NewSize(560, 360))
-
-	d := dialog.NewCustom("Inspect mesh packet", "Close", scroller, g.window)
-	d.Resize(fyne.NewSize(620, 420))
-	d.Show()
-}
-
-// formatHexDump returns a classic 16-bytes-per-row hex + printable
-// ASCII dump of b. Trailing partial rows pad cleanly so the ASCII
-// gutter stays aligned.
-func formatHexDump(b []byte) string {
-	if len(b) == 0 {
-		return "(empty)\n"
-	}
-	var out strings.Builder
-	for off := 0; off < len(b); off += 16 {
-		end := off + 16
-		if end > len(b) {
-			end = len(b)
-		}
-		row := b[off:end]
-		fmt.Fprintf(&out, "%04x  ", off)
-		for i := 0; i < 16; i++ {
-			if i < len(row) {
-				fmt.Fprintf(&out, "%02x ", row[i])
-			} else {
-				out.WriteString("   ")
-			}
-			if i == 7 {
-				out.WriteByte(' ')
-			}
-		}
-		out.WriteString(" |")
-		for _, c := range row {
-			if c >= 0x20 && c < 0x7F {
-				out.WriteByte(c)
-			} else {
-				out.WriteByte('.')
-			}
-		}
-		out.WriteString("|\n")
-	}
-	return out.String()
-}
-
-// mcAppendRxLogEntry buffers one parsed PushLogRxData event and
-// refreshes the RxLog viewer. Caps mcRxLog at maxMcRxLog (newest
-// wins). Safe from any goroutine.
-func (g *GUI) mcAppendRxLogEntry(ev meshcore.EventRxLog) {
-	g.mcMu.Lock()
-	g.mcRxLog = append(g.mcRxLog, mcRxLogEntry{
-		when:    time.Now(),
-		route:   ev.Packet.RouteType().String(),
-		payload: ev.Packet.PayloadType().String(),
-		hops:    ev.Packet.HopCount(),
-		snr:     ev.SNR,
-		rssi:    ev.RSSI,
-		raw:     ev.Raw,
-		packet:  ev.Packet,
-	})
-	if len(g.mcRxLog) > maxMcRxLog {
-		g.mcRxLog = g.mcRxLog[len(g.mcRxLog)-maxMcRxLog:]
-	}
-	n := len(g.mcRxLog)
-	g.mcMu.Unlock()
-	if g.mcRxLogList != nil {
-		fyne.Do(func() {
-			if g.mcRxLogHeader != nil {
-				g.mcRxLogHeader.Text = fmt.Sprintf("RX LOG  (%d)", n)
-				g.mcRxLogHeader.Refresh()
-			}
-			g.mcRxLogList.Refresh()
-			// Newest at the BOTTOM of the list now (chronological,
-			// reads top-down). Scroll-to-bottom keeps the latest
-			// arrival in view as the log grows.
-			g.mcRxLogList.ScrollToBottom()
-		})
 	}
 }
 
@@ -8785,7 +9790,23 @@ func (g *GUI) connectMeshcore() {
 				if favs, ferr := store.LoadFavorites(); ferr == nil {
 					g.mcFavorites = favs
 				}
+				if pend, perr := store.LoadPendingAdverts(); perr == nil {
+					g.mcPendingAdverts = pend
+				}
+				if blocked, berr := store.LoadBlockedAdverts(); berr == nil {
+					g.mcBlockedAdverts = blocked
+				}
 				g.mcMu.Unlock()
+				// One-shot purge of legacy slot-keyed channel
+				// buckets ("channel:0", "channel:1", …) left
+				// behind by the slot-to-secret keying change.
+				// Idempotent — re-runs are no-ops once the
+				// orphans are gone.
+				if n, err := store.PurgeLegacyChannelBuckets(); err != nil {
+					g.mcAppendSystem("legacy channel cleanup: " + err.Error())
+				} else if n > 0 {
+					g.mcAppendSystem(fmt.Sprintf("cleaned up %d orphaned channel history bucket(s) from before the secret-keying fix", n))
+				}
 				if all, err := store.LoadAll(maxRows); err == nil && len(all) > 0 {
 					g.mcMu.Lock()
 					if g.mcThreadHistory == nil {
@@ -8816,17 +9837,23 @@ func (g *GUI) connectMeshcore() {
 		// so without this the per-message senderTimestamp is
 		// nonsense for the first send. Errors are non-fatal.
 		_ = client.SetDeviceTime(time.Now())
-		// Push the manual-add-contacts toggle if it differs from
-		// the radio's current state. Critical on busy meshes where
-		// auto-add fills the contacts table to MAX_CONTACTS and
-		// the firmware starts thrashing on evictions.
-		manualAdd := prefs.BoolWithFallback(mcPrefProfileManualAdd, false)
-		currentManual := info.ManualAddContacts != 0
-		if manualAdd != currentManual {
-			if err := client.SetManualAddContacts(manualAdd); err != nil {
+		// Always force manual-add ON. We get rich PushNewAdvert
+		// events for every advert that way, and per-type
+		// auto-promotion is handled host-side via the per-type
+		// auto-add prefs (see mcRecordPendingAdvert). Skipping the
+		// push when the radio's already in manual mode avoids a
+		// pointless wire round-trip on every connect.
+		if info.ManualAddContacts == 0 {
+			if err := client.SetManualAddContacts(true); err != nil {
 				g.mcAppendSystem("SetManualAddContacts: " + err.Error())
 			}
 		}
+		// Hydrate the in-memory per-type auto-add map so the very
+		// first advert after connect uses the operator's saved
+		// preferences instead of falling back to defaults.
+		g.mcMu.Lock()
+		_ = g.mcAutoAddTypesLocked()
+		g.mcMu.Unlock()
 		// Repeaters drop packets whose senderTimestamp is earlier
 		// than the most recent timestamp seen from that pubkey
 		// (per the MeshCore crypto reference). A long-running
@@ -8892,101 +9919,15 @@ func (g *GUI) connectMeshcore() {
 		g.mcSetStatus(fmt.Sprintf("connected — %s", info.Name))
 		g.mcAppendSystem(fmt.Sprintf("connected: %s (%d contacts, %d channels)", info.Name, len(contacts), len(channels)))
 		go g.runMeshcoreEvents(client)
+		go g.runMeshcoreBatteryWatch(client)
+		go g.runMeshcoreTrackerAdvert(client)
 	}()
 }
 
-// disconnectMeshcore closes the client cleanly. Called from
-// Settings → Save (after a device pick change) and window-close.
-// Mode-rail flipping leaves the client open so a quick
-// FT8 ↔ MeshCore round-trip doesn't tear down the session. The
-// persistence store is closed here too so bbolt's file lock is
-// released before the next process tries to open it. Sets
-// mcManualDisconnect so any pending auto-reconnect timer no-ops
-// when it fires — the operator's intent is "stay disconnected".
-func (g *GUI) disconnectMeshcore() {
-	g.mcMu.Lock()
-	c := g.mcClient
-	store := g.mcStore
-	g.mcClient = nil
-	g.mcStore = nil
-	g.mcStarted = false
-	g.mcManualDisconnect = true
-	if g.mcAutoReconnectTimer != nil {
-		g.mcAutoReconnectTimer.Stop()
-		g.mcAutoReconnectTimer = nil
-	}
-	g.mcMu.Unlock()
-	if c != nil {
-		_ = c.Close()
-	}
-	if store != nil {
-		_ = store.Close()
-	}
-}
-
-// scheduleMcAutoReconnect arms a one-shot timer to retry
-// connectMeshcore after the operator-configured interval (default
-// mcDefaultAutoReconnectMin minutes). 0 disables. macOS sleep/wake
-// is the most common failure that drops the BLE link silently;
-// without this the operator has to remember to manually re-pick
-// the radio in Settings every time the laptop wakes. The interval
-// is intentionally NOT zero by default — battery-powered trackers
-// like the T1000-E pay a real cost for an aggressive reconnect
-// loop, and a 5-minute drift between "I closed the lid" and
-// "messages flow again" is acceptable for most use.
-func (g *GUI) scheduleMcAutoReconnect() {
-	if g.app == nil {
-		return
-	}
-	mins := g.app.Preferences().IntWithFallback(mcPrefAutoReconnectMin, mcDefaultAutoReconnectMin)
-	if mins <= 0 {
-		return
-	}
-	g.mcMu.Lock()
-	if g.mcManualDisconnect {
-		g.mcMu.Unlock()
-		return
-	}
-	if g.mcAutoReconnectTimer != nil {
-		g.mcAutoReconnectTimer.Stop()
-	}
-	delay := time.Duration(mins) * time.Minute
-	g.mcAutoReconnectTimer = time.AfterFunc(delay, func() {
-		g.mcMu.Lock()
-		// Bail if a manual reconnect already happened or the
-		// operator manually disconnected since the timer armed.
-		if g.mcClient != nil || g.mcManualDisconnect {
-			g.mcMu.Unlock()
-			return
-		}
-		g.mcMu.Unlock()
-		g.mcAppendSystem(fmt.Sprintf("auto-reconnecting after %d min idle", mins))
-		fyne.Do(func() { g.connectMeshcore() })
-	})
-	g.mcMu.Unlock()
-	g.mcAppendSystem(fmt.Sprintf("link dropped — auto-reconnect in %d min (Settings → MeshCore to change)", mins))
-}
-
-// runMeshcoreClockSync re-issues SetDeviceTime once an hour while
-// the supplied client is still the active one. Long-running
-// sessions whose device clock drifts ahead of wall-clock would
-// otherwise have sends silently dropped by repeaters that enforce
-// monotonic per-pubkey timestamps. Self-exits when the client
-// changes (operator reconnect / disconnect) so multiple
-// connect-disconnect cycles don't accumulate stray syncers.
-func (g *GUI) runMeshcoreClockSync(client *meshcore.Client) {
-	t := time.NewTicker(time.Hour)
-	defer t.Stop()
-	for range t.C {
-		g.mcMu.Lock()
-		current := g.mcClient
-		g.mcMu.Unlock()
-		if current != client {
-			return
-		}
-		_ = client.SetDeviceTime(time.Now())
-	}
-}
+// (runMeshcoreBatteryWatch, disconnectMeshcore, scheduleMcAutoReconnect,
+// runMeshcoreClockSync moved to gui_meshcore_lifecycle.go.
+// connectMeshcore + runMeshcoreEvents stay below — they tangle with
+// many surfaces.)
 
 // runMeshcoreEvents pumps the Client's event channel until it closes.
 // Translates push events into chat rows / sidebar updates. Drains
@@ -9027,6 +9968,28 @@ func (g *GUI) runMeshcoreEvents(client *meshcore.Client) {
 			// viewer; in MeshCore mode the operator can see live
 			// traffic + SNR/RSSI without leaving the app.
 			g.mcAppendRxLogEntry(e)
+		case meshcore.EventTraceData:
+			// Response to an operator-triggered "Trace path".
+			// Match against the pending-trace table and render
+			// the hops on the map with per-hop SNR labels.
+			g.handleMcTraceData(e)
+		case meshcore.EventTelemetryResponse:
+			// Response to an operator-triggered "Query telemetry"
+			// against a sensor node. Match against the pending
+			// table by sender prefix and surface the decoded
+			// LPP readings as a system message.
+			g.handleMcTelemetryResponse(e)
+		case meshcore.EventStatusResponse:
+			// Response to an operator-triggered "Query repeater
+			// status". Same correlation pattern as telemetry —
+			// match by sender prefix and render the decoded
+			// RepeaterStats inline.
+			g.handleMcStatusResponse(e)
+		case meshcore.EventLoginResult:
+			// Outcome of an operator-triggered "Login…" against a
+			// private repeater / room-server. Surface the result
+			// inline (success / fail with elapsed time).
+			g.handleMcLoginResult(e)
 		case meshcore.EventContactsFull:
 			// Hardware contacts table at MAX_CONTACTS — the
 			// firmware will start dropping new adverts AND
@@ -9087,6 +10050,16 @@ func (g *GUI) runMeshcoreEvents(client *meshcore.Client) {
 			// Coalesce adverts within the debounce window into a
 			// single GetContactsSince(lastMod) that returns just
 			// the changed records.
+			//
+			// PushNewAdvert (Manual=true) carries a full
+			// Contact-shaped record because the firmware DIDN'T
+			// add it to its contacts table — auto-add was off, so
+			// a refresh would surface nothing. Persist it locally
+			// so the operator can see the node on the map and
+			// optionally promote it to a real contact later.
+			if e.Manual && e.Pending != nil {
+				g.mcRecordPendingAdvert(*e.Pending)
+			}
 			g.scheduleMcContactsRefresh(client)
 		case meshcore.EventDisconnected:
 			g.mcMu.Lock()
@@ -9399,6 +10372,11 @@ func (g *GUI) applySidebarForMode() {
 			mw.ClearQSOPartner()
 			mw.Refresh()
 		}
+		// Repopulate the mesh-node overlay now that we're back in
+		// MeshCore mode — mcSyncContactsToMap is gated on activeMode
+		// so any background event-driven calls during FT8 mode were
+		// skipped, leaving the map cleared.
+		go g.mcSyncContactsToMap()
 	} else {
 		g.sidebarStack.Objects = []fyne.CanvasObject{g.bandList}
 		if g.chanHeader != nil {
@@ -9439,6 +10417,7 @@ func (g *GUI) applySidebarForMode() {
 			mw.SetShowMeshcoreLegend(false)
 			mw.SetShowGrids(true)
 			mw.ClearMeshNodes()
+			mw.ClearMessagePath()  // drop any in-flight lightning traces
 			mw.ClearSelfPosition() // diamond falls back to myGrid centroid
 			mw.Refresh()
 		}
@@ -9695,12 +10674,51 @@ type hoverRow struct {
 	// Callers set this to invoke the same logic as OnSelected,
 	// typically `list.Select(row.listIdx)`.
 	onTap func()
+	// onMiddle fires on middle-click (MouseButtonTertiary). Used
+	// for browser-style "back" navigation: the chat-row binder
+	// in MeshCore mode wires this to mcGoBack so middle-clicking
+	// any chat row bounces the operator back to the previous
+	// thread. nil = ignored.
+	onMiddle func()
 }
 
 var _ fyne.SecondaryTappable = (*hoverRow)(nil)
 var _ fyne.Tappable = (*hoverRow)(nil)
+var _ desktop.Mouseable = (*hoverRow)(nil)
+
+// MouseDown gives us the per-button event the Tapped /
+// TappedSecondary callbacks lack — specifically, Fyne 2.7 routes
+// MouseButtonTertiary (middle-click) only through Mouseable, not
+// through any of the convenience Tappable interfaces. We forward
+// just that one button to onMiddle; primary + secondary still
+// go through Tapped / TappedSecondary as usual (Fyne dispatches
+// both interfaces).
+func (h *hoverRow) MouseDown(ev *desktop.MouseEvent) {
+	if ev.Button == desktop.MouseButtonTertiary && h.onMiddle != nil {
+		h.onMiddle()
+	}
+}
+
+func (h *hoverRow) MouseUp(_ *desktop.MouseEvent) {}
 
 func (h *hoverRow) TappedSecondary(ev *fyne.PointEvent) {
+	// Diagnostic instrumentation: log every secondary-tap that
+	// reaches the widget so we can confirm Fyne is actually
+	// dispatching the event. If a right-click on the HEARD list
+	// doesn't show up here, the OS-level secondary-click isn't
+	// reaching Fyne (System Settings → Mouse / Trackpad). If it
+	// shows up with hasHandler=false, the row binder forgot to
+	// wire onSecondary for this row.
+	if logging.L != nil {
+		logging.L.Debugw("hoverRow.TappedSecondary",
+			"abs_x", ev.AbsolutePosition.X,
+			"abs_y", ev.AbsolutePosition.Y,
+			"local_x", ev.Position.X,
+			"local_y", ev.Position.Y,
+			"listIdx", h.listIdx,
+			"hasHandler", h.onSecondary != nil,
+		)
+	}
 	if h.onSecondary != nil {
 		h.onSecondary(ev.AbsolutePosition)
 	}
@@ -9716,6 +10734,17 @@ func (h *hoverRow) TappedSecondary(ev *fyne.PointEvent) {
 // list rows). If onTap is nil the click is silently dropped — fine
 // for chat rows where selection is irrelevant.
 func (h *hoverRow) Tapped(*fyne.PointEvent) {
+	// Parallel diagnostic to TappedSecondary above — comparing
+	// hit-counts of the two in the log tells us whether Fyne
+	// is dispatching primary but not secondary taps to this
+	// widget. If only Tapped fires on a right-click, the OS or
+	// Fyne is rewriting the secondary into a primary somewhere.
+	if logging.L != nil {
+		logging.L.Debugw("hoverRow.Tapped",
+			"listIdx", h.listIdx,
+			"hasHandler", h.onTap != nil,
+		)
+	}
 	if h.onTap != nil {
 		h.onTap()
 	}
@@ -9873,260 +10902,12 @@ func formatHoverTime(t time.Time) string {
 	return t.Local().Format("Mon Jan 2, 2006 15:04:05 MST")
 }
 
-// mcHashSegment is one piece of a parsed chat-row text — a plain
-// run, a path-hash link, or an @-mention. Path hashes are 1-, 2-,
-// or 3-byte prefixes of a contact pubkey (the firmware uses the
-// first PATH_HASH_SIZE bytes — 1 by default — to identify hops in
-// Packet.Path). Tokens that don't resolve to a known contact stay
-// in plain runs so common English hex-looking words ("be", "ad",
-// "decade") aren't underlined. Mentions match the @[Name] wire
-// convention used by upstream MeshCore clients (web, iOS) — the
-// brackets are wire-format only and stripped when rendering.
-type mcHashSegment struct {
-	text        string          // visible characters (mentions: "@Name" without brackets)
-	link        bool            // true when token resolves to a contact (path-hash link)
-	mention     bool            // true when this is an @[Name] mention
-	mentionSelf bool            // true when the mention targets the operator's own advert name
-	url         string          // populated for http(s) URL spans — render as clickable link
-	pub         meshcore.PubKey // populated when link == true OR mention resolved to a contact
-}
-
-// mcURLRe matches http:// and https:// URLs. The character class
-// stops at whitespace; trailing punctuation (.,;:!?)]) commonly
-// hugs URLs in prose ("check https://example.com.") so we strip
-// it after matching to keep the link targeting the actual page,
-// not page-plus-period.
-var mcURLRe = regexp.MustCompile(`https?://\S+`)
-
-// mcURLTrimTrailing is the set of punctuation characters peeled
-// off the right end of a URL match before the link is rendered.
-const mcURLTrimTrailing = ".,;:!?)]\"'>"
-
-// mcMentionRe matches the "@[Name]" wire convention. Names can
-// contain anything except a literal closing bracket so multi-word
-// or punctuated handles (rare on MeshCore but possible) survive.
-var mcMentionRe = regexp.MustCompile(`@\[([^\]]+)\]`)
-
-// mcHashSeriesRe matches a comma-separated SERIES of 2/4/6 hex
-// digits — at least two tokens. The series form is the only one we
-// auto-link, because a single 2-hex token ("be", "78", "ad") is
-// indistinguishable from ordinary English / numeric text and would
-// false-positive constantly. A series like "df,b7,43" or
-// "df, b7, 43" is unambiguous: nothing in normal chat looks like
-// that. Whitespace between commas is allowed so manually-typed
-// lists still match.
-var mcHashSeriesRe = regexp.MustCompile(`(?i)\b[0-9a-f]{2}(?:[0-9a-f]{2}){0,2}(?:\s*,\s*[0-9a-f]{2}(?:[0-9a-f]{2}){0,2})+\b`)
-
-// mcHashTokenInSeriesRe pulls one hex token (and the byte offsets
-// of just the hex characters) out of a series substring. Used after
-// mcHashSeriesRe locates a series so we can emit each token as its
-// own link/plain segment with the comma separators preserved as
-// plain runs between them.
-var mcHashTokenInSeriesRe = regexp.MustCompile(`(?i)[0-9a-f]{2}(?:[0-9a-f]{2}){0,2}`)
-
-// mcParseChatSegments is the unified inline-segment parser used by
-// the chat row binder. It splits text into plain runs, @[Name]
-// mentions (rendered without brackets, styled), and path-hash
-// links (existing behaviour). Mentions are extracted first as the
-// outermost frames; hash-link detection then runs on the plain
-// runs between mentions, so a mention can't accidentally hide
-// inside a hex series (or vice versa). selfName is the operator's
-// own advert name — when a mention's target matches selfName the
-// segment is flagged mentionSelf so the renderer can highlight it
-// (Slack "@you" style). Returns nil when nothing notable was
-// found, letting the caller fall back to the plain canvas.Text
-// path.
-func mcParseChatSegments(text string, contacts []meshcore.Contact, selfName string) []mcHashSegment {
-	if text == "" {
-		return nil
-	}
-	urlLocs := mcURLRe.FindAllStringIndex(text, -1)
-	mentionLocs := mcMentionRe.FindAllStringSubmatchIndex(text, -1)
-	if len(urlLocs) == 0 && len(mentionLocs) == 0 {
-		// No URLs / mentions — fall through to hash-only parsing.
-		return mcParseHashLinks(text, contacts)
-	}
-	var out []mcHashSegment
-	cursor := 0
-	// emitMentionsAndPlain runs mention extraction over a plain
-	// substring, then hands any remaining un-mentioned text to
-	// hash-link parsing. Used for the gaps BETWEEN URL matches so
-	// URLs are the outermost frames and mentions / hash series
-	// don't accidentally swallow URL characters.
-	emitMentionsAndPlain := func(s string) {
-		if s == "" {
-			return
-		}
-		if len(mentionLocs) == 0 {
-			// No mentions in the original text — go straight to
-			// hash-link parsing for this slice.
-			if hashSegs := mcParseHashLinks(s, contacts); hashSegs != nil {
-				out = append(out, hashSegs...)
-			} else {
-				out = append(out, mcHashSegment{text: s})
-			}
-			return
-		}
-		// Mentions exist somewhere in the original text; rescan
-		// just this slice for them so the offsets stay local.
-		subMentions := mcMentionRe.FindAllStringSubmatchIndex(s, -1)
-		if len(subMentions) == 0 {
-			if hashSegs := mcParseHashLinks(s, contacts); hashSegs != nil {
-				out = append(out, hashSegs...)
-			} else {
-				out = append(out, mcHashSegment{text: s})
-			}
-			return
-		}
-		subCursor := 0
-		emitPlainHashes := func(p string) {
-			if p == "" {
-				return
-			}
-			if hashSegs := mcParseHashLinks(p, contacts); hashSegs != nil {
-				out = append(out, hashSegs...)
-			} else {
-				out = append(out, mcHashSegment{text: p})
-			}
-		}
-		for _, m := range subMentions {
-			if m[0] > subCursor {
-				emitPlainHashes(s[subCursor:m[0]])
-			}
-			name := s[m[2]:m[3]]
-			seg := mcHashSegment{text: "@" + name, mention: true}
-			if selfName != "" && strings.EqualFold(name, selfName) {
-				seg.mentionSelf = true
-			}
-			for i := range contacts {
-				if strings.EqualFold(contacts[i].AdvName, name) {
-					seg.pub = contacts[i].PubKey
-					break
-				}
-			}
-			out = append(out, seg)
-			subCursor = m[1]
-		}
-		if subCursor < len(s) {
-			emitPlainHashes(s[subCursor:])
-		}
-	}
-	// Walk URL matches as outermost frames. Plain text between
-	// URLs goes through mention + hash extraction.
-	for _, u := range urlLocs {
-		if u[0] > cursor {
-			emitMentionsAndPlain(text[cursor:u[0]])
-		}
-		raw := text[u[0]:u[1]]
-		// Peel trailing punctuation that's almost certainly part
-		// of the surrounding prose, not the URL.
-		trim := strings.TrimRight(raw, mcURLTrimTrailing)
-		out = append(out, mcHashSegment{text: trim, url: trim})
-		// If we trimmed any tail, emit it as plain so the visible
-		// text matches the input character-for-character.
-		if tail := raw[len(trim):]; tail != "" {
-			out = append(out, mcHashSegment{text: tail})
-		}
-		cursor = u[1]
-	}
-	if cursor < len(text) {
-		emitMentionsAndPlain(text[cursor:])
-	}
-	// If nothing in the result is a link / mention / URL, the
-	// parser effectively did no work — let the plain-text path
-	// handle it.
-	for _, s := range out {
-		if s.link || s.mention || s.url != "" {
-			return out
-		}
-	}
-	return nil
-}
-
-// mcParseHashLinks splits text into plain + link segments. Only
-// path-hash *series* (≥2 hex tokens joined by commas) get scanned;
-// individual tokens that resolve against the contacts slice (via
-// pubkey-prefix match of 1/2/3 bytes) become links, the rest stay
-// in plain runs. The roster is passed in (not read off
-// g.mcContacts) so callers can avoid re-locking on every row
-// binding.
-func mcParseHashLinks(text string, contacts []meshcore.Contact) []mcHashSegment {
-	if text == "" || len(contacts) == 0 {
-		return nil
-	}
-	seriesLocs := mcHashSeriesRe.FindAllStringIndex(text, -1)
-	if len(seriesLocs) == 0 {
-		return nil
-	}
-	resolve := func(token string) (meshcore.PubKey, bool) {
-		decoded, err := hex.DecodeString(token)
-		if err != nil {
-			return meshcore.PubKey{}, false
-		}
-		for i := range contacts {
-			pk := contacts[i].PubKey
-			if len(decoded) > len(pk) {
-				continue
-			}
-			equal := true
-			for j, b := range decoded {
-				if pk[j] != b {
-					equal = false
-					break
-				}
-			}
-			if equal {
-				return pk, true
-			}
-		}
-		return meshcore.PubKey{}, false
-	}
-
-	var out []mcHashSegment
-	cursor := 0
-	anyLink := false
-	for _, sLoc := range seriesLocs {
-		series := text[sLoc[0]:sLoc[1]]
-		tokenLocs := mcHashTokenInSeriesRe.FindAllStringIndex(series, -1)
-		if len(tokenLocs) < 2 {
-			continue
-		}
-		// Emit any plain text between the previous cursor and this
-		// series.
-		if sLoc[0] > cursor {
-			out = append(out, mcHashSegment{text: text[cursor:sLoc[0]]})
-		}
-		// Walk the series: token, separator, token, separator, …
-		seriesCursor := 0
-		for _, tLoc := range tokenLocs {
-			if tLoc[0] > seriesCursor {
-				out = append(out, mcHashSegment{text: series[seriesCursor:tLoc[0]]})
-			}
-			token := series[tLoc[0]:tLoc[1]]
-			if pub, ok := resolve(token); ok {
-				out = append(out, mcHashSegment{text: token, link: true, pub: pub})
-				anyLink = true
-			} else {
-				out = append(out, mcHashSegment{text: token})
-			}
-			seriesCursor = tLoc[1]
-		}
-		if seriesCursor < len(series) {
-			out = append(out, mcHashSegment{text: series[seriesCursor:]})
-		}
-		cursor = sLoc[1]
-	}
-	if !anyLink {
-		// All tokens looked like a series but none resolved to a
-		// contact — render the original text untouched so we don't
-		// gratuitously segment a non-routing comma list.
-		return nil
-	}
-	if cursor < len(text) {
-		out = append(out, mcHashSegment{text: text[cursor:]})
-	}
-	return out
-}
+// (mcHashSegment, mcURLRe, mcContactCardRe, mcURLTrimTrailing,
+// mcMentionRe, mcGeoRe, mcParseGeoLink, and the chat-segment
+// parser itself live in chat_segments.go — they're pure parsing
+// over text + a contacts slice with no GUI state, so they were
+// pulled out to keep this file navigable and to sit next to
+// parse_test.go which exercises them.)
 
 // mcHashLink is a tappable canvas-text widget rendering a single
 // path-hash token in cyan with an underline. Left-click flies the
@@ -10187,11 +10968,24 @@ type mcHashLinkRenderer struct {
 }
 
 func (r *mcHashLinkRenderer) Layout(size fyne.Size) {
-	r.label.Resize(size)
-	r.label.Move(fyne.NewPos(0, 0))
+	// Fix the label to its MinSize and align to the BOTTOM of
+	// the cell when the surrounding container allocates more
+	// vertical space than the text needs. The previous Move(0,0)
+	// + underline-at-min.Height-1 looked like strikethrough
+	// inside an HBox that gave us extra height because the
+	// text floated at the top while the underline stayed at the
+	// MinSize bottom — pinning both to the cell bottom keeps the
+	// underline visually under the glyphs regardless of cell
+	// height.
 	min := r.label.MinSize()
-	r.underline.Position1 = fyne.NewPos(0, min.Height-1)
-	r.underline.Position2 = fyne.NewPos(min.Width, min.Height-1)
+	r.label.Resize(min)
+	yTop := size.Height - min.Height
+	if yTop < 0 {
+		yTop = 0
+	}
+	r.label.Move(fyne.NewPos(0, yTop))
+	r.underline.Position1 = fyne.NewPos(0, size.Height-1)
+	r.underline.Position2 = fyne.NewPos(min.Width, size.Height-1)
 }
 
 func (r *mcHashLinkRenderer) MinSize() fyne.Size { return r.label.MinSize() }

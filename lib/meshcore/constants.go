@@ -47,8 +47,11 @@ const (
 	CmdExportPrivateKey  CommandCode = 23
 	CmdImportPrivateKey  CommandCode = 24
 	CmdSendRawData       CommandCode = 25
+	CmdSendLogin         CommandCode = 26
+	CmdSendStatusReq     CommandCode = 27
 	CmdGetChannel        CommandCode = 31
 	CmdSetChannel        CommandCode = 32
+	CmdSendTracePath     CommandCode = 36
 	CmdSetOtherParams    CommandCode = 38
 	CmdSendTelemetryReq  CommandCode = 39
 	CmdSendBinaryReq     CommandCode = 50
@@ -127,6 +130,16 @@ const (
 	ErrBadState       ErrCode = 4
 	ErrFileIO         ErrCode = 5
 	ErrIllegalArg     ErrCode = 6
+)
+
+// StatsType selects which slice of GetStats output the firmware
+// returns. Mirrors meshcore.js Constants.StatsTypes.
+type StatsType byte
+
+const (
+	StatsTypeCore    StatsType = 0
+	StatsTypeRadio   StatsType = 1
+	StatsTypePackets StatsType = 2
 )
 
 // AdvType is the contact / advertisement type carried in an advert

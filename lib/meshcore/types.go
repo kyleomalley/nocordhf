@@ -98,11 +98,59 @@ type SelfInfo struct {
 	AdvLatE6          int32
 	AdvLonE6          int32
 	ManualAddContacts byte
-	RadioFreqHz       uint32
-	RadioBwHz         uint32
-	RadioSF           byte
-	RadioCR           byte
-	Name              string
+	// RadioFreqKHz is the carrier frequency in **kHz** (not Hz). The
+	// firmware's selfInfo packet and SetRadioParams wire format both
+	// use kHz for frequency; only BW is in Hz. Verified against
+	// meshcore-web's SettingsPage.vue (radioFreq / 1000 → MHz).
+	RadioFreqKHz uint32
+	RadioBwHz    uint32
+	RadioSF      byte
+	RadioCR      byte
+	Name         string
+}
+
+// DeviceInfo is the radio's response to CmdDeviceQuery — firmware
+// build identity for display in a Status / About panel. None of
+// these fields gate behaviour; they're informational only.
+type DeviceInfo struct {
+	FirmwareVersion   int8   // protocol-version-aligned integer (1, 2, 3, …)
+	FirmwareBuildDate string // 12-byte cstring like "19 Feb 2025"
+	ManufacturerModel string // remainder of frame, e.g. "RAK4631"
+}
+
+// CoreStats is the radio's response to GetStats(StatsTypeCore).
+// Lightweight battery + uptime + queue snapshot; cheap enough to
+// poll on a Status tab without bothering the firmware.
+type CoreStats struct {
+	BatteryMilliVolts uint16
+	UptimeSecs        uint32
+	QueueLen          uint8 // pending outbound packets in the firmware's TX queue
+}
+
+// RadioStats is the radio's response to GetStats(StatsTypeRadio).
+// Air-time accounting + last-packet link quality. Useful for
+// diagnosing "why are sends slow" (high TX/RX air seconds = busy
+// channel) and "why is range bad" (noiseFloor + lastSnr).
+type RadioStats struct {
+	NoiseFloor int16   // dBm
+	LastRSSI   int8    // dBm of the most recently decoded packet
+	LastSNR    float64 // dB; firmware reports int8 quarter-dB, divided by 4
+	TxAirSecs  uint32
+	RxAirSecs  uint32
+}
+
+// PacketStats is the radio's response to GetStats(StatsTypePackets).
+// Cumulative since boot; flood vs direct breakdown helps spot a
+// repeater that's chewing through everyone's airtime.
+type PacketStats struct {
+	Recv        uint32
+	Sent        uint32
+	NSentFlood  uint32
+	NSentDirect uint32
+	NRecvFlood  uint32
+	NRecvDirect uint32
+	NRecvErrors uint32 // optional in older firmwares; 0 when absent
+	HasRecvErrs bool   // false when the trailing field was missing
 }
 
 // SentResult is the radio's synchronous acknowledgement of a Send*
@@ -125,9 +173,17 @@ type Event interface{ isMeshcoreEvent() }
 // because the radio's "auto add contacts" mode is on (PushAdvert) or
 // pending operator approval when manual mode is on (PushNewAdvert,
 // indicated by Manual=true).
+//
+// Pending is non-nil only when Manual=true: PushNewAdvert delivers a
+// full Contact-shaped record (name, type, lat/lon, last-advert
+// timestamp), so callers can surface the advert without admitting it
+// to the firmware's contacts table. PushAdvert ships only the pubkey
+// — the firmware has already persisted it, so the rich data is
+// available via GetContacts.
 type EventAdvert struct {
 	PublicKey PubKey
 	Manual    bool // true if delivered as PushNewAdvert (operator must approve)
+	Pending   *Contact
 }
 
 func (EventAdvert) isMeshcoreEvent() {}
@@ -169,6 +225,97 @@ func (EventContactMessage) isMeshcoreEvent() {}
 type EventChannelMessage struct{ ChannelMessage }
 
 func (EventChannelMessage) isMeshcoreEvent() {}
+
+// EventLoginResult fires when the firmware delivers either a
+// PushLoginSuccess or PushLoginFail in response to a previously-
+// sent CmdSendLogin. SenderPrefix is the 6-byte addressing
+// prefix the response carries; callers correlate against
+// in-flight requests via that prefix. Success flips the bool;
+// failure (or any firmware-side error) clears it.
+type EventLoginResult struct {
+	SenderPrefix PubKeyPrefix
+	Success      bool
+}
+
+func (EventLoginResult) isMeshcoreEvent() {}
+
+// RepeaterStats decodes the statusData payload of a repeater /
+// room-server PushStatusResponse. Fields mirror the firmware's
+// CompanionRadio struct (see meshcore-dev/MeshCore), all
+// little-endian on the wire.
+type RepeaterStats struct {
+	BatteryMilliVolts uint16
+	TxQueueLen        uint16
+	NoiseFloor        int16
+	LastRSSI          int16
+	PacketsRecv       uint32
+	PacketsSent       uint32
+	TotalAirTimeSecs  uint32
+	TotalUpTimeSecs   uint32
+	NSentFlood        uint32
+	NSentDirect       uint32
+	NRecvFlood        uint32
+	NRecvDirect       uint32
+	ErrEvents         uint16
+	LastSNR           int16 // raw firmware quarter-dB units
+	NDirectDups       uint16
+	NFloodDups        uint16
+}
+
+// EventStatusResponse fires when the firmware delivers a
+// PushStatusResponse — the reply to a previously-sent
+// CmdSendStatusReq. Like telemetry, callers correlate by the
+// SenderPrefix the response carries.
+//
+// Stats is the decoded RepeaterStats when the payload was the
+// expected size (40 bytes); otherwise zero-valued so the caller
+// can fall back to Raw for forensic inspection.
+type EventStatusResponse struct {
+	SenderPrefix PubKeyPrefix
+	Stats        RepeaterStats
+	StatsOK      bool
+	Raw          []byte
+}
+
+func (EventStatusResponse) isMeshcoreEvent() {}
+
+// EventTelemetryResponse fires when the firmware delivers a
+// PushTelemetryResponse — the reply to a previously-sent
+// CmdSendTelemetryReq aimed at a sensor node. SenderPrefix is
+// the 6-byte pubkey prefix of the responding node (matches the
+// MeshCore addressing convention used elsewhere). Readings is
+// the LPP-decoded sensor channels; Raw is the original bytes
+// for forensic inspection.
+type EventTelemetryResponse struct {
+	SenderPrefix PubKeyPrefix
+	Readings     []LPPReading
+	Raw          []byte
+}
+
+func (EventTelemetryResponse) isMeshcoreEvent() {}
+
+// EventTraceData fires when the firmware delivers a PushTraceData
+// frame — the reply to a previously-sent CmdSendTracePath request.
+// Tag is the uint32 the host picked when issuing the trace; callers
+// correlate against their pending-trace table to drop responses for
+// traces they didn't initiate (a neighbouring app could in
+// principle issue overlapping traces).
+//
+// PathHashes is the actual hop sequence the trace traversed (1
+// byte per hop, same encoding as a normal Packet.Path); PathSNRs is
+// the matching per-hop SNR (firmware quarter-dB units already
+// converted to plain dB by the parser). LastSNR is the SNR of the
+// final hop back to us.
+type EventTraceData struct {
+	Tag        uint32
+	AuthCode   uint32
+	Flags      byte
+	PathHashes []byte
+	PathSNRs   []float64
+	LastSNR    float64
+}
+
+func (EventTraceData) isMeshcoreEvent() {}
 
 // EventDisconnected fires once when the read goroutine exits — either
 // the operator disconnected the device or the serial port returned an

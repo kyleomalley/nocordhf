@@ -222,9 +222,20 @@ func (c *Client) handlePush(code PushCode, payload []byte) {
 			c.emit(ev)
 		}
 	case PushNewAdvert:
+		// Same wire shape as a Contact record without the trailing
+		// LastMod field — parseContact stops at AdvLat/Lon so feed it
+		// directly. On older firmwares that drop fields the parse
+		// fails; we still emit the bare-pubkey form so the GUI knows
+		// something showed up.
 		if len(payload) >= 32 {
 			ev := EventAdvert{Manual: true}
 			copy(ev.PublicKey[:], payload[:32])
+			if pending, err := parsePushNewAdvert(payload); err == nil {
+				ev.Pending = &pending
+			} else {
+				c.logger().Debugw("meshcore PushNewAdvert parse failed",
+					"err", err, "len", len(payload))
+			}
 			c.emit(ev)
 		}
 	case PushPathUpdated:
@@ -266,6 +277,83 @@ func (c *Client) handlePush(code PushCode, payload []byte) {
 		copy(ev.Raw, raw)
 		if pkt, err := PacketFromBytes(raw); err == nil {
 			ev.Packet = pkt
+		}
+		c.emit(ev)
+	case PushLoginSuccess, PushLoginFail:
+		// Layout (matches meshcore.js onLoginSuccessPush):
+		//   [reserved:1][pubKeyPrefix:6]
+		// Both success and fail use the same shape; the push
+		// code itself disambiguates the outcome.
+		if len(payload) < 1+6 {
+			return
+		}
+		ev := EventLoginResult{Success: code == PushLoginSuccess}
+		copy(ev.SenderPrefix[:], payload[1:7])
+		c.emit(ev)
+	case PushStatusResponse:
+		// Layout (matches meshcore.js onStatusResponsePush):
+		//   [reserved:1][pubKeyPrefix:6][statusData:remaining]
+		// statusData for a repeater is the firmware's CompanionRadio
+		// stats struct (40 bytes). Other contact types may ship
+		// a different payload; if size doesn't match we still emit
+		// the event so the GUI can surface "raw N bytes".
+		if len(payload) < 1+6 {
+			return
+		}
+		ev := EventStatusResponse{}
+		copy(ev.SenderPrefix[:], payload[1:7])
+		raw := payload[7:]
+		ev.Raw = append([]byte(nil), raw...)
+		if stats, ok := parseRepeaterStats(raw); ok {
+			ev.Stats = stats
+			ev.StatsOK = true
+		}
+		c.emit(ev)
+	case PushTelemetryResponse:
+		// Layout (matches meshcore.js onTelemetryResponsePush):
+		//   [reserved:1][pubKeyPrefix:6][lppSensorData:remaining]
+		// pubKeyPrefix is the 6-byte addressing handle used
+		// elsewhere; caller correlates against pending requests.
+		if len(payload) < 1+6 {
+			return
+		}
+		ev := EventTelemetryResponse{}
+		copy(ev.SenderPrefix[:], payload[1:7])
+		lpp := payload[7:]
+		ev.Raw = append([]byte(nil), lpp...)
+		ev.Readings = ParseLPP(lpp)
+		c.emit(ev)
+	case PushTraceData:
+		// Layout (matches meshcore.js onTraceDataPush):
+		//   [reserved:1][pathLen:1][flags:1]
+		//   [tag:u32LE][authCode:u32LE]
+		//   [pathHashes: pathLen bytes]
+		//   [pathSNRs:   pathLen bytes, int8 quarter-dB each]
+		//   [lastSnr:    int8 quarter-dB]
+		if len(payload) < 1+1+1+4+4 {
+			return
+		}
+		pathLen := int(payload[1])
+		expected := 1 + 1 + 1 + 4 + 4 + pathLen*2 + 1
+		if len(payload) < expected {
+			return
+		}
+		flags := payload[2]
+		tag := binary.LittleEndian.Uint32(payload[3:7])
+		auth := binary.LittleEndian.Uint32(payload[7:11])
+		hashStart := 11
+		snrStart := hashStart + pathLen
+		lastSnrIdx := snrStart + pathLen
+		ev := EventTraceData{
+			Tag:        tag,
+			AuthCode:   auth,
+			Flags:      flags,
+			PathHashes: append([]byte(nil), payload[hashStart:hashStart+pathLen]...),
+			PathSNRs:   make([]float64, pathLen),
+			LastSNR:    float64(int8(payload[lastSnrIdx])) / 4,
+		}
+		for i := 0; i < pathLen; i++ {
+			ev.PathSNRs[i] = float64(int8(payload[snrStart+i])) / 4
 		}
 		c.emit(ev)
 	default:
@@ -607,6 +695,50 @@ func (c *Client) SendContactMessage(prefix PubKeyPrefix, senderTime time.Time, t
 	return res, err
 }
 
+// SendContactCliCommand sends an admin / CLI command to a
+// repeater or room-server contact, encoded as a CONTACT text
+// message with TxtType = TxtCliData. The firmware on the
+// receiving side interprets the body as a command line (e.g.
+// "reboot", "set freq 915000", repeater-specific commands).
+// Requires a prior successful CmdSendLogin for the repeater to
+// accept it; un-authed cli commands are silently rejected.
+//
+// Wire format mirrors SendContactMessage with one byte changed:
+//
+//	[CmdSendTxtMsg][TxtCliData][attempt=0][senderTime:u32LE]
+//	[prefix:6][text bytes]
+func (c *Client) SendContactCliCommand(prefix PubKeyPrefix, senderTime time.Time, text string) (SentResult, error) {
+	if len(text) > MaxTextLength {
+		return SentResult{}, ErrTextTooLong
+	}
+	payload := make([]byte, 0, 1+1+1+4+6+len(text))
+	payload = append(payload, byte(CmdSendTxtMsg))
+	payload = append(payload, byte(TxtCliData))
+	payload = append(payload, 0) // attempt
+	payload = appendUint32LE(payload, uint32(senderTime.Unix()))
+	payload = append(payload, prefix[:]...)
+	payload = append(payload, []byte(text)...)
+	var res SentResult
+	err := c.callWithTimeout(payload, func(frame Frame) (bool, error) {
+		if e := errFromFrame(frame); e != nil {
+			return true, e
+		}
+		switch ResponseCode(frame.Payload[0]) {
+		case RespSent:
+			parsed, err := parseSent(frame.Payload[1:])
+			if err != nil {
+				return true, err
+			}
+			res = parsed
+			return true, nil
+		case RespOk:
+			return true, nil
+		}
+		return false, nil
+	})
+	return res, err
+}
+
 // SendChannelMessage sends a plain text message to the given channel
 // index. The radio formats the wire payload as "name: text" so callers
 // pass the bare message body without prefixing their own name.
@@ -771,6 +903,227 @@ func (c *Client) RemoveContact(pub PubKey) error {
 	return c.callWithTimeout(payload, awaitOk)
 }
 
+// Reboot asks the firmware to reset itself. The cmd byte is
+// followed by the literal ASCII string "reboot" — a magic-word
+// guard that prevents an accidental short payload from triggering
+// a reset. The radio doesn't acknowledge before rebooting, so
+// this returns as soon as the bytes are on the wire; an
+// EventDisconnected typically follows within a couple of seconds
+// as the BLE/serial link tears down. Caller is responsible for
+// triggering reconnect after the radio comes back.
+func (c *Client) Reboot() error {
+	payload := append([]byte{byte(CmdReboot)}, []byte("reboot")...)
+	c.logger().Debugw("meshcore tx", "cmd", fmt.Sprintf("0x%02x", byte(CmdReboot)), "len", len(payload))
+	if err := c.transport.Send(payload); err != nil {
+		_ = c.transport.Close()
+		return fmt.Errorf("meshcore: reboot write: %w", err)
+	}
+	return nil
+}
+
+// ShareContact tells the radio to re-broadcast the signed advert
+// packet it cached for the given contact, flooding it over the
+// mesh as if the original sender had just re-advertised. Receivers
+// verify the embedded ed25519 signature against the embedded
+// pubkey, so the signature stays valid even though we're the ones
+// re-flooding — none of the signed fields (pubkey, timestamp,
+// appData) are mutated; only the outPath grows as the packet
+// hops. Useful for "vouching" for a peer to neighbours who
+// haven't heard them directly.
+//
+// Wire format mirrors meshcore.js sendCommandShareContact:
+// [cmd][32-byte pubkey]. Returns RespErr if the pubkey isn't in
+// the radio's contact table (the firmware needs the cached
+// advert bytes to re-broadcast).
+func (c *Client) ShareContact(pub PubKey) error {
+	payload := append([]byte{byte(CmdShareContact)}, pub[:]...)
+	return c.callWithTimeout(payload, awaitOk)
+}
+
+// SendLogin authenticates against a private repeater or room-
+// server. Reply arrives asynchronously as either
+// PushLoginSuccess (success) or PushLoginFail (wrong password /
+// not authorised) → EventLoginResult, with a SenderPrefix
+// matching pub's leading 6 bytes.
+//
+// Password is bounded at 15 characters by the firmware's frame-
+// width assumption; longer passwords get silently truncated by
+// the radio, so we truncate host-side too with a deterministic
+// cut so caller surfaces match what's actually on the wire.
+//
+// Wire format mirrors meshcore.js sendCommandSendLogin:
+//
+//	[CmdSendLogin][32-byte pubkey][password bytes ≤ 15]
+func (c *Client) SendLogin(pub PubKey, password string) (SentResult, error) {
+	const maxPasswordLen = 15
+	if len(password) > maxPasswordLen {
+		password = password[:maxPasswordLen]
+	}
+	payload := make([]byte, 0, 1+32+len(password))
+	payload = append(payload, byte(CmdSendLogin))
+	payload = append(payload, pub[:]...)
+	payload = append(payload, []byte(password)...)
+	var sent SentResult
+	err := c.callWithTimeout(payload, func(frame Frame) (bool, error) {
+		if e := errFromFrame(frame); e != nil {
+			return true, e
+		}
+		if ResponseCode(frame.Payload[0]) != RespSent {
+			return false, nil
+		}
+		s, err := parseSent(frame.Payload[1:])
+		if err != nil {
+			return true, err
+		}
+		sent = s
+		return true, nil
+	})
+	return sent, err
+}
+
+// SendStatusReq asks a repeater or room-server contact for its
+// runtime stats — battery / queue / air-time / packet counters /
+// noise floor. Reply arrives asynchronously as
+// PushStatusResponse → EventStatusResponse with a SenderPrefix
+// matching pub's leading 6 bytes; caller correlates against
+// in-flight requests via that prefix.
+//
+// Wire format mirrors meshcore.js sendCommandSendStatusReq:
+//
+//	[CmdSendStatusReq][32-byte pubkey]
+//
+// Returns the firmware's Sent ack (carries the estimated
+// round-trip budget); actual stats flow through the event
+// channel.
+func (c *Client) SendStatusReq(pub PubKey) (SentResult, error) {
+	payload := append([]byte{byte(CmdSendStatusReq)}, pub[:]...)
+	var sent SentResult
+	err := c.callWithTimeout(payload, func(frame Frame) (bool, error) {
+		if e := errFromFrame(frame); e != nil {
+			return true, e
+		}
+		if ResponseCode(frame.Payload[0]) != RespSent {
+			return false, nil
+		}
+		s, err := parseSent(frame.Payload[1:])
+		if err != nil {
+			return true, err
+		}
+		sent = s
+		return true, nil
+	})
+	return sent, err
+}
+
+// SendTelemetryReq asks a sensor node (typically AdvTypeSensor)
+// to ship its current LPP telemetry payload. Reply arrives
+// asynchronously as PushTelemetryResponse → EventTelemetryResponse
+// with a SenderPrefix that matches pub's leading 6 bytes; caller
+// uses that to correlate when multiple requests are in flight.
+//
+// Wire format mirrors meshcore.js sendCommandSendTelemetryReq:
+//
+//	[CmdSendTelemetryReq][3 reserved bytes = 0][32-byte pubkey]
+//
+// Returns the firmware's Sent ack (so the caller knows the
+// estimated round-trip budget); the actual telemetry data flows
+// through the event channel, not this return.
+func (c *Client) SendTelemetryReq(pub PubKey) (SentResult, error) {
+	payload := make([]byte, 0, 1+3+32)
+	payload = append(payload, byte(CmdSendTelemetryReq))
+	payload = append(payload, 0, 0, 0) // reserved
+	payload = append(payload, pub[:]...)
+	var sent SentResult
+	err := c.callWithTimeout(payload, func(frame Frame) (bool, error) {
+		if e := errFromFrame(frame); e != nil {
+			return true, e
+		}
+		if ResponseCode(frame.Payload[0]) != RespSent {
+			return false, nil
+		}
+		s, err := parseSent(frame.Payload[1:])
+		if err != nil {
+			return true, err
+		}
+		sent = s
+		return true, nil
+	})
+	return sent, err
+}
+
+// SendTracePath fires a trace-path request along the given path of
+// 1-byte path hashes. Each repeater along the path appends its
+// path hash + observed SNR to the response. The firmware ACKs
+// the send synchronously (estTimeoutMillis is in the Sent
+// response), then the trace results arrive asynchronously as
+// PushTraceData → EventTraceData with a matching tag.
+//
+// tag is a uint32 caller-chosen correlation ID; multiple traces
+// may be in flight at once, and the EventTraceData consumer
+// matches against this tag to find the right pending request.
+// Pass 0 for auth unless interacting with an authed repeater
+// chain.
+//
+// Wire format mirrors meshcore.js sendCommandSendTracePath:
+//
+//	[CmdSendTracePath][tag:u32LE][auth:u32LE][flags:1=0][path bytes]
+func (c *Client) SendTracePath(tag uint32, auth uint32, path []byte) (SentResult, error) {
+	payload := make([]byte, 0, 1+4+4+1+len(path))
+	payload = append(payload, byte(CmdSendTracePath))
+	payload = appendUint32LE(payload, tag)
+	payload = appendUint32LE(payload, auth)
+	payload = append(payload, 0) // flags reserved
+	payload = append(payload, path...)
+	var sent SentResult
+	err := c.callWithTimeout(payload, func(frame Frame) (bool, error) {
+		if e := errFromFrame(frame); e != nil {
+			return true, e
+		}
+		if ResponseCode(frame.Payload[0]) != RespSent {
+			return false, nil
+		}
+		s, err := parseSent(frame.Payload[1:])
+		if err != nil {
+			return true, err
+		}
+		sent = s
+		return true, nil
+	})
+	return sent, err
+}
+
+// AddUpdateContact admits a contact into the radio's persistent
+// contacts table — used to promote a pending advert (received
+// while manual-add mode was on) into a real contact the operator
+// can DM. The Contact record's fields are written verbatim:
+// caller usually populates from a previously-cached EventAdvert
+// pending payload, so type / flags / outPath / advName / lat /
+// lon / lastAdvert all survive promotion.
+//
+// Wire format mirrors meshcore.js sendCommandAddUpdateContact:
+//
+//	[cmd][32B pubkey][type:1][flags:1][outPathLen:int8]
+//	[outPath:64][advName:cstring32][lastAdvert:u32LE]
+//	[advLat:i32LE][advLon:i32LE]
+//
+// LastMod is NOT sent — the firmware stamps that itself on insert.
+func (c *Client) AddUpdateContact(ct Contact) error {
+	payload := make([]byte, 0, 1+32+1+1+1+64+32+4+4+4)
+	payload = append(payload, byte(CmdAddUpdateContact))
+	payload = append(payload, ct.PubKey[:]...)
+	payload = append(payload, byte(ct.Type))
+	payload = append(payload, ct.Flags)
+	payload = append(payload, byte(ct.OutPathLen))
+	payload = append(payload, ct.OutPath[:]...)
+	var nameBuf [32]byte
+	copy(nameBuf[:], ct.AdvName)
+	payload = append(payload, nameBuf[:]...)
+	payload = appendUint32LE(payload, uint32(ct.LastAdvert.Unix()))
+	payload = appendInt32LE(payload, ct.AdvLatE6)
+	payload = appendInt32LE(payload, ct.AdvLonE6)
+	return c.callWithTimeout(payload, awaitOk)
+}
+
 // ResetPath clears the radio's stored next-hop route for a contact.
 // DMs to that contact then re-discover the path via FLOOD on the
 // next send — useful when the cached route has gone stale (a relay
@@ -780,6 +1133,231 @@ func (c *Client) RemoveContact(pub PubKey) error {
 func (c *Client) ResetPath(pub PubKey) error {
 	payload := append([]byte{byte(CmdResetPath)}, pub[:]...)
 	return c.callWithTimeout(payload, awaitOk)
+}
+
+// SetRadioParams configures the LoRa physical layer:
+//   - freqKHz: carrier frequency in **kHz** (e.g. 915000 for 915 MHz,
+//     927875 for 927.875 MHz). NOT Hz — the firmware's wire format
+//     and selfInfo readback both use kHz; sending Hz makes the
+//     value 1000× too large and the firmware returns RespErr
+//     (ErrIllegalArg) without any further detail.
+//   - bwHz:    bandwidth in **Hz** (e.g. 125000, 250000, 500000).
+//     This one IS Hz on the wire — the asymmetry is upstream's,
+//     not ours; verified against meshcore-web's SettingsPage.vue.
+//   - sf:      spreading factor (7-12). Higher = more range, slower.
+//   - cr:      coding rate denominator (5-8 → 4/5..4/8).
+//
+// Mirrors meshcore.js sendCommandSetRadioParams. Wire format is
+// cmd byte + uint32LE freq(kHz) + uint32LE bw(Hz) + byte sf + byte cr.
+// Returns error on RespErr or transport failure.
+//
+// Mismatched radio params cause silent on-air decode failures —
+// every node on the mesh must agree on freq/bw/sf/cr to hear
+// each other. Region presets in regions.go encode the common
+// configurations the MeshCore community uses.
+func (c *Client) SetRadioParams(freqKHz, bwHz uint32, sf, cr uint8) error {
+	payload := make([]byte, 0, 1+4+4+1+1)
+	payload = append(payload, byte(CmdSetRadioParams))
+	payload = appendUint32LE(payload, freqKHz)
+	payload = appendUint32LE(payload, bwHz)
+	payload = append(payload, sf, cr)
+	return c.callWithTimeout(payload, awaitOk)
+}
+
+// SetTxPower sets the LoRa transmit power in dBm. Practical range
+// for most boards is 2-22 dBm; the firmware silently caps to the
+// SX1262/RFM95 module's hardware ceiling. Higher = louder on-air
+// but more current draw and battery cost on portable trackers.
+func (c *Client) SetTxPower(dBm uint8) error {
+	payload := []byte{byte(CmdSetTxPower), dBm}
+	return c.callWithTimeout(payload, awaitOk)
+}
+
+// GetBatteryVoltage returns the radio's current battery voltage in
+// millivolts. Wire format: cmd byte → uint16LE millivolts.
+// Returns 0 + nil error on radios that don't expose a battery
+// (mains-powered repeaters), since the firmware still answers
+// the request with a zeroed payload.
+func (c *Client) GetBatteryVoltage() (uint16, error) {
+	payload := []byte{byte(CmdGetBatteryVoltage)}
+	var mv uint16
+	err := c.callWithTimeout(payload, func(frame Frame) (bool, error) {
+		if e := errFromFrame(frame); e != nil {
+			return true, e
+		}
+		if ResponseCode(frame.Payload[0]) != RespBatteryVoltage {
+			return false, nil
+		}
+		r := newBufReader(frame.Payload[1:])
+		v, err := r.uint16LE()
+		if err != nil {
+			return true, err
+		}
+		mv = v
+		return true, nil
+	})
+	return mv, err
+}
+
+// DeviceQuery returns firmware identity (version, build date, model
+// string) as DeviceInfo. appTargetVer is the protocol version we're
+// asking the firmware to format its response for — pass
+// SupportedCompanionProtocolVersion for current behaviour.
+//
+// Wire format:
+//
+//	cmd  : [CmdDeviceQuery][appTargetVer:1]
+//	resp : [int8 firmwareVer][6B reserved][12B cstring buildDate][remaining = model]
+func (c *Client) DeviceQuery(appTargetVer byte) (DeviceInfo, error) {
+	payload := []byte{byte(CmdDeviceQuery), appTargetVer}
+	var info DeviceInfo
+	err := c.callWithTimeout(payload, func(frame Frame) (bool, error) {
+		if e := errFromFrame(frame); e != nil {
+			return true, e
+		}
+		if ResponseCode(frame.Payload[0]) != RespDeviceInfo {
+			return false, nil
+		}
+		r := newBufReader(frame.Payload[1:])
+		fwv, err := r.int8()
+		if err != nil {
+			return true, err
+		}
+		info.FirmwareVersion = fwv
+		if _, err := r.bytes(6); err != nil {
+			return true, err
+		}
+		bd, err := r.cstring(12)
+		if err != nil {
+			return true, err
+		}
+		info.FirmwareBuildDate = bd
+		info.ManufacturerModel = r.remainingString()
+		return true, nil
+	})
+	return info, err
+}
+
+// GetCoreStats returns battery + uptime + queue from
+// GetStats(Core). The firmware answers in 7 bytes:
+//
+//	uint16LE batteryMilliVolts
+//	uint32LE uptimeSecs
+//	uint8    queueLen (pending TX packets)
+func (c *Client) GetCoreStats() (CoreStats, error) {
+	var s CoreStats
+	err := c.getStats(StatsTypeCore, func(r *bufReader) error {
+		mv, err := r.uint16LE()
+		if err != nil {
+			return err
+		}
+		s.BatteryMilliVolts = mv
+		up, err := r.uint32LE()
+		if err != nil {
+			return err
+		}
+		s.UptimeSecs = up
+		q, err := r.byte_()
+		if err != nil {
+			return err
+		}
+		s.QueueLen = q
+		return nil
+	})
+	return s, err
+}
+
+// GetRadioStats returns noise/RSSI/SNR + air-seconds from
+// GetStats(Radio). The firmware reports lastSnr as int8 quarter-dB;
+// we divide by 4 to dB before exposing.
+func (c *Client) GetRadioStats() (RadioStats, error) {
+	var s RadioStats
+	err := c.getStats(StatsTypeRadio, func(r *bufReader) error {
+		nf, err := r.int16LE()
+		if err != nil {
+			return err
+		}
+		s.NoiseFloor = nf
+		rssi, err := r.int8()
+		if err != nil {
+			return err
+		}
+		s.LastRSSI = rssi
+		snr, err := r.int8()
+		if err != nil {
+			return err
+		}
+		s.LastSNR = float64(snr) / 4
+		tx, err := r.uint32LE()
+		if err != nil {
+			return err
+		}
+		s.TxAirSecs = tx
+		rx, err := r.uint32LE()
+		if err != nil {
+			return err
+		}
+		s.RxAirSecs = rx
+		return nil
+	})
+	return s, err
+}
+
+// GetPacketStats returns the cumulative-since-boot packet counters
+// from GetStats(Packets). NRecvErrors is optional in older firmware
+// — HasRecvErrs distinguishes "zero errors" from "field not present".
+func (c *Client) GetPacketStats() (PacketStats, error) {
+	var s PacketStats
+	err := c.getStats(StatsTypePackets, func(r *bufReader) error {
+		fields := []*uint32{
+			&s.Recv, &s.Sent,
+			&s.NSentFlood, &s.NSentDirect,
+			&s.NRecvFlood, &s.NRecvDirect,
+		}
+		for _, f := range fields {
+			v, err := r.uint32LE()
+			if err != nil {
+				return err
+			}
+			*f = v
+		}
+		// Optional trailing field — present in newer firmware.
+		if r.i+4 <= len(r.b) {
+			v, err := r.uint32LE()
+			if err == nil {
+				s.NRecvErrors = v
+				s.HasRecvErrs = true
+			}
+		}
+		return nil
+	})
+	return s, err
+}
+
+// getStats is the shared call/parse skeleton for GetStatsCore /
+// Radio / Packets — the type byte echoes back as the first byte of
+// the response and the variable parser handles the rest.
+func (c *Client) getStats(t StatsType, parse func(*bufReader) error) error {
+	payload := []byte{byte(CmdGetStats), byte(t)}
+	return c.callWithTimeout(payload, func(frame Frame) (bool, error) {
+		if e := errFromFrame(frame); e != nil {
+			return true, e
+		}
+		if ResponseCode(frame.Payload[0]) != RespStats {
+			return false, nil
+		}
+		r := newBufReader(frame.Payload[1:])
+		gotType, err := r.byte_()
+		if err != nil {
+			return true, err
+		}
+		// Multiple GetStats may be in flight; ignore responses for
+		// other types so the caller's match is precise.
+		if StatsType(gotType) != t {
+			return false, nil
+		}
+		return true, parse(r)
+	})
 }
 
 // SetManualAddContacts toggles the firmware's auto-add-contacts
@@ -873,7 +1451,7 @@ func parseSelfInfo(b []byte) (SelfInfo, error) {
 	if info.ManualAddContacts, err = r.byte_(); err != nil {
 		return info, err
 	}
-	if info.RadioFreqHz, err = r.uint32LE(); err != nil {
+	if info.RadioFreqKHz, err = r.uint32LE(); err != nil {
 		return info, err
 	}
 	if info.RadioBwHz, err = r.uint32LE(); err != nil {
@@ -939,6 +1517,17 @@ func parseContact(b []byte) (Contact, error) {
 	return ct, nil
 }
 
+// parsePushNewAdvert reads a PushNewAdvert payload — same layout as
+// a Contact record (pubkey, type, flags, outPath, name, lastAdvert,
+// lat, lon, lastMod). Mirrors meshcore.js onNewAdvertPush. Reused
+// here for the manual-mode "I saw an advert but didn't admit it"
+// flow so the GUI gets the rich Contact-shaped record without
+// having to re-fetch the contacts table (which doesn't include
+// pending entries by definition).
+func parsePushNewAdvert(b []byte) (Contact, error) {
+	return parseContact(b)
+}
+
 func parseChannelInfo(b []byte) (Channel, error) {
 	r := newBufReader(b)
 	idx, err := r.byte_()
@@ -975,6 +1564,71 @@ func parseSent(b []byte) (SentResult, error) {
 		return s, err
 	}
 	return s, nil
+}
+
+// parseRepeaterStats decodes a 40-byte CompanionRadio stats block
+// out of a PushStatusResponse payload. Field layout matches the
+// firmware struct in meshcore-dev/MeshCore (read by meshcore.js's
+// inline parser at sendStatusReq → onStatusResponsePush). Returns
+// ok=false when the payload is shorter than expected so the
+// caller can fall back to surfacing raw bytes.
+func parseRepeaterStats(b []byte) (RepeaterStats, bool) {
+	const wantLen = 2 + 2 + 2 + 2 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 2 + 2 + 2 + 2
+	if len(b) < wantLen {
+		return RepeaterStats{}, false
+	}
+	r := newBufReader(b)
+	var s RepeaterStats
+	var err error
+	if s.BatteryMilliVolts, err = r.uint16LE(); err != nil {
+		return s, false
+	}
+	if s.TxQueueLen, err = r.uint16LE(); err != nil {
+		return s, false
+	}
+	if s.NoiseFloor, err = r.int16LE(); err != nil {
+		return s, false
+	}
+	if s.LastRSSI, err = r.int16LE(); err != nil {
+		return s, false
+	}
+	if s.PacketsRecv, err = r.uint32LE(); err != nil {
+		return s, false
+	}
+	if s.PacketsSent, err = r.uint32LE(); err != nil {
+		return s, false
+	}
+	if s.TotalAirTimeSecs, err = r.uint32LE(); err != nil {
+		return s, false
+	}
+	if s.TotalUpTimeSecs, err = r.uint32LE(); err != nil {
+		return s, false
+	}
+	if s.NSentFlood, err = r.uint32LE(); err != nil {
+		return s, false
+	}
+	if s.NSentDirect, err = r.uint32LE(); err != nil {
+		return s, false
+	}
+	if s.NRecvFlood, err = r.uint32LE(); err != nil {
+		return s, false
+	}
+	if s.NRecvDirect, err = r.uint32LE(); err != nil {
+		return s, false
+	}
+	if s.ErrEvents, err = r.uint16LE(); err != nil {
+		return s, false
+	}
+	if s.LastSNR, err = r.int16LE(); err != nil {
+		return s, false
+	}
+	if s.NDirectDups, err = r.uint16LE(); err != nil {
+		return s, false
+	}
+	if s.NFloodDups, err = r.uint16LE(); err != nil {
+		return s, false
+	}
+	return s, true
 }
 
 func parseContactMsg(b []byte) (ContactMessage, error) {
@@ -1106,6 +1760,16 @@ func (r *bufReader) uint32LE() (uint32, error) {
 func (r *bufReader) int32LE() (int32, error) {
 	v, err := r.uint32LE()
 	return int32(v), err
+}
+
+func (r *bufReader) int16LE() (int16, error) {
+	v, err := r.uint16LE()
+	return int16(v), err
+}
+
+func (r *bufReader) int8() (int8, error) {
+	v, err := r.byte_()
+	return int8(v), err
 }
 
 // cstring reads a null-terminated string laid out in a fixed-size

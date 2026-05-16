@@ -42,3 +42,25 @@ func ChannelHash(secret [16]byte) byte {
 	sum := sha256.Sum256(secret[:])
 	return sum[0]
 }
+
+// ChannelIdentity returns a stable per-channel identifier derived
+// from the shared secret — the first 8 bytes of SHA-256(secret),
+// hex-encoded (16 chars). Same secret = same identity regardless
+// of which slot the firmware happens to store it in, so callers
+// keying persistent state (chat history, unread counters) by this
+// instead of the slot index avoid the "wipe NVRAM, re-add channel
+// in slot 0, see previous slot 0 occupant's history" bug.
+//
+// Hashing rather than using the secret bytes directly keeps the
+// AES-128 key out of any plaintext storage that's keyed on this
+// identifier (bbolt keys, log lines, etc.).
+func ChannelIdentity(secret [16]byte) string {
+	sum := sha256.Sum256(secret[:])
+	const hex = "0123456789abcdef"
+	out := make([]byte, 16)
+	for i := 0; i < 8; i++ {
+		out[2*i] = hex[sum[i]>>4]
+		out[2*i+1] = hex[sum[i]&0x0f]
+	}
+	return string(out)
+}

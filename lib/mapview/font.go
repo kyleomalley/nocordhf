@@ -6,7 +6,13 @@ package mapview
 // glyphs maps ASCII characters to a 5-column × 7-row bitmap.
 // Each uint8 in the inner array is one row; bits 4..0 are the 5 columns (MSB left).
 var glyphs = map[byte][7]uint8{
-	'0': {0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110},
+	// Dotted zero: a single center pixel inside an otherwise plain
+	// oval. Ambiguity-killer for the 0/O case at 5×7 — the previous
+	// design tried a diagonal staircase (rows 2-4) but at this size
+	// the staircase fights the oval contour and reads as noise.
+	// A single in-center pixel is unmistakable: O is hollow, 0 has
+	// a dot. Same convention used by Source Code Pro / Plan 9.
+	'0': {0b01110, 0b10001, 0b10001, 0b10101, 0b10001, 0b10001, 0b01110},
 	'1': {0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110},
 	'2': {0b01110, 0b10001, 0b00001, 0b00110, 0b01000, 0b10000, 0b11111},
 	'3': {0b11111, 0b00010, 0b00100, 0b00010, 0b00001, 0b10001, 0b01110},

@@ -512,6 +512,11 @@ func runTX(
 	// audio finishes the row flips fully green.
 	g.AppendTxEcho(displayMsg)
 	log.Infow("TX start", "msg", displayMsg)
+	// Capture the pre-TX RX peak so the post-TX splatter check
+	// (kicked off after Unmute below) has a baseline to compare
+	// against. Samples a short window so a momentary CW dot or
+	// noise burst doesn't bias the baseline.
+	preTxBaseline := samplePeakAvg(capturer, 4, 60*time.Millisecond)
 	capturer.Mute()
 	defer capturer.Unmute()
 
@@ -557,6 +562,63 @@ func runTX(
 	// will mark it complete once it sees txStart + txAudioDuration
 	// elapsed, so we don't append a duplicate here.
 	g.AppendSystem("TX done. " + peakNote)
+
+	// Splatter / RFI sanity check. Compare the RX noise floor right
+	// after our TX to the pre-TX baseline. A persistent +6 dB jump
+	// after the radio's AGC has had a second to recover usually
+	// means: residual RFI from our shack (USB cable picking up our
+	// own RF, ground loop), thermal IMD that lingered after the PA
+	// cooled, or a noise source that just happened to start at
+	// the same time. False positives are possible (band conditions
+	// shift); the warning suggests checks rather than asserting a
+	// fault.
+	go monitorPostTxNoise(capturer, g, preTxBaseline)
+}
+
+// samplePeakAvg averages capturer.RXPeak() over n polls separated by
+// gap. Returns the linear (not dB) average peak amplitude. Used as
+// the baseline for the post-TX splatter check; a single sample
+// would catch noise-burst outliers and bias the comparison.
+func samplePeakAvg(c *audio.Capturer, n int, gap time.Duration) float32 {
+	if c == nil || n <= 0 {
+		return 0
+	}
+	var sum float32
+	for i := 0; i < n; i++ {
+		sum += c.RXPeak()
+		if i < n-1 {
+			time.Sleep(gap)
+		}
+	}
+	return sum / float32(n)
+}
+
+// monitorPostTxNoise samples the RX peak ~1 s after Unmute (gives
+// the radio time to switch back to RX and AGC to recover from the
+// transmit blanking) and compares to pre. Threshold is a 2× linear
+// ratio (~+6 dB) plus an absolute floor so two near-zero baselines
+// can't trigger a false positive on a quiet band.
+func monitorPostTxNoise(c *audio.Capturer, g *nocord.GUI, pre float32) {
+	if c == nil || g == nil {
+		return
+	}
+	time.Sleep(1 * time.Second)
+	post := samplePeakAvg(c, 5, 80*time.Millisecond)
+	const (
+		ratioThreshold = 2.0   // +6 dB
+		minFloor       = 0.005 // ~ -46 dBFS — silence below this
+	)
+	if pre <= 0 || post <= 0 || post < minFloor {
+		return
+	}
+	if float64(post/pre) < ratioThreshold {
+		return
+	}
+	dB := 20 * math.Log10(float64(post/pre))
+	g.AppendSystem(fmt.Sprintf(
+		"⚠ post-TX noise floor +%.1f dB (was %.3f → now %.3f) — possible RFI back into shack, PA thermal IMD, or coincidental band noise; check ferrites on USB / coax",
+		dB, pre, post,
+	))
 }
 
 // pttOffWithRetry keeps attempting PTTOff until it succeeds or 10s elapses.
