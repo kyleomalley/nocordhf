@@ -3359,7 +3359,8 @@ Retries up to 4 times, 30 seconds apart, if they don't respond.
 	rt.Wrapping = fyne.TextWrapWord
 	scroll := container.NewScroll(rt)
 	scroll.SetMinSize(fyne.NewSize(600, 620))
-	dialog.ShowCustom("NocordHF — chat reference", "Close", scroll, g.window)
+	body := container.NewBorder(nil, g.diagnosticBundleBar(), nil, nil, scroll)
+	dialog.ShowCustom("NocordHF — chat reference", "Close", body, g.window)
 }
 
 // showMcLocationPicker opens a modal with a fresh MapWidget so the
@@ -3504,7 +3505,43 @@ indicators are hidden — irrelevant here.
 	rt.Wrapping = fyne.TextWrapWord
 	scroll := container.NewScroll(rt)
 	scroll.SetMinSize(fyne.NewSize(620, 640))
-	dialog.ShowCustom("NocordHF — MeshCore reference", "Close", scroll, g.window)
+	body := container.NewBorder(nil, g.diagnosticBundleBar(), nil, nil, scroll)
+	dialog.ShowCustom("NocordHF — MeshCore reference", "Close", body, g.window)
+}
+
+// diagnosticBundleBar returns the small footer row that lets the
+// operator save a zip of recent logs + sanitised prefs for bug
+// reports. Placed at the bottom of both chat-help dialogs so it
+// rides along with the (?) icon — the natural "help" surface
+// already in front of the operator when something's gone wrong.
+func (g *GUI) diagnosticBundleBar() fyne.CanvasObject {
+	includeHistoryChk := widget.NewCheck("Include chat history (bbolt)", nil)
+	includeRecordingsChk := widget.NewCheck("Include recent TX recordings (~3× WAV)", nil)
+	saveBtn := widget.NewButtonWithIcon("Save diagnostic bundle…", theme.DownloadIcon(), func() {
+		opts := DiagnosticOptions{
+			IncludeChatHistory: includeHistoryChk.Checked,
+			IncludeRecordings:  includeRecordingsChk.Checked,
+		}
+		dialog.ShowFileSave(func(uc fyne.URIWriteCloser, err error) {
+			if err != nil || uc == nil {
+				return
+			}
+			path := uc.URI().Path()
+			_ = uc.Close()
+			go func() {
+				if err := saveDiagnosticBundle(path, opts); err != nil {
+					g.AppendSystem("diag bundle: " + err.Error())
+					return
+				}
+				g.AppendSystem("diag bundle saved: " + path)
+			}()
+		}, g.window)
+	})
+	hint := wrappedLabel("Bundle: log tail (last 2 MB) + runtime info + prefs (passwords / device names redacted). Tick the boxes ONLY if the recipient needs them — chat history and recordings carry operator-private content.")
+	return container.NewVBox(
+		container.NewHBox(saveBtn, includeHistoryChk, includeRecordingsChk),
+		hint,
+	)
 }
 
 // showCallContextMenu opens a small popup menu at the given canvas
