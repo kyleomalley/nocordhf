@@ -5288,6 +5288,11 @@ func (g *GUI) buildLayout() fyne.CanvasObject {
 			}
 			rowIsCQ := !e.lastCQ.IsZero() && time.Since(e.lastCQ) <= 60*time.Second
 			h.onSecondary = func(pos fyne.Position) {
+				if logging.L != nil {
+					logging.L.Debugw("HEARD row onSecondary fired",
+						"call", call, "rowIsCQ", rowIsCQ,
+						"pos_x", pos.X, "pos_y", pos.Y)
+				}
 				g.showCallContextMenu(call, rowIsCQ, pos)
 			}
 			// Left-click → forward to the List's selection so
@@ -5296,6 +5301,10 @@ func (g *GUI) buildLayout() fyne.CanvasObject {
 			// hoverRow's SecondaryTappable impl stops bubbling all
 			// pointer events to the parent List.
 			h.onTap = func() {
+				if logging.L != nil {
+					logging.L.Debugw("HEARD row onTap fired",
+						"call", call, "listIdx", h.listIdx)
+				}
 				g.usersList.Select(h.listIdx)
 			}
 			// Clear flag-slot handlers — the row-level hover above
