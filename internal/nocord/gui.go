@@ -10247,6 +10247,23 @@ var _ fyne.SecondaryTappable = (*hoverRow)(nil)
 var _ fyne.Tappable = (*hoverRow)(nil)
 
 func (h *hoverRow) TappedSecondary(ev *fyne.PointEvent) {
+	// Diagnostic instrumentation: log every secondary-tap that
+	// reaches the widget so we can confirm Fyne is actually
+	// dispatching the event. If a right-click on the HEARD list
+	// doesn't show up here, the OS-level secondary-click isn't
+	// reaching Fyne (System Settings → Mouse / Trackpad). If it
+	// shows up with hasHandler=false, the row binder forgot to
+	// wire onSecondary for this row.
+	if logging.L != nil {
+		logging.L.Debugw("hoverRow.TappedSecondary",
+			"abs_x", ev.AbsolutePosition.X,
+			"abs_y", ev.AbsolutePosition.Y,
+			"local_x", ev.Position.X,
+			"local_y", ev.Position.Y,
+			"listIdx", h.listIdx,
+			"hasHandler", h.onSecondary != nil,
+		)
+	}
 	if h.onSecondary != nil {
 		h.onSecondary(ev.AbsolutePosition)
 	}
@@ -10262,6 +10279,17 @@ func (h *hoverRow) TappedSecondary(ev *fyne.PointEvent) {
 // list rows). If onTap is nil the click is silently dropped — fine
 // for chat rows where selection is irrelevant.
 func (h *hoverRow) Tapped(*fyne.PointEvent) {
+	// Parallel diagnostic to TappedSecondary above — comparing
+	// hit-counts of the two in the log tells us whether Fyne
+	// is dispatching primary but not secondary taps to this
+	// widget. If only Tapped fires on a right-click, the OS or
+	// Fyne is rewriting the secondary into a primary somewhere.
+	if logging.L != nil {
+		logging.L.Debugw("hoverRow.Tapped",
+			"listIdx", h.listIdx,
+			"hasHandler", h.onTap != nil,
+		)
+	}
 	if h.onTap != nil {
 		h.onTap()
 	}
