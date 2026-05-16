@@ -372,6 +372,14 @@ type GUI struct {
 	mcAutoAddByType map[meshcore.AdvType]bool
 	mcStatusText    *canvas.Text
 	mcCurrentThread string
+	// mcBackStack records the trail of thread IDs the operator has
+	// visited so the back navigation (Cmd+[ / middle-click) can
+	// pop one off and switch to it. Pushed by mcSwitchThread when
+	// recordHistory=true; popped + replayed by mcGoBack without
+	// pushing again. Bounded informally — the stack only grows
+	// while the operator is actively jumping between threads, and
+	// even a busy session rarely exceeds a few dozen entries.
+	mcBackStack     []string
 	mcThreadHistory map[string][]chatRow
 	// mcContactsSortBy is the sidebar sort mode chosen via the
 	// CONTACTS header menu (Recent / Name / Type). Persists in
@@ -634,6 +642,21 @@ func NewGUI(a fyne.App, buildID string, txCh chan TxRequest, tuneCh chan uint64)
 				return
 			}
 			g.removeSelectedMcContact()
+		case fyne.KeyLeftBracket:
+			// Browser-style back navigation in MeshCore mode —
+			// pop the previous thread off the back stack and
+			// switch to it. Only fires at canvas level (i.e.
+			// nothing's focused), so typing `[` into the chat
+			// input still works normally.
+			if focused := g.window.Canvas().Focused(); focused != nil {
+				return
+			}
+			g.mu.Lock()
+			isMc := g.activeMode == "meshcore"
+			g.mu.Unlock()
+			if isMc {
+				g.mcGoBack()
+			}
 		}
 	})
 	return g
@@ -5361,7 +5384,20 @@ func (g *GUI) buildLayout() fyne.CanvasObject {
 	// the neighbouring HSplit pane.
 	g.usersCol = container.New(&fixedWidthLayout{width: 170}, g.usersInner)
 
-	chatCenter := container.NewBorder(headerStack, inputStack, nil, nil, g.chatList)
+	// Wrap the chat list in a Mouseable shim so middle-click
+	// (mouse "back" on 5-button mice often maps to button 3)
+	// fires mcGoBack. Keyboard shortcut Cmd/Ctrl+[ also works;
+	// the mouse path is the more natural reach when you've
+	// just clicked into a DM from somewhere.
+	chatWithBack := newMiddleClickBackWrapper(g.chatList, func() {
+		g.mu.Lock()
+		isMc := g.activeMode == "meshcore"
+		g.mu.Unlock()
+		if isMc {
+			g.mcGoBack()
+		}
+	})
+	chatCenter := container.NewBorder(headerStack, inputStack, nil, nil, chatWithBack)
 	chatCol := container.NewBorder(nil, nil, nil, g.usersCol, chatCenter)
 	chatBg := canvas.NewRectangle(color.RGBA{40, 43, 48, 255})
 	chatColStack := container.NewStack(chatBg, chatCol)
@@ -6083,6 +6119,50 @@ func (t *tappableContainer) Tapped(_ *fyne.PointEvent) {
 		t.onTap()
 	}
 }
+
+// middleClickBackWrapper wraps any CanvasObject so MouseButtonTertiary
+// (the standard middle-click; many 5-button mice route their "back"
+// side button through it) fires onBack. Other mouse buttons /
+// scroll / hover pass through to the wrapped child untouched
+// because the wrapper isn't a Tappable / Scrollable / Hoverable —
+// only desktop.Mouseable's MouseDown is implemented, and primary
+// + secondary clicks are forwarded to the child via Fyne's normal
+// event routing (the wrapper doesn't claim them).
+//
+// Wraps the chat list in MeshCore mode so right after clicking
+// into a DM from a channel HEARD entry, the operator can middle-
+// click anywhere in the chat area to bounce back to the channel.
+type middleClickBackWrapper struct {
+	widget.BaseWidget
+	content fyne.CanvasObject
+	onBack  func()
+}
+
+func newMiddleClickBackWrapper(content fyne.CanvasObject, onBack func()) *middleClickBackWrapper {
+	w := &middleClickBackWrapper{content: content, onBack: onBack}
+	w.ExtendBaseWidget(w)
+	return w
+}
+
+func (w *middleClickBackWrapper) CreateRenderer() fyne.WidgetRenderer {
+	return widget.NewSimpleRenderer(w.content)
+}
+
+// MouseDown fires for any pointer button press on the wrapper.
+// We only care about the middle button; primary + secondary
+// propagate to children naturally via the renderer.
+func (w *middleClickBackWrapper) MouseDown(ev *desktop.MouseEvent) {
+	if ev.Button == desktop.MouseButtonTertiary && w.onBack != nil {
+		w.onBack()
+	}
+}
+
+// MouseUp is part of the desktop.Mouseable interface contract;
+// we don't need to act on release but the method must exist for
+// the interface assertion to succeed.
+func (w *middleClickBackWrapper) MouseUp(_ *desktop.MouseEvent) {}
+
+var _ desktop.Mouseable = (*middleClickBackWrapper)(nil)
 
 // circleBadge renders a colored circle with up to a few characters of
 // text inside it — used as a visual marker in the HEARD roster + on
@@ -7013,8 +7093,35 @@ func (g *GUI) mcSetStatus(msg string) {
 // mcSwitchThread snapshots the current g.rows into mcThreadHistory
 // (under the previous thread key) and swaps in the requested thread's
 // buffer. Empty buffer if the thread has no history yet. Repaints the
-// chat list and the topic bar.
+// chat list and the topic bar. Records the previous thread on the
+// back stack so mcGoBack can replay it (push the operator's
+// navigation trail).
 func (g *GUI) mcSwitchThread(newThread string) {
+	g.mcSwitchThreadInternal(newThread, true)
+}
+
+// mcGoBack pops the most-recent prior thread from the back stack
+// and switches to it without re-pushing — so chained backs walk
+// the stack rather than oscillating between the same two threads.
+// No-op when the stack is empty (caller's been on one thread the
+// whole session or has already walked back to the start).
+func (g *GUI) mcGoBack() {
+	g.mu.Lock()
+	if len(g.mcBackStack) == 0 {
+		g.mu.Unlock()
+		return
+	}
+	prev := g.mcBackStack[len(g.mcBackStack)-1]
+	g.mcBackStack = g.mcBackStack[:len(g.mcBackStack)-1]
+	g.mu.Unlock()
+	g.mcSwitchThreadInternal(prev, false)
+}
+
+// mcSwitchThreadInternal is the shared body. recordHistory=true
+// pushes the outgoing thread onto mcBackStack so the operator can
+// undo this navigation; mcGoBack calls with false to avoid the
+// "back to back" loop.
+func (g *GUI) mcSwitchThreadInternal(newThread string, recordHistory bool) {
 	g.mu.Lock()
 	prev := g.mcCurrentThread
 	if prev == newThread {
@@ -7030,6 +7137,9 @@ func (g *GUI) mcSwitchThread(newThread string) {
 		snap := make([]chatRow, len(g.rows))
 		copy(snap, g.rows)
 		g.mcThreadHistory[prev] = snap
+		if recordHistory {
+			g.mcBackStack = append(g.mcBackStack, prev)
+		}
 	}
 	g.mcCurrentThread = newThread
 	hist := g.mcThreadHistory[newThread]
