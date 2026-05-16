@@ -1708,10 +1708,18 @@ func (g *GUI) showMeshcoreSettings() {
 	pickMapBtn := widget.NewButton("Pick on map…", func() {
 		g.showMcLocationPicker(latEntry, lonEntry, profileStatus)
 	})
+	// Tracker re-advert interval (minutes). 0 disables. Tracker
+	// radios (T1000-E etc.) move faster than the firmware's
+	// default auto-advert cycle, so peers benefit from a more
+	// frequent re-advert. Stationary radios should leave this at 0.
+	trackerAdvertEntry := widget.NewEntry()
+	trackerAdvertEntry.SetPlaceHolder("minutes (0 = disabled)")
+	trackerAdvertEntry.SetText(strconv.Itoa(prefs.IntWithFallback(mcPrefTrackerAdvertMin, 0)))
 	profileForm := widget.NewForm(
 		widget.NewFormItem("Name", nameEntry),
 		widget.NewFormItem("Latitude", latEntry),
 		widget.NewFormItem("Longitude", lonEntry),
+		widget.NewFormItem("Tracker re-advert (min)", trackerAdvertEntry),
 	)
 	autoAddBox := container.NewVBox(
 		widget.NewLabelWithStyle("Auto-add new contacts by type:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
@@ -1937,6 +1945,15 @@ func (g *GUI) showMeshcoreSettings() {
 			lonF, _ := strconv.ParseFloat(strings.TrimSpace(lonEntry.Text), 64)
 			prefs.SetFloat(mcPrefProfileLat, latF)
 			prefs.SetFloat(mcPrefProfileLon, lonF)
+			// Tracker re-advert interval — clamp negatives to 0
+			// (disabled) so a typo can't put the radio into a
+			// pathological super-frequent advert loop. Change
+			// takes effect on next connect since the watcher
+			// reads the pref at startup; the operator can also
+			// click Disconnect + Reconnect to re-arm.
+			if v, err := strconv.Atoi(strings.TrimSpace(trackerAdvertEntry.Text)); err == nil && v >= 0 {
+				prefs.SetInt(mcPrefTrackerAdvertMin, v)
+			}
 			// Persist per-type auto-add prefs and refresh the
 			// in-memory map. The radio is always kept in manual
 			// mode below; these prefs decide host-side promotion.
@@ -6258,6 +6275,15 @@ const (
 	// common case where reconnect is needed.
 	mcPrefAutoReconnectMin    = "meshcore.auto_reconnect_minutes"
 	mcDefaultAutoReconnectMin = 5
+	// Periodic self-advert ("tracker re-advert") — fires
+	// SendSelfAdvert(Flood) every N minutes while a client is
+	// connected. 0 disables (the firmware's own auto-advert
+	// cycle stays in effect, typically every few hours). Useful
+	// for trackers (T1000-E and similar) where peers should see
+	// fresh GPS position more often than the firmware default.
+	// For stationary radios leave at 0 — repeated adverts waste
+	// air time without changing what peers know about you.
+	mcPrefTrackerAdvertMin = "meshcore.tracker.advert_interval_min"
 )
 
 // MeshCore transport identifiers as persisted in mcPrefTransport.
@@ -10176,6 +10202,7 @@ func (g *GUI) connectMeshcore() {
 		g.mcAppendSystem(fmt.Sprintf("connected: %s (%d contacts, %d channels)", info.Name, len(contacts), len(channels)))
 		go g.runMeshcoreEvents(client)
 		go g.runMeshcoreBatteryWatch(client)
+		go g.runMeshcoreTrackerAdvert(client)
 	}()
 }
 

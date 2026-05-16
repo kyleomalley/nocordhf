@@ -146,6 +146,45 @@ func (g *GUI) scheduleMcAutoReconnect() {
 	g.mcAppendSystem(fmt.Sprintf("link dropped — auto-reconnect in %d min (Settings → MeshCore to change)", mins))
 }
 
+// runMeshcoreTrackerAdvert fires SendSelfAdvert(Flood) at the
+// operator-configured interval while client remains the live
+// session. Intended for trackers / portable radios that move
+// faster than the firmware's own auto-advert cycle, so peers
+// see fresh GPS position promptly. 0 (the default) disables —
+// stationary radios shouldn't re-advert on a schedule.
+//
+// Self-exits when the client changes (operator reconnect /
+// disconnect) so multiple connect-disconnect cycles don't
+// accumulate stray tickers.
+func (g *GUI) runMeshcoreTrackerAdvert(client *meshcore.Client) {
+	if g.app == nil {
+		return
+	}
+	mins := g.app.Preferences().IntWithFallback(mcPrefTrackerAdvertMin, 0)
+	if mins <= 0 {
+		return
+	}
+	g.mcAppendSystem(fmt.Sprintf("tracker re-advert: every %d min", mins))
+	t := time.NewTicker(time.Duration(mins) * time.Minute)
+	defer t.Stop()
+	for range t.C {
+		g.mcMu.Lock()
+		current := g.mcClient
+		g.mcMu.Unlock()
+		if current != client {
+			return
+		}
+		if err := client.SendSelfAdvert(meshcore.SelfAdvertFlood); err != nil {
+			g.mcAppendSystem("tracker re-advert: " + err.Error())
+			// Don't bail on transient errors; the firmware's BLE
+			// link can hiccup briefly under load. Next tick tries
+			// again. If the client itself goes away the
+			// current-client check above will exit cleanly.
+			continue
+		}
+	}
+}
+
 // runMeshcoreClockSync re-issues SetDeviceTime once an hour while
 // the supplied client is still the active one. Long-running
 // sessions whose device clock drifts ahead of wall-clock would
