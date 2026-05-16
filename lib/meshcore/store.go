@@ -42,6 +42,16 @@ type StoredMessage struct {
 	// rows where the matching RxLog frame was missed.
 	PathLen byte   `json:"plen,omitempty"`
 	Path    []byte `json:"path,omitempty"`
+	// Header is the raw Packet.Header byte captured alongside the
+	// path. Carries RouteType in bits 0-1 (FLOOD vs DIRECT vs
+	// TRANSPORT_*) — load-bearing because Path bytes mean different
+	// things by route: FLOOD packets accumulate each forwarder's hash
+	// (true on-air route), DIRECT packets carry the SENDER's stored
+	// OutPath (which can be asymmetric to the reverse path). Without
+	// this byte the operator can't tell why a 4-hop ack might come
+	// back via a 1-byte Path stamp — it's the same physical mesh just
+	// with two routing modes producing two Path semantics.
+	Header byte `json:"hdr,omitempty"`
 }
 
 // Store is the persistent message-history backing for a Client.

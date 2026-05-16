@@ -165,6 +165,15 @@ type chatRow struct {
 	// correlation could be made (radio relaunched, ring rolled).
 	mcPathLen byte
 	mcPath    []byte
+	// mcHeader is the raw Packet.Header byte captured alongside
+	// mcPath. RouteType lives in bits 0-1 (FLOOD / DIRECT /
+	// TRANSPORT_FLOOD / TRANSPORT_DIRECT). Persisted so a chat
+	// row's Info dialog can explain WHY a 1-hop Path sometimes
+	// shows up on a route that physically traverses many more
+	// hops — DIRECT packets stamp the SENDER's stored OutPath
+	// rather than accumulating per-forwarder hashes like FLOOD,
+	// and that OutPath can be asymmetric to the reverse direction.
+	mcHeader byte
 }
 
 // MeshCore delivery-state values for chatRow.mcDelivery.
@@ -5858,29 +5867,45 @@ func formatRowSegments(r chatRow) (ts, meta, msg string) {
 	}
 	if r.system {
 		if r.mc {
-			return "[" + r.when.UTC().Format("15:04:05") + "]", "", r.text
+			return "[" + r.when.UTC().Format("15:04:05") + "]", "", flattenForChatLine(r.text)
 		}
-		return "", "", fmt.Sprintf("* %s", r.text)
+		return "", "", fmt.Sprintf("* %s", flattenForChatLine(r.text))
 	}
 	t := r.when.UTC().Format("15:04:05")
 	if r.mc {
 		// Cell contents are populated by the bind callback;
 		// return ts only so the timestamp still renders.
-		return "[" + t + "]", "", r.text
+		return "[" + t + "]", "", flattenForChatLine(r.text)
 	}
 	if r.tx {
-		return t, " TX> ", r.text
+		return t, " TX> ", flattenForChatLine(r.text)
 	}
 	region := r.region
 	if region == "" {
 		region = "-"
 	}
 	meta = fmt.Sprintf(" %+3.0f dB  %-7s ", r.snrDB, region)
-	msg = r.text
+	msg = flattenForChatLine(r.text)
 	if r.method != "" {
 		msg += " ~" + r.method
 	}
 	return t, meta, msg
+}
+
+// flattenForChatLine collapses a multi-line message body into one
+// renderable line. Fyne's canvas.Text is single-line and falls
+// through to the missing-glyph (◊) for any \n / \r, so a bot
+// broadcasting a 4-line status block ends up as one run of
+// diamond separators. Replacing the newlines with " · " keeps the
+// content readable in the chat row while the unmodified text is
+// still available in Info / chatRow.text for copy + paste.
+func flattenForChatLine(s string) string {
+	if !strings.ContainsAny(s, "\r\n") {
+		return s
+	}
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	return strings.ReplaceAll(s, "\n", " · ")
 }
 
 // formatMcSnrCell renders the SNR cell for a MeshCore chat row.
@@ -8365,10 +8390,21 @@ func (g *GUI) showMcChatRowContextMenu(r chatRow, absPos fyne.Position) {
 	if logging.L != nil {
 		logging.L.Debugw("showMcChatRowContextMenu enter", "system", r.system, "tx", r.tx)
 	}
-	menu := fyne.NewMenu("",
+	items := []*fyne.MenuItem{
 		fyne.NewMenuItem("Info", func() { g.showMcChatRowInfo(r) }),
 		fyne.NewMenuItem("Map Trace", func() { g.showMcChatRowMapTrace(r) }),
-	)
+	}
+	// "Send Signal Report" only makes sense for inbound rows with a
+	// known sender — it reports what we heard from THEM. Skip TX,
+	// system, separator, and unattributable rows so the menu stays
+	// uncluttered for cases the action wouldn't do anything useful.
+	if !r.tx && !r.system && !r.separator && strings.TrimSpace(r.mcSender) != "" {
+		rowCopy := r
+		items = append(items, fyne.NewMenuItem("Send Signal Report", func() {
+			g.sendMcSignalReportForRow(rowCopy)
+		}))
+	}
+	menu := fyne.NewMenu("", items...)
 	widget.ShowPopUpMenuAtPosition(menu, g.window.Canvas(), absPos)
 }
 
@@ -8406,9 +8442,28 @@ func (g *GUI) showMcChatRowInfo(r chatRow) {
 	// the ring at append time. Either source surfaces under the
 	// same "Captured packet" header so Info reads consistently.
 	switch {
-	case r.mcPathLen != 0 || len(r.mcPath) > 0:
-		pkt := meshcore.Packet{PathLen: r.mcPathLen, Path: r.mcPath}
+	case r.mcPathLen != 0 || len(r.mcPath) > 0 || r.mcHeader != 0:
+		pkt := meshcore.Packet{Header: r.mcHeader, PathLen: r.mcPathLen, Path: r.mcPath}
 		body.WriteString("\n--- Captured packet (persisted) ---\n")
+		if r.mcHeader != 0 {
+			rt := pkt.RouteType()
+			fmt.Fprintf(&body, "Route:       %s\n", rt)
+			// Route-specific gloss: explain what Path bytes MEAN
+			// for this packet so the operator knows whether the
+			// hop count reflects on-air forwarders (FLOOD) or
+			// the sender's stored OutPath (DIRECT). Asymmetric
+			// routes between two nodes are normal — uplink and
+			// downlink can use different repeater sets even on
+			// the same mesh.
+			switch rt {
+			case meshcore.RouteFlood, meshcore.RouteTransportFlood:
+				body.WriteString("             (FLOOD — Path accumulates each forwarder's hash;\n")
+				body.WriteString("              hop count reflects the real on-air route.)\n")
+			case meshcore.RouteDirect, meshcore.RouteTransportDirect:
+				body.WriteString("             (DIRECT — Path carries the sender's stored OutPath\n")
+				body.WriteString("              to the destination; reverse direction may differ.)\n")
+			}
+		}
 		fmt.Fprintf(&body, "Hops:        %d\n", pkt.HopCount())
 		if len(pkt.Path) > 0 {
 			fmt.Fprintf(&body, "Path bytes:  %x\n", pkt.Path)
@@ -8964,6 +9019,7 @@ func chatRowToStored(r chatRow) meshcore.StoredMessage {
 		SNR:      r.snrDB,
 		Sender:   r.mcSender,
 		PathLen:  r.mcPathLen,
+		Header:   r.mcHeader,
 	}
 	if len(r.mcPath) > 0 {
 		msg.Path = append([]byte(nil), r.mcPath...)
@@ -8991,6 +9047,7 @@ func storedToChatRow(thread string, m meshcore.StoredMessage) chatRow {
 		mc:        true,
 		mcSender:  m.Sender,
 		mcPathLen: m.PathLen,
+		mcHeader:  m.Header,
 	}
 	if len(m.Path) > 0 {
 		r.mcPath = append([]byte(nil), m.Path...)
@@ -10911,11 +10968,24 @@ type mcHashLinkRenderer struct {
 }
 
 func (r *mcHashLinkRenderer) Layout(size fyne.Size) {
-	r.label.Resize(size)
-	r.label.Move(fyne.NewPos(0, 0))
+	// Fix the label to its MinSize and align to the BOTTOM of
+	// the cell when the surrounding container allocates more
+	// vertical space than the text needs. The previous Move(0,0)
+	// + underline-at-min.Height-1 looked like strikethrough
+	// inside an HBox that gave us extra height because the
+	// text floated at the top while the underline stayed at the
+	// MinSize bottom — pinning both to the cell bottom keeps the
+	// underline visually under the glyphs regardless of cell
+	// height.
 	min := r.label.MinSize()
-	r.underline.Position1 = fyne.NewPos(0, min.Height-1)
-	r.underline.Position2 = fyne.NewPos(min.Width, min.Height-1)
+	r.label.Resize(min)
+	yTop := size.Height - min.Height
+	if yTop < 0 {
+		yTop = 0
+	}
+	r.label.Move(fyne.NewPos(0, yTop))
+	r.underline.Position1 = fyne.NewPos(0, size.Height-1)
+	r.underline.Position2 = fyne.NewPos(min.Width, size.Height-1)
 }
 
 func (r *mcHashLinkRenderer) MinSize() fyne.Size { return r.label.MinSize() }

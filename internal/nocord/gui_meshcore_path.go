@@ -193,6 +193,7 @@ func (g *GUI) mcCapturePathFromRxLog(row *chatRow) {
 		return
 	}
 	row.mcPathLen = pkt.PathLen
+	row.mcHeader = pkt.Header
 	if len(pkt.Path) > 0 {
 		row.mcPath = append([]byte(nil), pkt.Path...)
 	}

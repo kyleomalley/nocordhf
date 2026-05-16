@@ -3,6 +3,134 @@
 All notable changes to NocordHF are tracked in this file. Version
 numbers follow [Semantic Versioning](https://semver.org/).
 
+## [1.2.3] - 2026-05-16
+
+### MeshCore — signal reports & route diagnostics
+
+- **Send Signal Report** on any inbound chat message: right-click,
+  pick the action, and a one-line report posts to the active
+  channel with the @sender, comma-separated hash-prefix path, hop
+  count, route mode (FLOOD / DIRECT), SNR, RSSI, and reception
+  time. RSSI is filled best-effort from the live RxLog ring with
+  fallback to the row's persisted SNR. Truncates cleanly to the
+  140-byte MeshCore on-air cap.
+- Persist `Header` byte on chat rows + StoredMessage so RouteType
+  survives across restarts. The Info dialog now shows the route
+  mode with a gloss explaining whether `Path` reflects the real
+  on-air route (FLOOD) or the sender's stored OutPath (DIRECT) —
+  the two can disagree on hop count without indicating a bug.
+- Detect bot status broadcasts ("XX: name" / 🎯-origin lines)
+  and surface them as a `peers df,a2,...` suffix on the report
+  rather than mislabelling them as the actual path. They're a
+  contact-table snapshot, not a route.
+
+### MeshCore — RX LOG densification
+
+- Tighter row layout: smaller monospace, sender nickname inline,
+  hop count × hash-size, per-hop clickable hash tokens. Each hash
+  byte in the path renders as a `mcHashLink` that flies the map
+  to the matched contact (or shows dim if unmatched).
+- Column header row over the list labels TIME / RT / PAY /
+  HOPS / SNR / RSSI / SENDER / PATH so it's clear what each
+  column means.
+- Fixed the path-hash underline rendering — it was floating at
+  MinSize bottom while the label sat at the cell top, which
+  looked like strikethrough inside the HBox. Both now pin to
+  the cell bottom.
+
+### MeshCore — HEARD column
+
+- Normalised the FT8 "HEARD" and MeshCore "ROSTER" naming —
+  both surfaces are now "HEARD" so the operator's mental model
+  carries between modes.
+- HEARD rows now classify by relationship: bold = admitted
+  contact, plain = pending advert, italic+dim = name seen in
+  chat without an advert. Single-click jumps to the right
+  destination per status (DM thread / PENDING entry / system
+  message explaining why).
+- Right-click HEARD opens a status-aware menu: known contact
+  gets DM / Info / Trace / Telemetry / Status, pending gets
+  Add / Discard / Block, unknown shows a "no advert yet" note.
+- Persistent HEARD ignore-list — right-click → Ignore hides
+  the call across restarts.
+- Fixed HEARD-list clicks + selection being dropped on the
+  floor (Fyne's list-event bubbling required wiring `onTap`
+  explicitly on each row).
+
+### MeshCore — admin / diagnostic actions
+
+- Private-repeater login (`CmdSendLogin`). Right-click a
+  repeater → Login..., enter the password, and on success an
+  admin-actions modal opens with Query status / Send CLI
+  command / Open DM. Passwords aren't persisted to disk.
+- CLI command DM (`TxtCliData`) to a logged-in repeater.
+- Repeater status query (`CmdSendStatusReq` →
+  `PushStatusResponse`) — renders the CompanionRadio stats
+  struct (battery, uptime, packet counts, noise floor).
+- Sensor telemetry (`CmdSendTelemetryReq` →
+  `PushTelemetryResponse`) with a Cayenne LPP parser for the
+  payload.
+- Active trace path (`CmdSendTracePath` → `PushTraceData`)
+  with random-tag correlation and per-hop SNR map labels.
+
+### MeshCore — navigation & quality of life
+
+- Browser-style back navigation: `Cmd+[` and middle-click pop
+  the previous thread off the back-stack and switch to it.
+- Promoting a pending advert no longer drops the map pin for
+  30s — optimistic local-state injection bridges the gap
+  before `scheduleMcContactsRefresh` lands.
+- Mesh repeater pins clear from the FT8 map when switching
+  modes.
+- Tracker re-advert — periodic `SendSelfAdvert` at the
+  operator's configured interval so trackers stay
+  rediscoverable.
+- Flatten newlines in chat rendering — multi-line bot status
+  payloads (DF: RB / A2: AB / 0E: ... / FA: 🎯) used to render
+  as the unknown-glyph diamond ◊ in Fyne's single-line
+  canvas.Text. Now collapsed to " · " separators so the
+  content stays readable while the original text survives
+  intact in Info / copy.
+
+### FT8
+
+- Post-TX splatter sentinel — checks the noise floor after a
+  TX cycle and warns if the radio looks like it's still
+  emitting bandwidth-spreading energy.
+- HEARD-list hover tooltip shows worked-before history
+  (ADIF/LoTW).
+- Recognise RRR (legacy rogers) in the auto-reply tail + QSO
+  finaliser alongside RR73.
+- Per-radio audio prefs (rx_gain / tx_level scoped by
+  radio_type) — IC-7300 and Yaesu drive levels differ wildly
+  and a single flat pref kept clipping one or the other.
+- 0/O ambiguity in tiny map labels — switched to a dotted
+  zero so callsigns like "OØ" stop looking like "OO".
+- TX cancel halts the row's "characters going green"
+  animation (was getting stuck mid-progress).
+
+### Refactor
+
+- Split `gui.go` into focused modules:
+  `gui_meshcore_lifecycle.go`, `gui_meshcore_pending.go`,
+  `gui_meshcore_login.go`, `gui_meshcore_status.go`,
+  `gui_meshcore_telemetry.go`, `gui_meshcore_trace.go`,
+  `gui_meshcore_rxlog.go`, `gui_meshcore_unread.go`,
+  `gui_meshcore_path.go`, `gui_meshcore_signal_report.go`,
+  `gui_heard.go`, `gui_heard_ignore.go`, `chat_segments.go`,
+  `diagnostics.go`.
+
+## [1.2.2] - 2026-05-12
+
+### macOS
+
+- Fix Finder-launch crash on macOS 26 (Tahoe). Bumped the
+  bundled `LSMinimumSystemVersion` to 13.0 and added
+  hardened-runtime entitlements so notarisation + Gatekeeper
+  on Tahoe load the modern AppKit init path instead of the
+  legacy paste-telemetry path that watchdog-aborts on
+  Background-role processes.
+
 ## [1.2.1] - 2026-05-10
 
 ### Release tooling

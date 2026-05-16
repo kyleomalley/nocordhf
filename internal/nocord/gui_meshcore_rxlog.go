@@ -110,7 +110,7 @@ func (g *GUI) buildMeshcoreRxLog() *fyne.Container {
 					senderTag = fmt.Sprintf("%x?", lastHash)
 				}
 			}
-			meta.Text = fmt.Sprintf("%s  %-4s %-7s %dh×%dB  S%4.1f R%4d  %-12s",
+			meta.Text = fmt.Sprintf("%s %-3s %-6s %dh×%dB %5.1f %4d %-12s",
 				e.when.Format("15:04:05"),
 				routeShort(e.route),
 				payloadShort(e.payload),
@@ -185,10 +185,17 @@ func (g *GUI) buildMeshcoreRxLog() *fyne.Container {
 		container.NewPadded(g.mcRxLogHeader),
 		helpBtn, nil,
 	)
+	// Column-label row aligned with the row format below
+	// ("%s %-3s %-6s %dh×%dB %5.1f %4d %-12s"). Width-padded to
+	// match the meta string positions so the header sits over
+	// the right columns even though TextSize is the same.
+	colHdr := canvas.NewText("TIME     RT  PAY    HOPS   SNR RSSI SENDER       PATH", color.RGBA{120, 125, 135, 255})
+	colHdr.TextStyle = fyne.TextStyle{Monospace: true, Bold: true}
+	colHdr.TextSize = 9
 	g.mcRxLogPane = container.NewStack(
 		bg,
 		container.NewBorder(
-			header,
+			container.NewVBox(header, container.NewPadded(colHdr)),
 			nil, nil, nil,
 			g.mcRxLogList,
 		),
