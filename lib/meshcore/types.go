@@ -226,6 +226,46 @@ type EventChannelMessage struct{ ChannelMessage }
 
 func (EventChannelMessage) isMeshcoreEvent() {}
 
+// RepeaterStats decodes the statusData payload of a repeater /
+// room-server PushStatusResponse. Fields mirror the firmware's
+// CompanionRadio struct (see meshcore-dev/MeshCore), all
+// little-endian on the wire.
+type RepeaterStats struct {
+	BatteryMilliVolts uint16
+	TxQueueLen        uint16
+	NoiseFloor        int16
+	LastRSSI          int16
+	PacketsRecv       uint32
+	PacketsSent       uint32
+	TotalAirTimeSecs  uint32
+	TotalUpTimeSecs   uint32
+	NSentFlood        uint32
+	NSentDirect       uint32
+	NRecvFlood        uint32
+	NRecvDirect       uint32
+	ErrEvents         uint16
+	LastSNR           int16 // raw firmware quarter-dB units
+	NDirectDups       uint16
+	NFloodDups        uint16
+}
+
+// EventStatusResponse fires when the firmware delivers a
+// PushStatusResponse — the reply to a previously-sent
+// CmdSendStatusReq. Like telemetry, callers correlate by the
+// SenderPrefix the response carries.
+//
+// Stats is the decoded RepeaterStats when the payload was the
+// expected size (40 bytes); otherwise zero-valued so the caller
+// can fall back to Raw for forensic inspection.
+type EventStatusResponse struct {
+	SenderPrefix PubKeyPrefix
+	Stats        RepeaterStats
+	StatsOK      bool
+	Raw          []byte
+}
+
+func (EventStatusResponse) isMeshcoreEvent() {}
+
 // EventTelemetryResponse fires when the firmware delivers a
 // PushTelemetryResponse — the reply to a previously-sent
 // CmdSendTelemetryReq aimed at a sensor node. SenderPrefix is

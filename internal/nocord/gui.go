@@ -7296,6 +7296,7 @@ func (g *GUI) showMcContactContextMenu(visibleIdx int, absPos fyne.Position) {
 		fyne.NewMenuItem("Share in channel…", func() { g.showMcShareInChannelDialog(ct) }),
 		fyne.NewMenuItem("Trace path", func() { g.traceMcContactPath(ct) }),
 		fyne.NewMenuItem("Query telemetry", func() { g.requestMcContactTelemetry(ct) }),
+		fyne.NewMenuItem("Query repeater status", func() { g.requestMcContactStatus(ct) }),
 		fyne.NewMenuItem("Reset path", func() { g.confirmResetMcPath(ct) }),
 		fyne.NewMenuItem("Remove", func() { g.confirmRemoveMcContact(ct) }),
 	)
@@ -10233,6 +10234,12 @@ func (g *GUI) runMeshcoreEvents(client *meshcore.Client) {
 			// table by sender prefix and surface the decoded
 			// LPP readings as a system message.
 			g.handleMcTelemetryResponse(e)
+		case meshcore.EventStatusResponse:
+			// Response to an operator-triggered "Query repeater
+			// status". Same correlation pattern as telemetry —
+			// match by sender prefix and render the decoded
+			// RepeaterStats inline.
+			g.handleMcStatusResponse(e)
 		case meshcore.EventContactsFull:
 			// Hardware contacts table at MAX_CONTACTS — the
 			// firmware will start dropping new adverts AND

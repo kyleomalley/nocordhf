@@ -47,6 +47,8 @@ const (
 	CmdExportPrivateKey  CommandCode = 23
 	CmdImportPrivateKey  CommandCode = 24
 	CmdSendRawData       CommandCode = 25
+	CmdSendLogin         CommandCode = 26
+	CmdSendStatusReq     CommandCode = 27
 	CmdGetChannel        CommandCode = 31
 	CmdSetChannel        CommandCode = 32
 	CmdSendTracePath     CommandCode = 36

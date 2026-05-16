@@ -279,6 +279,25 @@ func (c *Client) handlePush(code PushCode, payload []byte) {
 			ev.Packet = pkt
 		}
 		c.emit(ev)
+	case PushStatusResponse:
+		// Layout (matches meshcore.js onStatusResponsePush):
+		//   [reserved:1][pubKeyPrefix:6][statusData:remaining]
+		// statusData for a repeater is the firmware's CompanionRadio
+		// stats struct (40 bytes). Other contact types may ship
+		// a different payload; if size doesn't match we still emit
+		// the event so the GUI can surface "raw N bytes".
+		if len(payload) < 1+6 {
+			return
+		}
+		ev := EventStatusResponse{}
+		copy(ev.SenderPrefix[:], payload[1:7])
+		raw := payload[7:]
+		ev.Raw = append([]byte(nil), raw...)
+		if stats, ok := parseRepeaterStats(raw); ok {
+			ev.Stats = stats
+			ev.StatsOK = true
+		}
+		c.emit(ev)
 	case PushTelemetryResponse:
 		// Layout (matches meshcore.js onTelemetryResponsePush):
 		//   [reserved:1][pubKeyPrefix:6][lppSensorData:remaining]
@@ -866,6 +885,40 @@ func (c *Client) ShareContact(pub PubKey) error {
 	return c.callWithTimeout(payload, awaitOk)
 }
 
+// SendStatusReq asks a repeater or room-server contact for its
+// runtime stats — battery / queue / air-time / packet counters /
+// noise floor. Reply arrives asynchronously as
+// PushStatusResponse → EventStatusResponse with a SenderPrefix
+// matching pub's leading 6 bytes; caller correlates against
+// in-flight requests via that prefix.
+//
+// Wire format mirrors meshcore.js sendCommandSendStatusReq:
+//
+//	[CmdSendStatusReq][32-byte pubkey]
+//
+// Returns the firmware's Sent ack (carries the estimated
+// round-trip budget); actual stats flow through the event
+// channel.
+func (c *Client) SendStatusReq(pub PubKey) (SentResult, error) {
+	payload := append([]byte{byte(CmdSendStatusReq)}, pub[:]...)
+	var sent SentResult
+	err := c.callWithTimeout(payload, func(frame Frame) (bool, error) {
+		if e := errFromFrame(frame); e != nil {
+			return true, e
+		}
+		if ResponseCode(frame.Payload[0]) != RespSent {
+			return false, nil
+		}
+		s, err := parseSent(frame.Payload[1:])
+		if err != nil {
+			return true, err
+		}
+		sent = s
+		return true, nil
+	})
+	return sent, err
+}
+
 // SendTelemetryReq asks a sensor node (typically AdvTypeSensor)
 // to ship its current LPP telemetry payload. Reply arrives
 // asynchronously as PushTelemetryResponse → EventTelemetryResponse
@@ -1415,6 +1468,71 @@ func parseSent(b []byte) (SentResult, error) {
 		return s, err
 	}
 	return s, nil
+}
+
+// parseRepeaterStats decodes a 40-byte CompanionRadio stats block
+// out of a PushStatusResponse payload. Field layout matches the
+// firmware struct in meshcore-dev/MeshCore (read by meshcore.js's
+// inline parser at sendStatusReq → onStatusResponsePush). Returns
+// ok=false when the payload is shorter than expected so the
+// caller can fall back to surfacing raw bytes.
+func parseRepeaterStats(b []byte) (RepeaterStats, bool) {
+	const wantLen = 2 + 2 + 2 + 2 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 2 + 2 + 2 + 2
+	if len(b) < wantLen {
+		return RepeaterStats{}, false
+	}
+	r := newBufReader(b)
+	var s RepeaterStats
+	var err error
+	if s.BatteryMilliVolts, err = r.uint16LE(); err != nil {
+		return s, false
+	}
+	if s.TxQueueLen, err = r.uint16LE(); err != nil {
+		return s, false
+	}
+	if s.NoiseFloor, err = r.int16LE(); err != nil {
+		return s, false
+	}
+	if s.LastRSSI, err = r.int16LE(); err != nil {
+		return s, false
+	}
+	if s.PacketsRecv, err = r.uint32LE(); err != nil {
+		return s, false
+	}
+	if s.PacketsSent, err = r.uint32LE(); err != nil {
+		return s, false
+	}
+	if s.TotalAirTimeSecs, err = r.uint32LE(); err != nil {
+		return s, false
+	}
+	if s.TotalUpTimeSecs, err = r.uint32LE(); err != nil {
+		return s, false
+	}
+	if s.NSentFlood, err = r.uint32LE(); err != nil {
+		return s, false
+	}
+	if s.NSentDirect, err = r.uint32LE(); err != nil {
+		return s, false
+	}
+	if s.NRecvFlood, err = r.uint32LE(); err != nil {
+		return s, false
+	}
+	if s.NRecvDirect, err = r.uint32LE(); err != nil {
+		return s, false
+	}
+	if s.ErrEvents, err = r.uint16LE(); err != nil {
+		return s, false
+	}
+	if s.LastSNR, err = r.int16LE(); err != nil {
+		return s, false
+	}
+	if s.NDirectDups, err = r.uint16LE(); err != nil {
+		return s, false
+	}
+	if s.NFloodDups, err = r.uint16LE(); err != nil {
+		return s, false
+	}
+	return s, true
 }
 
 func parseContactMsg(b []byte) (ContactMessage, error) {
