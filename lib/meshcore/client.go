@@ -695,6 +695,50 @@ func (c *Client) SendContactMessage(prefix PubKeyPrefix, senderTime time.Time, t
 	return res, err
 }
 
+// SendContactCliCommand sends an admin / CLI command to a
+// repeater or room-server contact, encoded as a CONTACT text
+// message with TxtType = TxtCliData. The firmware on the
+// receiving side interprets the body as a command line (e.g.
+// "reboot", "set freq 915000", repeater-specific commands).
+// Requires a prior successful CmdSendLogin for the repeater to
+// accept it; un-authed cli commands are silently rejected.
+//
+// Wire format mirrors SendContactMessage with one byte changed:
+//
+//	[CmdSendTxtMsg][TxtCliData][attempt=0][senderTime:u32LE]
+//	[prefix:6][text bytes]
+func (c *Client) SendContactCliCommand(prefix PubKeyPrefix, senderTime time.Time, text string) (SentResult, error) {
+	if len(text) > MaxTextLength {
+		return SentResult{}, ErrTextTooLong
+	}
+	payload := make([]byte, 0, 1+1+1+4+6+len(text))
+	payload = append(payload, byte(CmdSendTxtMsg))
+	payload = append(payload, byte(TxtCliData))
+	payload = append(payload, 0) // attempt
+	payload = appendUint32LE(payload, uint32(senderTime.Unix()))
+	payload = append(payload, prefix[:]...)
+	payload = append(payload, []byte(text)...)
+	var res SentResult
+	err := c.callWithTimeout(payload, func(frame Frame) (bool, error) {
+		if e := errFromFrame(frame); e != nil {
+			return true, e
+		}
+		switch ResponseCode(frame.Payload[0]) {
+		case RespSent:
+			parsed, err := parseSent(frame.Payload[1:])
+			if err != nil {
+				return true, err
+			}
+			res = parsed
+			return true, nil
+		case RespOk:
+			return true, nil
+		}
+		return false, nil
+	})
+	return res, err
+}
+
 // SendChannelMessage sends a plain text message to the given channel
 // index. The radio formats the wire payload as "name: text" so callers
 // pass the bare message body without prefixing their own name.
