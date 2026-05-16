@@ -84,6 +84,13 @@ func (g *GUI) rememberHeard(call string, snr float64, isCQ bool, otaType string)
 	if !isPlausibleCallsign(call) {
 		return
 	}
+	// Operator-curated ignore list — silently drop entries the
+	// operator has marked. Checked AFTER the shape gate so we
+	// don't waste a lookup on obvious non-callsigns, but BEFORE
+	// the lock so the early-exit is cheap.
+	if g.isHeardIgnored(call) {
+		return
+	}
 	now := time.Now()
 	g.mu.Lock()
 	if g.heard == nil {

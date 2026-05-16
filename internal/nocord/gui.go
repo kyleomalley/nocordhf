@@ -253,6 +253,12 @@ type GUI struct {
 	// first. Capped at maxHeard entries (oldest evicted).
 	heard     map[string]heardEntry
 	heardSort heardSortMode
+	// heardIgnored is the operator-curated set of callsigns
+	// silently filtered out of HEARD before they ever land in
+	// `heard`. Persisted to prefs via gui_heard_ignore.go; lazy-
+	// loaded on first read so we don't need an explicit init
+	// in the GUI bootstrap.
+	heardIgnored map[string]bool
 
 	// bandActivity returns the number of unique stations heard on `band`
 	// over the recent activity window, or 0 if no data. Sourced from
@@ -3576,6 +3582,10 @@ func (g *GUI) showCallContextMenu(call string, isCQ bool, pos fyne.Position) {
 	if isCQ {
 		directedLabel = "Reply"
 	}
+	ignoreLabel := "Ignore (hide from HEARD)"
+	if g.isHeardIgnored(call) {
+		ignoreLabel = "Unignore (show in HEARD)"
+	}
 	items := []*fyne.MenuItem{
 		fyne.NewMenuItem("Profile", func() { g.showProfile(call, pos) }),
 		fyne.NewMenuItem(directedLabel, func() {
@@ -3588,6 +3598,10 @@ func (g *GUI) showCallContextMenu(call string, isCQ bool, pos fyne.Position) {
 		}),
 		fyne.NewMenuItem("Open QRZ", func() {
 			_ = openURL(fmt.Sprintf("https://www.qrz.com/db/%s", call))
+		}),
+		fyne.NewMenuItemSeparator(),
+		fyne.NewMenuItem(ignoreLabel, func() {
+			g.setHeardIgnored(call, !g.isHeardIgnored(call))
 		}),
 	}
 	menu := fyne.NewMenu("", items...)
