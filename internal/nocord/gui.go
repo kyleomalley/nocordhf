@@ -8598,7 +8598,30 @@ func (g *GUI) buildMeshcoreRoster() *fyne.Container {
 			if id >= len(roster) {
 				return
 			}
-			t.Text = roster[id]
+			name := roster[id]
+			t.Text = name
+			// Style by relationship so the operator can scan
+			// the HEARD column and immediately tell who's
+			// actionable:
+			//   bold  = admitted contact (one click → DM).
+			//   plain = pending advert (one click → jump to
+			//           PENDING entry to promote / discard /
+			//           block).
+			//   italic + dim = seen in channel chat but we
+			//           haven't received their advert yet;
+			//           no pubkey, no DM possible until they
+			//           broadcast within RF range.
+			switch status, _, _ := g.mcClassifyRosterName(name); status {
+			case mcRosterStatusContact:
+				t.TextStyle = fyne.TextStyle{Monospace: true, Bold: true}
+				t.Color = color.RGBA{220, 225, 235, 255}
+			case mcRosterStatusPending:
+				t.TextStyle = fyne.TextStyle{Monospace: true}
+				t.Color = color.RGBA{210, 215, 225, 255}
+			default:
+				t.TextStyle = fyne.TextStyle{Monospace: true, Italic: true}
+				t.Color = color.RGBA{150, 155, 165, 255}
+			}
 			t.Refresh()
 		},
 	)
@@ -8613,7 +8636,7 @@ func (g *GUI) buildMeshcoreRoster() *fyne.Container {
 		if id < 0 || id >= len(roster) {
 			return
 		}
-		g.openMcDmByRosterName(roster[id])
+		g.activateMcRosterName(roster[id])
 	}
 	bg := canvas.NewRectangle(color.RGBA{36, 38, 43, 255})
 	g.mcRosterPane = container.NewStack(
@@ -8623,14 +8646,59 @@ func (g *GUI) buildMeshcoreRoster() *fyne.Container {
 	return g.mcRosterPane
 }
 
+// mcRosterStatus categorises a HEARD-column entry by what we know
+// about that name across our local state:
+//
+//	mcRosterStatusContact — name matches an admitted Contact;
+//	   the operator can DM them right now.
+//	mcRosterStatusPending — name matches a PENDING ADVERT entry;
+//	   we have their pubkey (a fresh PushNewAdvert delivered it)
+//	   but per-type auto-add filtered them out. One promotion
+//	   call admits them.
+//	mcRosterStatusUnknown — we've seen the name in channel chat
+//	   but haven't received an advert from them yet. No pubkey,
+//	   no way to DM until they next advertise within RF range.
+//
+// Drives the HEARD-row style (bold / normal / italic) and the
+// right-click menu's action set.
+type mcRosterStatus int
+
+const (
+	mcRosterStatusUnknown mcRosterStatus = iota
+	mcRosterStatusPending
+	mcRosterStatusContact
+)
+
+// mcClassifyRosterName resolves a HEARD-row display name against
+// the contact + pending tables. Returns the status enum plus the
+// matched record (Contact for status=Contact, StoredPendingAdvert
+// for status=Pending, zero values otherwise). Case-insensitive.
+func (g *GUI) mcClassifyRosterName(name string) (mcRosterStatus, meshcore.Contact, meshcore.StoredPendingAdvert) {
+	if name == "" {
+		return mcRosterStatusUnknown, meshcore.Contact{}, meshcore.StoredPendingAdvert{}
+	}
+	g.mcMu.Lock()
+	defer g.mcMu.Unlock()
+	for _, c := range g.mcContacts {
+		if strings.EqualFold(c.AdvName, name) {
+			return mcRosterStatusContact, c, meshcore.StoredPendingAdvert{}
+		}
+	}
+	for _, p := range g.mcPendingAdverts {
+		if strings.EqualFold(p.AdvName, name) {
+			return mcRosterStatusPending, meshcore.Contact{}, p
+		}
+	}
+	return mcRosterStatusUnknown, meshcore.Contact{}, meshcore.StoredPendingAdvert{}
+}
+
 // showMcRosterContextMenu opens the right-click menu for a row in
-// the MeshCore HEARD column (the per-channel sender roster). Maps
-// the displayed name back to a known Contact when possible so the
-// menu offers DM / Info / Trace, falling back to "Open as DM"
-// when the name doesn't match anyone in the contact table — that
-// still works because mcSwitchThread accepts any contact-prefix
-// thread id and the radio's contacts table is the source of truth
-// for actually delivering the DM.
+// the MeshCore HEARD column (the per-channel sender roster). The
+// menu branches by mcClassifyRosterName status — a known contact
+// gets the full action set (DM / Info / Trace / Telemetry /
+// Status / Login), a pending advert gets Add / Discard / Block,
+// an unknown name gets only Copy because there's no pubkey to act
+// on yet.
 func (g *GUI) showMcRosterContextMenu(visibleIdx int, absPos fyne.Position) {
 	if g.window == nil {
 		return
@@ -8640,62 +8708,92 @@ func (g *GUI) showMcRosterContextMenu(visibleIdx int, absPos fyne.Position) {
 		return
 	}
 	name := roster[visibleIdx]
-	ct, ok := g.mcContactByDisplayName(name)
-	if !ok {
-		// Not in our table — offer minimal actions only.
+	status, ct, pend := g.mcClassifyRosterName(name)
+	canvas := g.window.Canvas()
+	copyItem := fyne.NewMenuItem("Copy name", func() { g.window.Clipboard().SetContent(name) })
+
+	switch status {
+	case mcRosterStatusContact:
+		// Known contact — full action set.
 		menu := fyne.NewMenu("",
-			fyne.NewMenuItem(name+"  (not in contacts)", func() {}),
-			fyne.NewMenuItem("Copy name", func() {
-				g.window.Clipboard().SetContent(name)
-			}),
+			fyne.NewMenuItem("Open DM", func() { g.activateMcRosterName(name) }),
+			fyne.NewMenuItem("Info", func() { g.showMcContactInfoDialog(ct) }),
+			fyne.NewMenuItem("Trace path", func() { g.traceMcContactPath(ct) }),
+			fyne.NewMenuItem("Query telemetry", func() { g.requestMcContactTelemetry(ct) }),
+			fyne.NewMenuItem("Query repeater status", func() { g.requestMcContactStatus(ct) }),
+			copyItem,
 		)
-		widget.ShowPopUpMenuAtPosition(menu, g.window.Canvas(), absPos)
-		return
+		widget.ShowPopUpMenuAtPosition(menu, canvas, absPos)
+	case mcRosterStatusPending:
+		// We have the pubkey — operator can promote, discard,
+		// or block right from here, OR jump to the entry in the
+		// PENDING sidebar to see all the entries together.
+		menu := fyne.NewMenu("",
+			fyne.NewMenuItem(name+"  (pending — not in contacts)", func() {}),
+			fyne.NewMenuItem("Jump to PENDING entry", func() { g.activateMcRosterName(name) }),
+			fyne.NewMenuItem("Add as Contact", func() { g.promoteMcPendingAdvert(pend) }),
+			fyne.NewMenuItem("Discard", func() { g.discardMcPendingAdvert(pend.PubKey) }),
+			fyne.NewMenuItem("Block (permanent)", func() { g.blockMcPendingAdvert(pend) }),
+			copyItem,
+		)
+		widget.ShowPopUpMenuAtPosition(menu, canvas, absPos)
+	default:
+		// Unknown — we've only ever seen the name in chat text,
+		// no advert has reached us. Nothing actionable until
+		// they next advertise within RF range.
+		menu := fyne.NewMenu("",
+			fyne.NewMenuItem(name+"  (no advert yet)", func() {}),
+			copyItem,
+		)
+		widget.ShowPopUpMenuAtPosition(menu, canvas, absPos)
 	}
-	// Known contact — full contact context menu, identical to
-	// the one in the Contacts sidebar. Reuse the contact-context
-	// helper since the actions (DM / Info / Trace / Login / etc.)
-	// are exactly what an operator wants when they spot a name
-	// in the channel HEARD.
-	menu := fyne.NewMenu("",
-		fyne.NewMenuItem("Open DM", func() { g.openMcDmByRosterName(name) }),
-		fyne.NewMenuItem("Info", func() { g.showMcContactInfoDialog(ct) }),
-		fyne.NewMenuItem("Trace path", func() { g.traceMcContactPath(ct) }),
-		fyne.NewMenuItem("Query telemetry", func() { g.requestMcContactTelemetry(ct) }),
-		fyne.NewMenuItem("Query repeater status", func() { g.requestMcContactStatus(ct) }),
-		fyne.NewMenuItem("Copy name", func() { g.window.Clipboard().SetContent(name) }),
-	)
-	widget.ShowPopUpMenuAtPosition(menu, g.window.Canvas(), absPos)
 }
 
-// openMcDmByRosterName resolves a HEARD entry's display name to a
-// known contact and switches the chat to that contact's DM thread.
-// Falls through to a system message when no contact matches —
-// the most common reason is that the channel sender isn't in our
-// table because auto-add filters them out (sensor / repeater types
-// off by default).
-func (g *GUI) openMcDmByRosterName(name string) {
-	ct, ok := g.mcContactByDisplayName(name)
-	if !ok {
-		g.mcAppendSystem(fmt.Sprintf("can't DM %s — not in your contacts table; right-click on the map / PENDING to admit them first", name))
-		return
+// activateMcRosterName handles a left-click on a HEARD row. The
+// action depends on the operator's relationship with the name:
+//
+//   - Contact: switch to that contact's DM thread.
+//   - Pending: jump to the PENDING ADVERTS sidebar entry so the
+//     operator can promote / discard / block without rummaging
+//     for the same name in a long list.
+//   - Unknown: system message — no pubkey, nothing to navigate to.
+func (g *GUI) activateMcRosterName(name string) {
+	status, ct, pend := g.mcClassifyRosterName(name)
+	switch status {
+	case mcRosterStatusContact:
+		g.mcSwitchThread(mcContactThreadID(ct))
+	case mcRosterStatusPending:
+		g.scrollMcPendingToPubKey(pend.PubKey, name)
+	default:
+		g.mcAppendSystem(fmt.Sprintf("can't act on %s yet — we've seen the name in chat but haven't received their advert. Wait for them to broadcast within RF range.", name))
 	}
-	g.mcSwitchThread(mcContactThreadID(ct))
 }
 
-// mcContactByDisplayName returns the contact whose AdvName matches
-// the given display string. Case-insensitive. Returns ok=false when
-// no contact matches — channel posters can be anyone on the mesh,
-// not just contacts the operator has admitted.
-func (g *GUI) mcContactByDisplayName(name string) (meshcore.Contact, bool) {
+// scrollMcPendingToPubKey finds the row matching pub in the live
+// PENDING list and scrolls the sidebar to it, selecting briefly
+// to flash a visual cue. Mirrors the scrollHeardToCall pattern.
+func (g *GUI) scrollMcPendingToPubKey(pub meshcore.PubKey, display string) {
+	if g.mcPendingList == nil {
+		g.mcAppendSystem(fmt.Sprintf("can't jump to %s — PENDING sidebar not built yet", display))
+		return
+	}
 	g.mcMu.Lock()
-	defer g.mcMu.Unlock()
-	for _, c := range g.mcContacts {
-		if strings.EqualFold(c.AdvName, name) {
-			return c, true
+	idx := -1
+	for i, k := range g.mcPendingOrder {
+		if k == pub {
+			idx = i
+			break
 		}
 	}
-	return meshcore.Contact{}, false
+	g.mcMu.Unlock()
+	if idx < 0 {
+		g.mcAppendSystem(fmt.Sprintf("can't jump to %s — pending entry missing from sidebar (refresh?)", display))
+		return
+	}
+	fyne.Do(func() {
+		g.mcPendingList.ScrollTo(idx)
+		g.mcPendingList.Select(idx)
+	})
 }
 
 // mcRefreshRoster repaints the roster header count + list when the
