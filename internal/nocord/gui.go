@@ -2781,6 +2781,55 @@ func (g *GUI) sweepPendingRetries() {
 	}
 }
 
+// freezeInProgressTxRows halts the live "characters going green"
+// animation on every in-flight TX row. Called from cancelAllSends
+// after closing the playback stop channels — without this, the
+// 1 Hz advanceTxRows ticker keeps interpolating txProgress until
+// the full txAudioDuration elapses, so the operator sees text
+// continue to fill in green long after the radio has dropped PTT
+// and the cancel actually took effect.
+//
+// Behaviour per row:
+//   - Clamp txProgress to its current value (no further advance).
+//   - Clear txInProgress so the renderer stops splitting the text
+//     at the green/grey boundary.
+//   - Suffix " ✕" to the original message so a cancelled mid-TX
+//     reads visually distinct from a clean-completion TX echo.
+//
+// Idempotent — safe to call when no TX is in flight (loop body
+// short-circuits on the !r.tx || !r.txInProgress guard).
+func (g *GUI) freezeInProgressTxRows() {
+	g.mu.Lock()
+	dirty := false
+	for i := range g.rows {
+		r := &g.rows[i]
+		if !r.tx || !r.txInProgress {
+			continue
+		}
+		r.txInProgress = false
+		runeLen := len([]rune(r.text))
+		if r.txProgress < 0 {
+			r.txProgress = 0
+		}
+		if r.txProgress > runeLen {
+			r.txProgress = runeLen
+		}
+		// Append a cancel marker so the row visually distinguishes
+		// from a successful TX (which renders fully green). Don't
+		// re-append if already present so back-to-back cancels
+		// (e.g. ESC twice) don't pile up markers.
+		if !strings.HasSuffix(r.text, " ✕") {
+			r.text += " ✕"
+		}
+		dirty = true
+	}
+	chatList := g.chatList
+	g.mu.Unlock()
+	if dirty && chatList != nil {
+		fyne.Do(func() { chatList.Refresh() })
+	}
+}
+
 // advanceTxRows nudges the txProgress on every in-progress TX row by
 // the proportion of the FT8 audio duration that's elapsed since the
 // row was created. Called once a second by the status ticker; cheap
@@ -2896,6 +2945,13 @@ func (g *GUI) cancelAllSends(reason string, verbose bool) {
 	for _, p := range pending {
 		closeStopCh(p.stopCh)
 	}
+	// Closing the stop channels aborts the audio + drops PTT, but the
+	// in-progress chat row keeps animating ("characters going green")
+	// because advanceTxRows interpolates against txStart and doesn't
+	// know the playback was cut short. Freeze the row now so the
+	// animation halts at the actual cancellation point and it's
+	// visually distinct from a normal-completion TX echo.
+	g.freezeInProgressTxRows()
 	// Drain queued TxRequests. Non-blocking — stop as soon as the
 	// channel is empty. Each drained request gets its StopCh closed
 	// in case runTX picked it up between the drain and the close
