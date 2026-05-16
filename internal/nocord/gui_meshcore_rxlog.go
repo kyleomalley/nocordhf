@@ -28,6 +28,7 @@ import (
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
+	"github.com/kyleomalley/nocordhf/lib/logging"
 	"github.com/kyleomalley/nocordhf/lib/meshcore"
 )
 
@@ -237,6 +238,9 @@ func percentInt(n, total int) int {
 // removes the most recent path overlay so the operator can de-clutter
 // without flipping modes.
 func (g *GUI) showRxLogContextMenu(visibleIdx int, absPos fyne.Position) {
+	if logging.L != nil {
+		logging.L.Debugw("showRxLogContextMenu enter", "visibleIdx", visibleIdx)
+	}
 	g.mcMu.Lock()
 	if visibleIdx < 0 || visibleIdx >= len(g.mcRxLog) {
 		g.mcMu.Unlock()

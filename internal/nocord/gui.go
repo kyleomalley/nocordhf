@@ -7355,6 +7355,9 @@ func distanceMiles(lat1, lon1, lat2, lon2 float64, contactLatE6, contactLonE6 in
 // record) and Remove (call CmdRemoveContact then refresh the
 // roster).
 func (g *GUI) showMcContactContextMenu(visibleIdx int, absPos fyne.Position) {
+	if logging.L != nil {
+		logging.L.Debugw("showMcContactContextMenu enter", "visibleIdx", visibleIdx)
+	}
 	g.mcMu.Lock()
 	if visibleIdx < 0 || visibleIdx >= len(g.mcContactsView) {
 		g.mcMu.Unlock()
@@ -8156,6 +8159,9 @@ func (g *GUI) removeSelectedMcContact() {
 // menu-firing time so a roster mutation between hover and click
 // doesn't reach a stale entry.
 func (g *GUI) showMcChannelContextMenu(visibleIdx int, absPos fyne.Position) {
+	if logging.L != nil {
+		logging.L.Debugw("showMcChannelContextMenu enter", "visibleIdx", visibleIdx)
+	}
 	g.mcMu.Lock()
 	if visibleIdx < 0 || visibleIdx >= len(g.mcChannels) {
 		g.mcMu.Unlock()
@@ -8230,6 +8236,9 @@ func (g *GUI) confirmRemoveMcChannel(ch meshcore.Channel) {
 // the message took, when the row matches an entry still in the
 // RxLog ring).
 func (g *GUI) showMcChatRowContextMenu(r chatRow, absPos fyne.Position) {
+	if logging.L != nil {
+		logging.L.Debugw("showMcChatRowContextMenu enter", "system", r.system, "tx", r.tx)
+	}
 	menu := fyne.NewMenu("",
 		fyne.NewMenuItem("Info", func() { g.showMcChatRowInfo(r) }),
 		fyne.NewMenuItem("Map Trace", func() { g.showMcChatRowMapTrace(r) }),
