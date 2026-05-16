@@ -226,6 +226,21 @@ type EventChannelMessage struct{ ChannelMessage }
 
 func (EventChannelMessage) isMeshcoreEvent() {}
 
+// EventTelemetryResponse fires when the firmware delivers a
+// PushTelemetryResponse — the reply to a previously-sent
+// CmdSendTelemetryReq aimed at a sensor node. SenderPrefix is
+// the 6-byte pubkey prefix of the responding node (matches the
+// MeshCore addressing convention used elsewhere). Readings is
+// the LPP-decoded sensor channels; Raw is the original bytes
+// for forensic inspection.
+type EventTelemetryResponse struct {
+	SenderPrefix PubKeyPrefix
+	Readings     []LPPReading
+	Raw          []byte
+}
+
+func (EventTelemetryResponse) isMeshcoreEvent() {}
+
 // EventTraceData fires when the firmware delivers a PushTraceData
 // frame — the reply to a previously-sent CmdSendTracePath request.
 // Tag is the uint32 the host picked when issuing the trace; callers

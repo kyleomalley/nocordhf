@@ -279,6 +279,20 @@ func (c *Client) handlePush(code PushCode, payload []byte) {
 			ev.Packet = pkt
 		}
 		c.emit(ev)
+	case PushTelemetryResponse:
+		// Layout (matches meshcore.js onTelemetryResponsePush):
+		//   [reserved:1][pubKeyPrefix:6][lppSensorData:remaining]
+		// pubKeyPrefix is the 6-byte addressing handle used
+		// elsewhere; caller correlates against pending requests.
+		if len(payload) < 1+6 {
+			return
+		}
+		ev := EventTelemetryResponse{}
+		copy(ev.SenderPrefix[:], payload[1:7])
+		lpp := payload[7:]
+		ev.Raw = append([]byte(nil), lpp...)
+		ev.Readings = ParseLPP(lpp)
+		c.emit(ev)
 	case PushTraceData:
 		// Layout (matches meshcore.js onTraceDataPush):
 		//   [reserved:1][pathLen:1][flags:1]
@@ -850,6 +864,42 @@ func (c *Client) Reboot() error {
 func (c *Client) ShareContact(pub PubKey) error {
 	payload := append([]byte{byte(CmdShareContact)}, pub[:]...)
 	return c.callWithTimeout(payload, awaitOk)
+}
+
+// SendTelemetryReq asks a sensor node (typically AdvTypeSensor)
+// to ship its current LPP telemetry payload. Reply arrives
+// asynchronously as PushTelemetryResponse → EventTelemetryResponse
+// with a SenderPrefix that matches pub's leading 6 bytes; caller
+// uses that to correlate when multiple requests are in flight.
+//
+// Wire format mirrors meshcore.js sendCommandSendTelemetryReq:
+//
+//	[CmdSendTelemetryReq][3 reserved bytes = 0][32-byte pubkey]
+//
+// Returns the firmware's Sent ack (so the caller knows the
+// estimated round-trip budget); the actual telemetry data flows
+// through the event channel, not this return.
+func (c *Client) SendTelemetryReq(pub PubKey) (SentResult, error) {
+	payload := make([]byte, 0, 1+3+32)
+	payload = append(payload, byte(CmdSendTelemetryReq))
+	payload = append(payload, 0, 0, 0) // reserved
+	payload = append(payload, pub[:]...)
+	var sent SentResult
+	err := c.callWithTimeout(payload, func(frame Frame) (bool, error) {
+		if e := errFromFrame(frame); e != nil {
+			return true, e
+		}
+		if ResponseCode(frame.Payload[0]) != RespSent {
+			return false, nil
+		}
+		s, err := parseSent(frame.Payload[1:])
+		if err != nil {
+			return true, err
+		}
+		sent = s
+		return true, nil
+	})
+	return sent, err
 }
 
 // SendTracePath fires a trace-path request along the given path of

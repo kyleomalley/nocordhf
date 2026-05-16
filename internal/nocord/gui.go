@@ -7295,6 +7295,7 @@ func (g *GUI) showMcContactContextMenu(visibleIdx int, absPos fyne.Position) {
 		fyne.NewMenuItem("Share over mesh", func() { g.shareMcContact(ct) }),
 		fyne.NewMenuItem("Share in channel…", func() { g.showMcShareInChannelDialog(ct) }),
 		fyne.NewMenuItem("Trace path", func() { g.traceMcContactPath(ct) }),
+		fyne.NewMenuItem("Query telemetry", func() { g.requestMcContactTelemetry(ct) }),
 		fyne.NewMenuItem("Reset path", func() { g.confirmResetMcPath(ct) }),
 		fyne.NewMenuItem("Remove", func() { g.confirmRemoveMcContact(ct) }),
 	)
@@ -10226,6 +10227,12 @@ func (g *GUI) runMeshcoreEvents(client *meshcore.Client) {
 			// Match against the pending-trace table and render
 			// the hops on the map with per-hop SNR labels.
 			g.handleMcTraceData(e)
+		case meshcore.EventTelemetryResponse:
+			// Response to an operator-triggered "Query telemetry"
+			// against a sensor node. Match against the pending
+			// table by sender prefix and surface the decoded
+			// LPP readings as a system message.
+			g.handleMcTelemetryResponse(e)
 		case meshcore.EventContactsFull:
 			// Hardware contacts table at MAX_CONTACTS — the
 			// firmware will start dropping new adverts AND
