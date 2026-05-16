@@ -8563,7 +8563,11 @@ func (g *GUI) buildMeshcoreRoster() *fyne.Container {
 	if g.mcRosterPane != nil {
 		return g.mcRosterPane
 	}
-	g.mcRosterHdr = canvas.NewText("ROSTER  (0)", color.RGBA{140, 140, 145, 255})
+	// Header label normalised to "HEARD" so FT8 and MeshCore use
+	// the same word for the same idea (people we've heard from
+	// recently). FT8 sources from decoded transmissions, MeshCore
+	// sources from active-channel posters; semantically the same.
+	g.mcRosterHdr = canvas.NewText("HEARD  (0)", color.RGBA{140, 140, 145, 255})
 	g.mcRosterHdr.TextSize = 11
 	g.mcRosterHdr.TextStyle = fyne.TextStyle{Bold: true}
 	g.mcRosterList = widget.NewList(
@@ -8572,11 +8576,24 @@ func (g *GUI) buildMeshcoreRoster() *fyne.Container {
 			t := canvas.NewText("", color.RGBA{210, 215, 225, 255})
 			t.TextStyle = fyne.TextStyle{Monospace: true}
 			t.TextSize = 12
-			return container.NewPadded(t)
+			row := newHoverRow(container.NewPadded(t))
+			row.onTap = func() {
+				// Single-click → switch to a DM thread with this
+				// contact, like clicking a Discord channel-member
+				// jumps to their profile / DM. Bind sets onTap
+				// per-row so the closure captures the right name.
+				g.mcRosterList.Select(row.listIdx)
+			}
+			row.onSecondary = func(pos fyne.Position) {
+				g.showMcRosterContextMenu(row.listIdx, pos)
+			}
+			return row
 		},
 		func(id widget.ListItemID, obj fyne.CanvasObject) {
-			padded := obj.(*fyne.Container)
+			row := obj.(*hoverRow)
+			padded := row.inner.(*fyne.Container)
 			t := padded.Objects[0].(*canvas.Text)
+			row.listIdx = id
 			roster := g.mcCurrentRoster()
 			if id >= len(roster) {
 				return
@@ -8585,12 +8602,100 @@ func (g *GUI) buildMeshcoreRoster() *fyne.Container {
 			t.Refresh()
 		},
 	)
+	g.mcRosterList.OnSelected = func(id widget.ListItemID) {
+		// Left-click forwards to here via the row's onTap →
+		// list.Select(). Resolve the roster name to a contact and
+		// switch to its DM thread. If no matching contact (the
+		// poster is a channel member we don't have in our table),
+		// fall through with a system message.
+		g.mcRosterList.UnselectAll()
+		roster := g.mcCurrentRoster()
+		if id < 0 || id >= len(roster) {
+			return
+		}
+		g.openMcDmByRosterName(roster[id])
+	}
 	bg := canvas.NewRectangle(color.RGBA{36, 38, 43, 255})
 	g.mcRosterPane = container.NewStack(
 		bg,
 		container.NewBorder(container.NewPadded(g.mcRosterHdr), nil, nil, nil, g.mcRosterList),
 	)
 	return g.mcRosterPane
+}
+
+// showMcRosterContextMenu opens the right-click menu for a row in
+// the MeshCore HEARD column (the per-channel sender roster). Maps
+// the displayed name back to a known Contact when possible so the
+// menu offers DM / Info / Trace, falling back to "Open as DM"
+// when the name doesn't match anyone in the contact table — that
+// still works because mcSwitchThread accepts any contact-prefix
+// thread id and the radio's contacts table is the source of truth
+// for actually delivering the DM.
+func (g *GUI) showMcRosterContextMenu(visibleIdx int, absPos fyne.Position) {
+	if g.window == nil {
+		return
+	}
+	roster := g.mcCurrentRoster()
+	if visibleIdx < 0 || visibleIdx >= len(roster) {
+		return
+	}
+	name := roster[visibleIdx]
+	ct, ok := g.mcContactByDisplayName(name)
+	if !ok {
+		// Not in our table — offer minimal actions only.
+		menu := fyne.NewMenu("",
+			fyne.NewMenuItem(name+"  (not in contacts)", func() {}),
+			fyne.NewMenuItem("Copy name", func() {
+				g.window.Clipboard().SetContent(name)
+			}),
+		)
+		widget.ShowPopUpMenuAtPosition(menu, g.window.Canvas(), absPos)
+		return
+	}
+	// Known contact — full contact context menu, identical to
+	// the one in the Contacts sidebar. Reuse the contact-context
+	// helper since the actions (DM / Info / Trace / Login / etc.)
+	// are exactly what an operator wants when they spot a name
+	// in the channel HEARD.
+	menu := fyne.NewMenu("",
+		fyne.NewMenuItem("Open DM", func() { g.openMcDmByRosterName(name) }),
+		fyne.NewMenuItem("Info", func() { g.showMcContactInfoDialog(ct) }),
+		fyne.NewMenuItem("Trace path", func() { g.traceMcContactPath(ct) }),
+		fyne.NewMenuItem("Query telemetry", func() { g.requestMcContactTelemetry(ct) }),
+		fyne.NewMenuItem("Query repeater status", func() { g.requestMcContactStatus(ct) }),
+		fyne.NewMenuItem("Copy name", func() { g.window.Clipboard().SetContent(name) }),
+	)
+	widget.ShowPopUpMenuAtPosition(menu, g.window.Canvas(), absPos)
+}
+
+// openMcDmByRosterName resolves a HEARD entry's display name to a
+// known contact and switches the chat to that contact's DM thread.
+// Falls through to a system message when no contact matches —
+// the most common reason is that the channel sender isn't in our
+// table because auto-add filters them out (sensor / repeater types
+// off by default).
+func (g *GUI) openMcDmByRosterName(name string) {
+	ct, ok := g.mcContactByDisplayName(name)
+	if !ok {
+		g.mcAppendSystem(fmt.Sprintf("can't DM %s — not in your contacts table; right-click on the map / PENDING to admit them first", name))
+		return
+	}
+	g.mcSwitchThread(mcContactThreadID(ct))
+}
+
+// mcContactByDisplayName returns the contact whose AdvName matches
+// the given display string. Case-insensitive. Returns ok=false when
+// no contact matches — channel posters can be anyone on the mesh,
+// not just contacts the operator has admitted.
+func (g *GUI) mcContactByDisplayName(name string) (meshcore.Contact, bool) {
+	g.mcMu.Lock()
+	defer g.mcMu.Unlock()
+	for _, c := range g.mcContacts {
+		if strings.EqualFold(c.AdvName, name) {
+			return c, true
+		}
+	}
+	return meshcore.Contact{}, false
 }
 
 // mcRefreshRoster repaints the roster header count + list when the
@@ -8616,7 +8721,7 @@ func (g *GUI) mcRefreshRoster() {
 			}
 		}
 		if g.mcRosterHdr != nil {
-			g.mcRosterHdr.Text = fmt.Sprintf("ROSTER  (%d)", count)
+			g.mcRosterHdr.Text = fmt.Sprintf("HEARD  (%d)", count)
 			g.mcRosterHdr.Refresh()
 		}
 		g.mcRosterList.Refresh()
