@@ -279,6 +279,17 @@ func (c *Client) handlePush(code PushCode, payload []byte) {
 			ev.Packet = pkt
 		}
 		c.emit(ev)
+	case PushLoginSuccess, PushLoginFail:
+		// Layout (matches meshcore.js onLoginSuccessPush):
+		//   [reserved:1][pubKeyPrefix:6]
+		// Both success and fail use the same shape; the push
+		// code itself disambiguates the outcome.
+		if len(payload) < 1+6 {
+			return
+		}
+		ev := EventLoginResult{Success: code == PushLoginSuccess}
+		copy(ev.SenderPrefix[:], payload[1:7])
+		c.emit(ev)
 	case PushStatusResponse:
 		// Layout (matches meshcore.js onStatusResponsePush):
 		//   [reserved:1][pubKeyPrefix:6][statusData:remaining]
@@ -883,6 +894,47 @@ func (c *Client) Reboot() error {
 func (c *Client) ShareContact(pub PubKey) error {
 	payload := append([]byte{byte(CmdShareContact)}, pub[:]...)
 	return c.callWithTimeout(payload, awaitOk)
+}
+
+// SendLogin authenticates against a private repeater or room-
+// server. Reply arrives asynchronously as either
+// PushLoginSuccess (success) or PushLoginFail (wrong password /
+// not authorised) → EventLoginResult, with a SenderPrefix
+// matching pub's leading 6 bytes.
+//
+// Password is bounded at 15 characters by the firmware's frame-
+// width assumption; longer passwords get silently truncated by
+// the radio, so we truncate host-side too with a deterministic
+// cut so caller surfaces match what's actually on the wire.
+//
+// Wire format mirrors meshcore.js sendCommandSendLogin:
+//
+//	[CmdSendLogin][32-byte pubkey][password bytes ≤ 15]
+func (c *Client) SendLogin(pub PubKey, password string) (SentResult, error) {
+	const maxPasswordLen = 15
+	if len(password) > maxPasswordLen {
+		password = password[:maxPasswordLen]
+	}
+	payload := make([]byte, 0, 1+32+len(password))
+	payload = append(payload, byte(CmdSendLogin))
+	payload = append(payload, pub[:]...)
+	payload = append(payload, []byte(password)...)
+	var sent SentResult
+	err := c.callWithTimeout(payload, func(frame Frame) (bool, error) {
+		if e := errFromFrame(frame); e != nil {
+			return true, e
+		}
+		if ResponseCode(frame.Payload[0]) != RespSent {
+			return false, nil
+		}
+		s, err := parseSent(frame.Payload[1:])
+		if err != nil {
+			return true, err
+		}
+		sent = s
+		return true, nil
+	})
+	return sent, err
 }
 
 // SendStatusReq asks a repeater or room-server contact for its

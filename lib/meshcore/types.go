@@ -226,6 +226,19 @@ type EventChannelMessage struct{ ChannelMessage }
 
 func (EventChannelMessage) isMeshcoreEvent() {}
 
+// EventLoginResult fires when the firmware delivers either a
+// PushLoginSuccess or PushLoginFail in response to a previously-
+// sent CmdSendLogin. SenderPrefix is the 6-byte addressing
+// prefix the response carries; callers correlate against
+// in-flight requests via that prefix. Success flips the bool;
+// failure (or any firmware-side error) clears it.
+type EventLoginResult struct {
+	SenderPrefix PubKeyPrefix
+	Success      bool
+}
+
+func (EventLoginResult) isMeshcoreEvent() {}
+
 // RepeaterStats decodes the statusData payload of a repeater /
 // room-server PushStatusResponse. Fields mirror the firmware's
 // CompanionRadio struct (see meshcore-dev/MeshCore), all
