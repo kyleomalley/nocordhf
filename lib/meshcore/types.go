@@ -226,6 +226,29 @@ type EventChannelMessage struct{ ChannelMessage }
 
 func (EventChannelMessage) isMeshcoreEvent() {}
 
+// EventTraceData fires when the firmware delivers a PushTraceData
+// frame — the reply to a previously-sent CmdSendTracePath request.
+// Tag is the uint32 the host picked when issuing the trace; callers
+// correlate against their pending-trace table to drop responses for
+// traces they didn't initiate (a neighbouring app could in
+// principle issue overlapping traces).
+//
+// PathHashes is the actual hop sequence the trace traversed (1
+// byte per hop, same encoding as a normal Packet.Path); PathSNRs is
+// the matching per-hop SNR (firmware quarter-dB units already
+// converted to plain dB by the parser). LastSNR is the SNR of the
+// final hop back to us.
+type EventTraceData struct {
+	Tag        uint32
+	AuthCode   uint32
+	Flags      byte
+	PathHashes []byte
+	PathSNRs   []float64
+	LastSNR    float64
+}
+
+func (EventTraceData) isMeshcoreEvent() {}
+
 // EventDisconnected fires once when the read goroutine exits — either
 // the operator disconnected the device or the serial port returned an
 // unrecoverable error. Err is nil on a clean Client.Close.

@@ -279,6 +279,39 @@ func (c *Client) handlePush(code PushCode, payload []byte) {
 			ev.Packet = pkt
 		}
 		c.emit(ev)
+	case PushTraceData:
+		// Layout (matches meshcore.js onTraceDataPush):
+		//   [reserved:1][pathLen:1][flags:1]
+		//   [tag:u32LE][authCode:u32LE]
+		//   [pathHashes: pathLen bytes]
+		//   [pathSNRs:   pathLen bytes, int8 quarter-dB each]
+		//   [lastSnr:    int8 quarter-dB]
+		if len(payload) < 1+1+1+4+4 {
+			return
+		}
+		pathLen := int(payload[1])
+		expected := 1 + 1 + 1 + 4 + 4 + pathLen*2 + 1
+		if len(payload) < expected {
+			return
+		}
+		flags := payload[2]
+		tag := binary.LittleEndian.Uint32(payload[3:7])
+		auth := binary.LittleEndian.Uint32(payload[7:11])
+		hashStart := 11
+		snrStart := hashStart + pathLen
+		lastSnrIdx := snrStart + pathLen
+		ev := EventTraceData{
+			Tag:        tag,
+			AuthCode:   auth,
+			Flags:      flags,
+			PathHashes: append([]byte(nil), payload[hashStart:hashStart+pathLen]...),
+			PathSNRs:   make([]float64, pathLen),
+			LastSNR:    float64(int8(payload[lastSnrIdx])) / 4,
+		}
+		for i := 0; i < pathLen; i++ {
+			ev.PathSNRs[i] = float64(int8(payload[snrStart+i])) / 4
+		}
+		c.emit(ev)
 	default:
 		// Other pushes (RawData, LoginSuccess, StatusResponse, …)
 		// aren't surfaced yet. The chat-focused MVP only needs the
@@ -817,6 +850,47 @@ func (c *Client) Reboot() error {
 func (c *Client) ShareContact(pub PubKey) error {
 	payload := append([]byte{byte(CmdShareContact)}, pub[:]...)
 	return c.callWithTimeout(payload, awaitOk)
+}
+
+// SendTracePath fires a trace-path request along the given path of
+// 1-byte path hashes. Each repeater along the path appends its
+// path hash + observed SNR to the response. The firmware ACKs
+// the send synchronously (estTimeoutMillis is in the Sent
+// response), then the trace results arrive asynchronously as
+// PushTraceData → EventTraceData with a matching tag.
+//
+// tag is a uint32 caller-chosen correlation ID; multiple traces
+// may be in flight at once, and the EventTraceData consumer
+// matches against this tag to find the right pending request.
+// Pass 0 for auth unless interacting with an authed repeater
+// chain.
+//
+// Wire format mirrors meshcore.js sendCommandSendTracePath:
+//
+//	[CmdSendTracePath][tag:u32LE][auth:u32LE][flags:1=0][path bytes]
+func (c *Client) SendTracePath(tag uint32, auth uint32, path []byte) (SentResult, error) {
+	payload := make([]byte, 0, 1+4+4+1+len(path))
+	payload = append(payload, byte(CmdSendTracePath))
+	payload = appendUint32LE(payload, tag)
+	payload = appendUint32LE(payload, auth)
+	payload = append(payload, 0) // flags reserved
+	payload = append(payload, path...)
+	var sent SentResult
+	err := c.callWithTimeout(payload, func(frame Frame) (bool, error) {
+		if e := errFromFrame(frame); e != nil {
+			return true, e
+		}
+		if ResponseCode(frame.Payload[0]) != RespSent {
+			return false, nil
+		}
+		s, err := parseSent(frame.Payload[1:])
+		if err != nil {
+			return true, err
+		}
+		sent = s
+		return true, nil
+	})
+	return sent, err
 }
 
 // AddUpdateContact admits a contact into the radio's persistent

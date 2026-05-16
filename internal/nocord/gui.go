@@ -7294,6 +7294,7 @@ func (g *GUI) showMcContactContextMenu(visibleIdx int, absPos fyne.Position) {
 		fyne.NewMenuItem("Info", func() { g.showMcContactInfoDialog(ct) }),
 		fyne.NewMenuItem("Share over mesh", func() { g.shareMcContact(ct) }),
 		fyne.NewMenuItem("Share in channel…", func() { g.showMcShareInChannelDialog(ct) }),
+		fyne.NewMenuItem("Trace path", func() { g.traceMcContactPath(ct) }),
 		fyne.NewMenuItem("Reset path", func() { g.confirmResetMcPath(ct) }),
 		fyne.NewMenuItem("Remove", func() { g.confirmRemoveMcContact(ct) }),
 	)
@@ -10220,6 +10221,11 @@ func (g *GUI) runMeshcoreEvents(client *meshcore.Client) {
 			// viewer; in MeshCore mode the operator can see live
 			// traffic + SNR/RSSI without leaving the app.
 			g.mcAppendRxLogEntry(e)
+		case meshcore.EventTraceData:
+			// Response to an operator-triggered "Trace path".
+			// Match against the pending-trace table and render
+			// the hops on the map with per-hop SNR labels.
+			g.handleMcTraceData(e)
 		case meshcore.EventContactsFull:
 			// Hardware contacts table at MAX_CONTACTS — the
 			// firmware will start dropping new adverts AND

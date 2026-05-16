@@ -49,6 +49,7 @@ const (
 	CmdSendRawData       CommandCode = 25
 	CmdGetChannel        CommandCode = 31
 	CmdSetChannel        CommandCode = 32
+	CmdSendTracePath     CommandCode = 36
 	CmdSetOtherParams    CommandCode = 38
 	CmdSendTelemetryReq  CommandCode = 39
 	CmdSendBinaryReq     CommandCode = 50
